@@ -1,56 +1,52 @@
-# Welcome to your Expo app 👋
+# Brio Mobile
 
-This is an [Expo](https://expo.dev) project created with [`create-expo-app`](https://www.npmjs.com/package/create-expo-app).
+Expo app for the Brio mobile control plane.
 
-## Get started
+## Run
 
-1. Install dependencies
-
-   ```bash
-   npm install
-   ```
-
-2. Start the app
-
-   ```bash
-   npx expo start
-   ```
-
-In the output, you'll find options to open the app in a
-
-- [development build](https://docs.expo.dev/develop/development-builds/introduction/)
-- [Android emulator](https://docs.expo.dev/workflow/android-studio-emulator/)
-- [iOS simulator](https://docs.expo.dev/workflow/ios-simulator/)
-- [Expo Go](https://expo.dev/go), a limited sandbox for trying out app development with Expo
-
-You can start developing by editing the files inside the **app** directory. This project uses [file-based routing](https://docs.expo.dev/router/introduction).
-
-## Get a fresh project
-
-When you're ready, run:
+From the repo root:
 
 ```bash
-npm run reset-project
+make setup
+make dev-mobile
 ```
 
-This command will move the starter code to the **app-example** directory and create a blank **app** directory where you can start developing.
+From this directory:
 
-### Other setup steps
+```bash
+npm ci
+npm run web
+```
 
-- To set up ESLint for linting, run `npx expo lint`, or follow our guide on ["Using ESLint and Prettier"](https://docs.expo.dev/guides/using-eslint/)
-- If you'd like to set up unit testing, follow our guide on ["Unit Testing with Jest"](https://docs.expo.dev/develop/unit-testing/)
-- Learn more about the TypeScript setup in this template in our guide on ["Using TypeScript"](https://docs.expo.dev/guides/typescript/)
+## Validate
 
-## Learn more
+From the repo root:
 
-To learn more about developing your project with Expo, look at the following resources:
+```bash
+make check
+```
 
-- [Expo documentation](https://docs.expo.dev/): Learn fundamentals, or go into advanced topics with our [guides](https://docs.expo.dev/guides).
-- [Learn Expo tutorial](https://docs.expo.dev/tutorial/introduction/): Follow a step-by-step tutorial where you'll create a project that runs on Android, iOS, and the web.
+From this directory:
 
-## Join the community
+```bash
+npm run check
+```
 
-Join our community of developers creating universal apps.
+`npm run check` runs Expo linting, TypeScript, and a static web export.
 
-- [Expo on GitHub](https://github.com/expo/expo): View our open source platform and contribute.
-- [Discord community](https://chat.expo.dev): Chat with Expo users and ask questions.
+## Connect Locally
+
+Start the companion in a separate terminal:
+
+```bash
+make dev-companion
+```
+
+The companion prints a pairing payload. Paste it into the mobile app to create a direct local connection.
+
+For an installed companion binary on an end-user machine:
+
+```bash
+brio companion install
+brio companion pair
+```

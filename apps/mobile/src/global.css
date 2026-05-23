@@ -1,4 +1,8 @@
 :root {
+  --background-base: #041c1c;
+  --midground-base: #ffe6cb;
+  --warm-glow: rgba(255, 189, 56, 0.35);
+  --noise-opacity-mul: 1;
   --font-display:
     Spline Sans, Inter, ui-sans-serif, system-ui, sans-serif, Apple Color Emoji, Segoe UI Emoji,
     Segoe UI Symbol, Noto Color Emoji;

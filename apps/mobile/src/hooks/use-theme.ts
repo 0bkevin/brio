@@ -3,12 +3,17 @@
  * https://docs.expo.dev/guides/color-schemes/
  */
 
-import { Colors } from '@/constants/theme';
-import { useColorScheme } from '@/hooks/use-color-scheme';
+import { colorsFromDashboardTheme, DashboardThemes } from '@/constants/theme';
+import { useUIStore } from '@/state/ui-store';
 
 export function useTheme() {
-  const scheme = useColorScheme();
-  const theme = scheme === 'unspecified' ? 'light' : scheme;
+  const themeName = useUIStore((state) => state.themeName);
+  const dashboardTheme = DashboardThemes[themeName] ?? DashboardThemes.default;
 
-  return Colors[theme];
+  return colorsFromDashboardTheme(dashboardTheme);
+}
+
+export function useDashboardTheme() {
+  const themeName = useUIStore((state) => state.themeName);
+  return DashboardThemes[themeName] ?? DashboardThemes.default;
 }

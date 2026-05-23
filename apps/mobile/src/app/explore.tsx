@@ -2,6 +2,7 @@ import { useQuery } from '@tanstack/react-query';
 import { ActivityIndicator, Pressable, ScrollView, StyleSheet, View } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 
+import { DashboardCard, SectionLabel, StatusBadge } from '@/components/dashboard';
 import { brioFetch, getCapabilities, getHealth } from '@/lib/brio';
 import { ThemedText } from '@/components/themed-text';
 import { ThemedView } from '@/components/themed-view';
@@ -46,6 +47,7 @@ export default function ManageScreen() {
     <ScrollView style={[styles.scroll, { backgroundColor: theme.background }]}>
       <SafeAreaView style={styles.safeArea}>
         <ThemedView style={styles.header}>
+          <SectionLabel>Dashboard</SectionLabel>
           <ThemedText type="subtitle">Manage</ThemedText>
           <ThemedText themeColor="textSecondary">{connection.url}</ThemedText>
         </ThemedView>
@@ -108,7 +110,7 @@ function StatusCard({
   title: string;
 }) {
   return (
-    <ThemedView type="backgroundElement" style={styles.card}>
+    <DashboardCard>
       <View style={styles.cardHeader}>
         <ThemedText type="smallBold">{title}</ThemedText>
         <Pressable onPress={onRefresh} style={styles.refreshButton}>
@@ -120,13 +122,19 @@ function StatusCard({
         rows.map(([label, value]) => (
           <View key={label} style={styles.row}>
             <ThemedText themeColor="textSecondary">{label}</ThemedText>
-            <ThemedText style={styles.rowValue}>{value}</ThemedText>
+            {value === 'online' || value === 'available' ? (
+              <StatusBadge tone="success">{value}</StatusBadge>
+            ) : value === 'not reachable' || value === 'unknown' ? (
+              <StatusBadge tone="warning">{value}</StatusBadge>
+            ) : (
+              <ThemedText style={styles.rowValue}>{value}</ThemedText>
+            )}
           </View>
         ))
       ) : (
         <ThemedText themeColor="textSecondary">No data.</ThemedText>
       )}
-    </ThemedView>
+    </DashboardCard>
   );
 }
 
@@ -145,11 +153,6 @@ const styles = StyleSheet.create({
   },
   header: {
     gap: Spacing.one,
-  },
-  card: {
-    borderRadius: Spacing.two,
-    gap: Spacing.two,
-    padding: Spacing.three,
   },
   cardHeader: {
     alignItems: 'center',

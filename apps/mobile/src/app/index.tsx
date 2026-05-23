@@ -11,6 +11,7 @@ import {
 } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 
+import { DashboardCard, SectionLabel, StatusBadge } from '@/components/dashboard';
 import {
   claimRelayPairing,
   connectionFromPairingPayload,
@@ -57,14 +58,14 @@ function ConnectionForm() {
       const connection = pairingPayload.trim()
         ? connectionFromPairingPayload(decodePairingPayload(pairingPayload))
         : ({
-        id: 'self-hosted-local',
-        name: 'Hermes',
-        mode: 'self_hosted',
+            id: 'self-hosted-local',
+            name: 'Hermes',
+            mode: 'self_hosted',
             transport: 'direct',
             status: 'connecting',
-        capabilities: {},
-        url: url.trim(),
-        token: token.trim(),
+            capabilities: {},
+            url: url.trim(),
+            token: token.trim(),
           } as AgentConnection);
       let nextConnection = connection;
       if (connection.transport === 'relay') {
@@ -96,11 +97,14 @@ function ConnectionForm() {
   return (
     <Screen>
       <ThemedView style={styles.header}>
+        <SectionLabel>Hermes Agent</SectionLabel>
         <ThemedText type="title">Brio</ThemedText>
-        <ThemedText themeColor="textSecondary">Connect your Hermes companion.</ThemedText>
+        <ThemedText themeColor="textSecondary">
+          Connect your Hermes companion through direct or relay transport.
+        </ThemedText>
       </ThemedView>
 
-      <ThemedView type="backgroundElement" style={styles.panel}>
+      <DashboardCard>
         <ThemedText type="smallBold">Pairing payload</ThemedText>
         <TextInput
           autoCapitalize="none"
@@ -146,7 +150,7 @@ function ConnectionForm() {
           label="Connect"
           onPress={connect}
         />
-      </ThemedView>
+      </DashboardCard>
     </Screen>
   );
 }
@@ -172,17 +176,18 @@ function ConnectedChat({ connection }: { connection: AgentConnection }) {
     <Screen>
       <ThemedView style={styles.headerRow}>
         <View>
+          <SectionLabel>Active companion</SectionLabel>
           <ThemedText type="subtitle">{connection.name}</ThemedText>
-          <ThemedText themeColor="textSecondary">
+          <StatusBadge tone={health.data?.hermes_ok ? 'success' : 'warning'}>
             Hermes {health.data?.hermes_ok ? 'online' : 'not reachable'}
-          </ThemedText>
+          </StatusBadge>
         </View>
         <Pressable onPress={() => void clearConnection()} style={styles.textButton}>
           <ThemedText type="link">Disconnect</ThemedText>
         </Pressable>
       </ThemedView>
 
-      <ThemedView type="backgroundElement" style={styles.panel}>
+      <DashboardCard>
         <TextInput
           multiline
           onChangeText={setPrompt}
@@ -208,15 +213,15 @@ function ConnectedChat({ connection }: { connection: AgentConnection }) {
             chat.mutate(message);
           }}
         />
-      </ThemedView>
+      </DashboardCard>
 
-      <ThemedView type="backgroundElement" style={styles.panel}>
+      <DashboardCard>
         <ThemedText type="smallBold">Latest response</ThemedText>
         {chat.isPending ? <ActivityIndicator /> : null}
         <ThemedText type="code" style={styles.jsonBlock}>
           {lastResponse ? JSON.stringify(lastResponse, null, 2) : 'No response yet.'}
         </ThemedText>
-      </ThemedView>
+      </DashboardCard>
     </Screen>
   );
 }
@@ -255,9 +260,9 @@ function PrimaryButton({
       onPress={onPress}
       style={[
         styles.primaryButton,
-        { backgroundColor: disabled ? theme.backgroundSelected : theme.text },
+        { backgroundColor: disabled ? theme.backgroundSelected : theme.accent },
       ]}>
-      <ThemedText style={{ color: theme.background }} type="smallBold">
+      <ThemedText style={{ color: disabled ? theme.textDisabled : theme.accentText }} type="smallBold">
         {label}
       </ThemedText>
     </Pressable>
@@ -287,18 +292,15 @@ const styles = StyleSheet.create({
     justifyContent: 'space-between',
     gap: Spacing.three,
   },
-  panel: {
-    borderRadius: Spacing.two,
-    gap: Spacing.three,
-    padding: Spacing.three,
-  },
   input: {
+    backgroundColor: 'rgba(0,0,0,0.12)',
     borderRadius: Spacing.two,
     borderWidth: 1,
     minHeight: 48,
     paddingHorizontal: Spacing.three,
   },
   messageInput: {
+    backgroundColor: 'rgba(0,0,0,0.12)',
     borderRadius: Spacing.two,
     borderWidth: 1,
     minHeight: 132,
@@ -306,6 +308,7 @@ const styles = StyleSheet.create({
     textAlignVertical: 'top',
   },
   pairingInput: {
+    backgroundColor: 'rgba(0,0,0,0.12)',
     borderRadius: Spacing.two,
     borderWidth: 1,
     minHeight: 92,
