@@ -1,0 +1,43 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://brio.local/schemas/tunnel-frame.schema.json",
+  "title": "BrioTunnelFrame",
+  "type": "object",
+  "required": ["type", "id"],
+  "properties": {
+    "type": {
+      "type": "string",
+      "enum": ["request", "response", "stream_chunk", "stream_end", "error", "ping", "pong"]
+    },
+    "id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "method": {
+      "type": "string"
+    },
+    "path": {
+      "type": "string"
+    },
+    "status": {
+      "type": "integer"
+    },
+    "headers": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "string"
+      }
+    },
+    "body": {},
+    "data": {
+      "type": "string"
+    },
+    "code": {
+      "type": "string"
+    },
+    "message": {
+      "type": "string"
+    }
+  },
+  "additionalProperties": false
+}

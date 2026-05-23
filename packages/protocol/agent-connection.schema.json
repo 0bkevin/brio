@@ -1,0 +1,47 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://brio.local/schemas/agent-connection.schema.json",
+  "title": "AgentConnection",
+  "type": "object",
+  "required": ["id", "name", "mode", "transport", "status", "capabilities"],
+  "properties": {
+    "id": {
+      "type": "string"
+    },
+    "name": {
+      "type": "string"
+    },
+    "mode": {
+      "type": "string",
+      "enum": ["self_hosted", "brio_hosted"]
+    },
+    "transport": {
+      "type": "string",
+      "enum": ["relay", "direct"]
+    },
+    "status": {
+      "type": "string",
+      "enum": ["online", "offline", "connecting", "error"]
+    },
+    "capabilities": {
+      "type": "object",
+      "additionalProperties": true
+    },
+    "url": {
+      "type": "string"
+    },
+    "token": {
+      "type": "string"
+    },
+    "relayToken": {
+      "type": "string"
+    },
+    "agentId": {
+      "type": "string"
+    },
+    "pairingCode": {
+      "type": "string"
+    }
+  },
+  "additionalProperties": false
+}
