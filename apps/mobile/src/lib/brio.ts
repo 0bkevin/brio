@@ -113,13 +113,7 @@ export function decodePairingPayload(raw: string): PairingPayload {
   try {
     return JSON.parse(value) as PairingPayload;
   } catch {
-    const normalized = value.replace(/-/g, '+').replace(/_/g, '/');
-    const padded = normalized.padEnd(Math.ceil(normalized.length / 4) * 4, '=');
-    if (typeof atob !== 'function') {
-      throw new Error('This device cannot decode the pairing payload');
-    }
-    const decoded = atob(padded);
-    return JSON.parse(decoded) as PairingPayload;
+    return JSON.parse(decodeBase64URL(value)) as PairingPayload;
   }
 }
 
@@ -270,7 +264,39 @@ function relayTunnelURL(baseURL: string, agentId: string, relayToken: string) {
   } else if (url.protocol === 'https:') {
     url.protocol = 'wss:';
   }
-  url.pathname = `${url.pathname.replace(/\/+$/, '')}/tunnel/mobile/${encodeURIComponent(agentId)}`;
+  url.pathname = `${url.pathname.replace(/\/+$/, '')}/tunnel/mobile/${agentId}`;
   url.searchParams.set('token', relayToken);
   return url.toString();
+}
+
+function decodeBase64URL(value: string) {
+  const normalized = value.replace(/-/g, '+').replace(/_/g, '/');
+  const padded = normalized.padEnd(Math.ceil(normalized.length / 4) * 4, '=');
+
+  if (typeof globalThis.atob === 'function') {
+    return globalThis.atob(padded);
+  }
+
+  const alphabet = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
+  let output = '';
+  let buffer = 0;
+  let bits = 0;
+
+  for (const char of padded) {
+    if (char === '=') {
+      break;
+    }
+    const index = alphabet.indexOf(char);
+    if (index === -1) {
+      throw new Error('Pairing payload is not valid base64');
+    }
+    buffer = (buffer << 6) | index;
+    bits += 6;
+    if (bits >= 8) {
+      bits -= 8;
+      output += String.fromCharCode((buffer >> bits) & 0xff);
+    }
+  }
+
+  return output;
 }

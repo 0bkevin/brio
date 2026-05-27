@@ -183,7 +183,7 @@ func tunnelURL(base string, role string, agentID string, token string) (string, 
 	default:
 		return "", fmt.Errorf("unsupported relay URL scheme: %s", u.Scheme)
 	}
-	u.Path = strings.TrimRight(u.Path, "/") + "/tunnel/" + role + "/" + url.PathEscape(agentID)
+	u.Path = strings.TrimRight(u.Path, "/") + "/tunnel/" + role + "/" + agentID
 	if token != "" {
 		q := u.Query()
 		q.Set("token", token)
