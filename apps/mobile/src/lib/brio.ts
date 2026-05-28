@@ -33,6 +33,15 @@ export type RelayDeviceSession = {
   token: string;
 };
 
+export type RelayAgent = {
+  id: string;
+  name: string;
+  mode: 'self_hosted' | 'brio_hosted';
+  status: AgentConnection['status'];
+  created_at?: string;
+  last_seen_at?: string | null;
+};
+
 export type RelayClaimResponse = {
   agent: {
     id: string;
@@ -42,8 +51,28 @@ export type RelayClaimResponse = {
   };
 };
 
+export type RelayRecoveryResponse = {
+  code: string;
+  agent_token: string;
+  agent_id: string;
+  name: string;
+  expires_at: string;
+  created_at: string;
+};
+
+export type RelayEnrollmentResponse = {
+  code: string;
+  name: string;
+  expires_at: string;
+  created_at: string;
+};
+
 function normalizeBaseURL(url: string) {
   return url.trim().replace(/\/+$/, '');
+}
+
+function cleanConnectionValue(value: string) {
+  return value.trim().replace(/^["'`]+|[,"'`.;]+$/g, '');
 }
 
 export async function brioFetch<T>(
@@ -117,6 +146,49 @@ export function decodePairingPayload(raw: string): PairingPayload {
   }
 }
 
+export function extractPairingPayload(raw: string): PairingPayload {
+  const value = raw.trim();
+  if (!value) {
+    throw new Error('Hermes reply is empty');
+  }
+
+  const notReadyMatch = value.match(/^\s*NOT\s+READY\s*:\s*(.+)$/is);
+  if (notReadyMatch) {
+    throw new Error(notReadyMatch[1].trim());
+  }
+
+  try {
+    return decodePairingPayload(value);
+  } catch {
+    // Fall through to more forgiving parsing for human-readable Hermes replies.
+  }
+
+  const jsonBlock = value.match(/\{[\s\S]*\}/)?.[0];
+  if (jsonBlock) {
+    try {
+      return JSON.parse(jsonBlock) as PairingPayload;
+    } catch {
+      // Ignore and continue with label-based parsing.
+    }
+  }
+
+  const urlMatch =
+    value.match(/(?:^|\n)\s*url\s*:\s*(\S+)/i) ??
+    value.match(/\bhttps?:\/\/[^\s"'`]+/i);
+  const tokenMatch = value.match(/(?:^|\n)\s*token\s*:\s*([^\s]+)/i);
+
+  if (!urlMatch || !tokenMatch) {
+    throw new Error('Could not find a pairing payload or URL/token in the Hermes reply');
+  }
+
+  return {
+    url: cleanConnectionValue(urlMatch[1] ?? urlMatch[0]),
+    token: cleanConnectionValue(tokenMatch[1]),
+    mode: 'direct',
+    transport: 'direct',
+  };
+}
+
 export function connectionFromPairingPayload(payload: PairingPayload): AgentConnection {
   const transport = payload.transport ?? payload.mode ?? 'direct';
   return {
@@ -173,6 +245,66 @@ export async function claimRelayPairing(
     throw new Error(body?.error ?? 'Could not claim pairing');
   }
   return body as RelayClaimResponse;
+}
+
+export async function listRelayAgents(relayURL: string, relayToken: string) {
+  const response = await fetch(`${normalizeBaseURL(relayURL)}/agents`, {
+    headers: {
+      Accept: 'application/json',
+      Authorization: `Bearer ${relayToken}`,
+    },
+  });
+  const body = await response.json();
+  if (!response.ok) {
+    throw new Error(body?.error ?? 'Could not load agents');
+  }
+  return (body?.agents ?? []) as RelayAgent[];
+}
+
+export async function createRelayEnrollment(
+  relayURL: string,
+  relayToken: string,
+  name = 'Hermes',
+) {
+  const response = await fetch(`${normalizeBaseURL(relayURL)}/enrollments`, {
+    method: 'POST',
+    headers: {
+      Accept: 'application/json',
+      Authorization: `Bearer ${relayToken}`,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({ name }),
+  });
+  const body = await response.json();
+  if (!response.ok) {
+    throw new Error(body?.error ?? 'Could not create enrollment');
+  }
+  return body as RelayEnrollmentResponse;
+}
+
+export async function recoverRelayAgent(
+  relayURL: string,
+  relayToken: string,
+  agentID: string,
+  name?: string,
+) {
+  const response = await fetch(
+    `${normalizeBaseURL(relayURL)}/agents/${encodeURIComponent(agentID)}/recover`,
+    {
+      method: 'POST',
+      headers: {
+        Accept: 'application/json',
+        Authorization: `Bearer ${relayToken}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify(name ? { name } : {}),
+    },
+  );
+  const body = await response.json();
+  if (!response.ok) {
+    throw new Error(body?.error ?? 'Could not recover relay agent');
+  }
+  return body as RelayRecoveryResponse;
 }
 
 type RelayFrame = {

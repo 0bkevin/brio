@@ -63,9 +63,18 @@ CREATE TABLE IF NOT EXISTS pairing_sessions (
   used_at TIMESTAMPTZ,
   created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+CREATE TABLE IF NOT EXISTS enrollment_sessions (
+  code_hash TEXT PRIMARY KEY,
+  user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  name TEXT NOT NULL,
+  expires_at TIMESTAMPTZ NOT NULL,
+  used_at TIMESTAMPTZ,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
 CREATE INDEX IF NOT EXISTS idx_devices_user_id ON devices(user_id);
 CREATE INDEX IF NOT EXISTS idx_agents_owner_user_id ON agents(owner_user_id);
 CREATE INDEX IF NOT EXISTS idx_pairing_sessions_agent_id ON pairing_sessions(agent_id);
+CREATE INDEX IF NOT EXISTS idx_enrollment_sessions_user_id ON enrollment_sessions(user_id);
 ALTER TABLE agents ADD COLUMN IF NOT EXISTS companion_token_hash TEXT;
 `)
 	return err
@@ -133,6 +142,51 @@ WHERE d.token_hash = $1 AND d.revoked_at IS NULL
 	return auth, err
 }
 
+func (s *PostgresStore) ListDevices(ctx context.Context, userID string) ([]Device, error) {
+	rows, err := s.pool.Query(ctx, `
+SELECT id, user_id, name, created_at, revoked_at
+FROM devices
+WHERE user_id = $1
+ORDER BY created_at DESC
+`, userID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var out []Device
+	for rows.Next() {
+		var device Device
+		if err := rows.Scan(&device.ID, &device.UserID, &device.Name, &device.CreatedAt, &device.RevokedAt); err != nil {
+			return nil, err
+		}
+		out = append(out, device)
+	}
+	return out, rows.Err()
+}
+
+func (s *PostgresStore) RevokeDevice(ctx context.Context, userID string, deviceID string) (Device, error) {
+	var device Device
+	err := s.pool.QueryRow(ctx, `
+UPDATE devices
+SET revoked_at = COALESCE(revoked_at, now())
+WHERE id = $1 AND user_id = $2
+RETURNING id, user_id, name, created_at, revoked_at
+`, deviceID, userID).Scan(&device.ID, &device.UserID, &device.Name, &device.CreatedAt, &device.RevokedAt)
+	if errors.Is(err, pgx.ErrNoRows) {
+		var exists bool
+		checkErr := s.pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM devices WHERE id = $1)`, deviceID).Scan(&exists)
+		if checkErr != nil {
+			return Device{}, checkErr
+		}
+		if exists {
+			return Device{}, ErrUnauthorized
+		}
+		return Device{}, ErrNotFound
+	}
+	return device, err
+}
+
 func (s *PostgresStore) AuthenticateCompanion(ctx context.Context, agentID string, token string) error {
 	var ok bool
 	err := s.pool.QueryRow(ctx, `
@@ -173,9 +227,119 @@ ON CONFLICT (id) DO UPDATE SET status = EXCLUDED.status, last_seen_at = now()
 	return err
 }
 
-func (s *PostgresStore) CreatePairing(ctx context.Context, agentID string, name string, ttl time.Duration) (Pairing, error) {
-	if _, err := s.UpsertAgent(ctx, agentID, name); err != nil {
-		return Pairing{}, err
+func (s *PostgresStore) CreateEnrollment(ctx context.Context, userID string, name string, ttl time.Duration) (Enrollment, error) {
+	if name == "" {
+		name = "Hermes"
+	}
+	code := RandomCode(8)
+	var enrollment Enrollment
+	err := s.pool.QueryRow(ctx, `
+INSERT INTO enrollment_sessions (code_hash, user_id, name, expires_at)
+VALUES ($1, $2, $3, $4)
+RETURNING user_id, name, expires_at, used_at, created_at
+`, HashSecret(code), userID, name, time.Now().UTC().Add(ttl)).Scan(
+		&enrollment.UserID,
+		&enrollment.Name,
+		&enrollment.ExpiresAt,
+		&enrollment.UsedAt,
+		&enrollment.CreatedAt,
+	)
+	if err != nil {
+		return Enrollment{}, err
+	}
+	enrollment.Code = code
+	return enrollment, nil
+}
+
+func (s *PostgresStore) ClaimEnrollment(ctx context.Context, code string, agentID string, name string) (Agent, string, error) {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return Agent{}, "", err
+	}
+	defer tx.Rollback(ctx)
+
+	var enrollment Enrollment
+	err = tx.QueryRow(ctx, `
+SELECT user_id, name, expires_at, used_at, created_at
+FROM enrollment_sessions
+WHERE code_hash = $1
+FOR UPDATE
+`, HashSecret(code)).Scan(
+		&enrollment.UserID,
+		&enrollment.Name,
+		&enrollment.ExpiresAt,
+		&enrollment.UsedAt,
+		&enrollment.CreatedAt,
+	)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return Agent{}, "", ErrNotFound
+	}
+	if err != nil {
+		return Agent{}, "", err
+	}
+	if time.Now().After(enrollment.ExpiresAt) {
+		return Agent{}, "", ErrExpired
+	}
+	if enrollment.UsedAt != nil {
+		return Agent{}, "", ErrUsed
+	}
+	if name == "" {
+		name = enrollment.Name
+	}
+
+	var existingOwner *string
+	err = tx.QueryRow(ctx, `
+SELECT owner_user_id
+FROM agents
+WHERE id = $1
+FOR UPDATE
+`, agentID).Scan(&existingOwner)
+	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+		return Agent{}, "", err
+	}
+	if err == nil && existingOwner != nil && *existingOwner != enrollment.UserID {
+		return Agent{}, "", ErrUnauthorized
+	}
+
+	token := "brio_agent_" + RandomCode(48)
+	now := time.Now().UTC()
+	var agent Agent
+	err = tx.QueryRow(ctx, `
+INSERT INTO agents (id, owner_user_id, name, companion_token_hash, mode, status, last_seen_at)
+VALUES ($1, $2, $3, $4, 'self_hosted', 'online', $5)
+ON CONFLICT (id) DO UPDATE
+SET owner_user_id = EXCLUDED.owner_user_id,
+    name = EXCLUDED.name,
+    companion_token_hash = EXCLUDED.companion_token_hash,
+    status = 'online',
+    last_seen_at = EXCLUDED.last_seen_at
+RETURNING id, owner_user_id, name, mode, status, last_seen_at, created_at
+`, agentID, enrollment.UserID, name, HashSecret(token), now).Scan(
+		&agent.ID,
+		&agent.OwnerUserID,
+		&agent.Name,
+		&agent.Mode,
+		&agent.Status,
+		&agent.LastSeenAt,
+		&agent.CreatedAt,
+	)
+	if err != nil {
+		return Agent{}, "", err
+	}
+
+	_, err = tx.Exec(ctx, `UPDATE enrollment_sessions SET used_at = now() WHERE code_hash = $1`, HashSecret(code))
+	if err != nil {
+		return Agent{}, "", err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return Agent{}, "", err
+	}
+	return agent, token, nil
+}
+
+func (s *PostgresStore) CreatePairing(ctx context.Context, agentID string, name string, ttl time.Duration, companionToken string) (Pairing, error) {
+	if name == "" {
+		name = "Hermes"
 	}
 	code := RandomCode(8)
 	agentToken := "brio_agent_" + RandomCode(48)
@@ -185,7 +349,97 @@ func (s *PostgresStore) CreatePairing(ctx context.Context, agentID string, name 
 		return Pairing{}, err
 	}
 	defer tx.Rollback(ctx)
+	var ownerUserID *string
+	var currentTokenHash *string
+	err = tx.QueryRow(ctx, `
+SELECT owner_user_id, companion_token_hash
+FROM agents
+WHERE id = $1
+FOR UPDATE
+`, agentID).Scan(&ownerUserID, &currentTokenHash)
+	if errors.Is(err, pgx.ErrNoRows) {
+		_, err = tx.Exec(ctx, `
+INSERT INTO agents (id, name, status, last_seen_at)
+VALUES ($1, $2, 'online', now())
+`, agentID, name)
+		if err != nil {
+			return Pairing{}, err
+		}
+	} else if err != nil {
+		return Pairing{}, err
+	} else {
+		if ownerUserID != nil && (companionToken == "" || currentTokenHash == nil || *currentTokenHash != HashSecret(companionToken)) {
+			return Pairing{}, ErrUnauthorized
+		}
+		_, err = tx.Exec(ctx, `
+UPDATE agents
+SET name = $2, status = 'online', last_seen_at = now()
+WHERE id = $1
+`, agentID, name)
+		if err != nil {
+			return Pairing{}, err
+		}
+	}
 	_, err = tx.Exec(ctx, `UPDATE agents SET companion_token_hash = $2 WHERE id = $1`, agentID, HashSecret(agentToken))
+	if err != nil {
+		return Pairing{}, err
+	}
+	err = tx.QueryRow(ctx, `
+INSERT INTO pairing_sessions (code_hash, agent_id, name, expires_at)
+VALUES ($1, $2, $3, $4)
+RETURNING agent_id, name, expires_at, used_at, created_at
+`, HashSecret(code), agentID, name, time.Now().UTC().Add(ttl)).Scan(&p.AgentID, &p.Name, &p.ExpiresAt, &p.UsedAt, &p.CreatedAt)
+	if err != nil {
+		return Pairing{}, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return Pairing{}, err
+	}
+	p.Code = code
+	p.AgentToken = agentToken
+	return p, nil
+}
+
+func (s *PostgresStore) RecoverPairing(ctx context.Context, userID string, agentID string, name string, ttl time.Duration) (Pairing, error) {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return Pairing{}, err
+	}
+	defer tx.Rollback(ctx)
+
+	var currentName string
+	err = tx.QueryRow(ctx, `
+SELECT name
+FROM agents
+WHERE id = $1 AND owner_user_id = $2
+FOR UPDATE
+`, agentID, userID).Scan(&currentName)
+	if errors.Is(err, pgx.ErrNoRows) {
+		var exists bool
+		checkErr := tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM agents WHERE id = $1)`, agentID).Scan(&exists)
+		if checkErr != nil {
+			return Pairing{}, checkErr
+		}
+		if exists {
+			return Pairing{}, ErrUnauthorized
+		}
+		return Pairing{}, ErrNotFound
+	}
+	if err != nil {
+		return Pairing{}, err
+	}
+	if name == "" {
+		name = currentName
+	}
+
+	code := RandomCode(8)
+	agentToken := "brio_agent_" + RandomCode(48)
+	var p Pairing
+	_, err = tx.Exec(ctx, `
+UPDATE agents
+SET name = $3, status = 'online', last_seen_at = now(), companion_token_hash = $4
+WHERE id = $1 AND owner_user_id = $2
+`, agentID, userID, name, HashSecret(agentToken))
 	if err != nil {
 		return Pairing{}, err
 	}

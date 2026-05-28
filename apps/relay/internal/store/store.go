@@ -52,6 +52,15 @@ type Pairing struct {
 	CreatedAt  time.Time  `json:"created_at"`
 }
 
+type Enrollment struct {
+	Code      string     `json:"code,omitempty"`
+	UserID    string     `json:"user_id,omitempty"`
+	Name      string     `json:"name"`
+	ExpiresAt time.Time  `json:"expires_at"`
+	UsedAt    *time.Time `json:"used_at,omitempty"`
+	CreatedAt time.Time  `json:"created_at"`
+}
+
 type Auth struct {
 	User   User   `json:"user"`
 	Device Device `json:"device"`
@@ -61,10 +70,15 @@ type Store interface {
 	Close()
 	CreateDeviceToken(ctx context.Context, email string, deviceName string) (User, Device, string, error)
 	AuthenticateDevice(ctx context.Context, token string) (Auth, error)
+	ListDevices(ctx context.Context, userID string) ([]Device, error)
+	RevokeDevice(ctx context.Context, userID string, deviceID string) (Device, error)
 	AuthenticateCompanion(ctx context.Context, agentID string, token string) error
 	UpsertAgent(ctx context.Context, agentID string, name string) (Agent, error)
 	TouchAgent(ctx context.Context, agentID string, status string) error
-	CreatePairing(ctx context.Context, agentID string, name string, ttl time.Duration) (Pairing, error)
+	CreateEnrollment(ctx context.Context, userID string, name string, ttl time.Duration) (Enrollment, error)
+	ClaimEnrollment(ctx context.Context, code string, agentID string, name string) (Agent, string, error)
+	CreatePairing(ctx context.Context, agentID string, name string, ttl time.Duration, companionToken string) (Pairing, error)
+	RecoverPairing(ctx context.Context, userID string, agentID string, name string, ttl time.Duration) (Pairing, error)
 	GetPairing(ctx context.Context, code string) (Pairing, error)
 	ClaimPairing(ctx context.Context, code string, userID string) (Agent, error)
 	ListAgents(ctx context.Context, userID string) ([]Agent, error)

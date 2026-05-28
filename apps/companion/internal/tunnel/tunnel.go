@@ -46,6 +46,16 @@ type PairingPayload struct {
 	Code      string `json:"code,omitempty"`
 }
 
+type EnrollmentResult struct {
+	Agent AgentInfo `json:"agent"`
+	Token string    `json:"relay_token"`
+}
+
+type AgentInfo struct {
+	ID   string `json:"id"`
+	Name string `json:"name"`
+}
+
 func PairingCode(payload PairingPayload) string {
 	encoded, _ := json.Marshal(payload)
 	return base64.RawURLEncoding.EncodeToString(encoded)
@@ -81,6 +91,9 @@ func RegisterPairing(ctx context.Context, cfg Config) (string, string, error) {
 		return "", "", err
 	}
 	req.Header.Set("Content-Type", "application/json")
+	if cfg.RelayToken != "" {
+		req.Header.Set("Authorization", "Bearer "+cfg.RelayToken)
+	}
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		return "", "", err
@@ -98,6 +111,43 @@ func RegisterPairing(ctx context.Context, cfg Config) (string, string, error) {
 		return "", "", err
 	}
 	return result.Code, result.AgentToken, nil
+}
+
+func ClaimEnrollment(ctx context.Context, relayURL string, code string, agentID string, name string) (EnrollmentResult, error) {
+	body := map[string]string{
+		"agent_id": agentID,
+	}
+	if strings.TrimSpace(name) != "" {
+		body["name"] = strings.TrimSpace(name)
+	}
+	encoded, _ := json.Marshal(body)
+	req, err := http.NewRequestWithContext(
+		ctx,
+		http.MethodPost,
+		strings.TrimRight(relayURL, "/")+"/enrollments/"+url.PathEscape(strings.ToUpper(strings.TrimSpace(code)))+"/claim",
+		bytes.NewReader(encoded),
+	)
+	if err != nil {
+		return EnrollmentResult{}, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return EnrollmentResult{}, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 300 {
+		data, _ := io.ReadAll(resp.Body)
+		return EnrollmentResult{}, fmt.Errorf("enrollment claim failed: %s", strings.TrimSpace(string(data)))
+	}
+	var result EnrollmentResult
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return EnrollmentResult{}, err
+	}
+	if result.Token == "" || result.Agent.ID == "" {
+		return EnrollmentResult{}, fmt.Errorf("enrollment response is incomplete")
+	}
+	return result, nil
 }
 
 func connect(ctx context.Context, cfg Config) error {

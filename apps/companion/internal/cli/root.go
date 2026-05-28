@@ -30,10 +30,12 @@ func Execute() {
 }
 
 type companionRunOptions struct {
-	cfg       server.Config
-	publicURL string
-	relayURL  string
-	agentID   string
+	cfg        server.Config
+	publicURL  string
+	relayURL   string
+	relayToken string
+	relayMode  string
+	agentID    string
 }
 
 func defaultCompanionRunOptions() companionRunOptions {
@@ -46,9 +48,11 @@ func defaultCompanionRunOptions() companionRunOptions {
 			HermesHome:    configDefault("HERMES_HOME", ""),
 			AllowedRoots:  configList("BRIO_ALLOWED_ROOTS"),
 		},
-		publicURL: configDefault("BRIO_PUBLIC_URL", ""),
-		relayURL:  configDefault("BRIO_RELAY_URL", ""),
-		agentID:   configDefault("BRIO_AGENT_ID", ""),
+		publicURL:  configDefault("BRIO_PUBLIC_URL", ""),
+		relayURL:   configDefault("BRIO_RELAY_URL", ""),
+		relayToken: configDefault("BRIO_RELAY_TOKEN", ""),
+		relayMode:  configDefault("BRIO_RELAY_MODE", "pairing"),
+		agentID:    configDefault("BRIO_AGENT_ID", ""),
 	}
 }
 
@@ -74,6 +78,8 @@ func addCompanionRunFlags(cmd *cobra.Command, opts *companionRunOptions) {
 	cmd.Flags().StringVar(&opts.cfg.HermesHome, "hermes-home", opts.cfg.HermesHome, "Hermes home directory")
 	cmd.Flags().StringSliceVar(&opts.cfg.AllowedRoots, "allowed-root", opts.cfg.AllowedRoots, "allowed file root; repeatable")
 	cmd.Flags().StringVar(&opts.relayURL, "relay-url", opts.relayURL, "Brio relay URL for remote access")
+	cmd.Flags().StringVar(&opts.relayToken, "relay-token", opts.relayToken, "existing relay companion token for recovery")
+	cmd.Flags().StringVar(&opts.relayMode, "relay-mode", opts.relayMode, "relay mode: pairing or control-plane")
 	cmd.Flags().StringVar(&opts.agentID, "agent-id", opts.agentID, "stable agent identifier for relay mode")
 }
 
@@ -105,12 +111,37 @@ func runCompanion(ctx context.Context, opts companionRunOptions, print bool) err
 		Mode:      "direct",
 		Transport: "direct",
 	}
+	relayToken := ""
 	if opts.relayURL != "" {
 		relayCfg := tunnel.Config{
 			AgentID:      opts.agentID,
 			RelayURL:     strings.TrimRight(opts.relayURL, "/"),
 			LocalBaseURL: localURL,
 			Token:        opts.cfg.Token,
+			RelayToken:   strings.TrimSpace(opts.relayToken),
+		}
+		if opts.relayMode == "control-plane" {
+			if relayCfg.RelayToken == "" {
+				return fmt.Errorf("control-plane relay mode requires a relay token; run `brio companion enroll` first")
+			}
+			tunnel.Run(ctx, relayCfg)
+			if err := writePairingState(tunnel.PairingPayload{
+				URL:       strings.TrimRight(opts.relayURL, "/"),
+				Token:     opts.cfg.Token,
+				Mode:      "relay",
+				Transport: "relay",
+				AgentID:   opts.agentID,
+			}, relayCfg.RelayToken); err != nil {
+				slog.Warn("could not write pairing state", "error", err)
+			}
+			return server.Run(ctx, opts.cfg)
+		}
+		if state, err := readPairingState(); err == nil &&
+			state.Payload.Transport == "relay" &&
+			strings.TrimRight(state.Payload.URL, "/") == relayCfg.RelayURL &&
+			state.Payload.AgentID == opts.agentID &&
+			state.RelayToken != "" {
+			relayCfg.RelayToken = state.RelayToken
 		}
 		code, relayToken, err := tunnel.RegisterPairing(ctx, relayCfg)
 		if err != nil {
@@ -127,7 +158,7 @@ func runCompanion(ctx context.Context, opts companionRunOptions, print bool) err
 			Code:      code,
 		}
 	}
-	if err := writePairingState(payload); err != nil {
+	if err := writePairingState(payload, relayToken); err != nil {
 		slog.Warn("could not write pairing state", "error", err)
 	}
 	if print {

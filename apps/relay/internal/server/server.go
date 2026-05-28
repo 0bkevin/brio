@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"log/slog"
 	"net/http"
 	"strings"
@@ -56,9 +57,14 @@ func Run(ctx context.Context, cfg Config) error {
 	router.Group(func(r chi.Router) {
 		r.Use(a.requireDevice)
 		r.Get("/me", a.me)
+		r.Get("/devices", a.listDevices)
+		r.Delete("/devices/{id}", a.revokeDevice)
 		r.Get("/agents", a.listAgents)
+		r.Post("/enrollments", a.createEnrollment)
+		r.Post("/agents/{id}/recover", a.recoverAgent)
 		r.Post("/pairings/{code}/claim", a.claimPairing)
 	})
+	router.Post("/enrollments/{code}/claim", a.claimEnrollment)
 	router.Post("/pairings", a.createPairing)
 	router.Get("/pairings/{code}", a.getPairing)
 	router.Get("/tunnel/{role}/{agentID}", a.tunnel)
@@ -139,6 +145,26 @@ func (a *app) me(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, auth)
 }
 
+func (a *app) listDevices(w http.ResponseWriter, r *http.Request) {
+	auth := authFromContext(r.Context())
+	devices, err := a.store.ListDevices(r.Context(), auth.User.ID)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"devices": devices})
+}
+
+func (a *app) revokeDevice(w http.ResponseWriter, r *http.Request) {
+	auth := authFromContext(r.Context())
+	device, err := a.store.RevokeDevice(r.Context(), auth.User.ID, strings.TrimSpace(chi.URLParam(r, "id")))
+	if err != nil {
+		writeStoreError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"device": device})
+}
+
 func (a *app) listAgents(w http.ResponseWriter, r *http.Request) {
 	auth := authFromContext(r.Context())
 	agents, err := a.store.ListAgents(r.Context(), auth.User.ID)
@@ -147,6 +173,75 @@ func (a *app) listAgents(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"agents": agents})
+}
+
+func (a *app) createEnrollment(w http.ResponseWriter, r *http.Request) {
+	auth := authFromContext(r.Context())
+	var body struct {
+		Name string `json:"name"`
+	}
+	if r.Body != nil {
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil && !errors.Is(err, io.EOF) {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"error": "invalid JSON"})
+			return
+		}
+	}
+	enrollment, err := a.store.CreateEnrollment(r.Context(), auth.User.ID, body.Name, 15*time.Minute)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusCreated, enrollment)
+}
+
+func (a *app) claimEnrollment(w http.ResponseWriter, r *http.Request) {
+	code := strings.ToUpper(strings.TrimSpace(chi.URLParam(r, "code")))
+	var body struct {
+		AgentID string `json:"agent_id"`
+		Name    string `json:"name"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "invalid JSON"})
+		return
+	}
+	body.AgentID = strings.TrimSpace(body.AgentID)
+	if body.AgentID == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "agent_id is required"})
+		return
+	}
+	agent, relayToken, err := a.store.ClaimEnrollment(r.Context(), code, body.AgentID, body.Name)
+	if err != nil {
+		writeStoreError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusCreated, map[string]any{
+		"agent":       agent,
+		"relay_token": relayToken,
+	})
+}
+
+func (a *app) recoverAgent(w http.ResponseWriter, r *http.Request) {
+	auth := authFromContext(r.Context())
+	agentID := strings.TrimSpace(chi.URLParam(r, "id"))
+	if agentID == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "agent id is required"})
+		return
+	}
+	var body struct {
+		Name string `json:"name"`
+	}
+	if r.Body != nil {
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil && !errors.Is(err, io.EOF) {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"error": "invalid JSON"})
+			return
+		}
+	}
+	p, err := a.store.RecoverPairing(r.Context(), auth.User.ID, agentID, body.Name, 10*time.Minute)
+	if err != nil {
+		writeStoreError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusCreated, p)
 }
 
 func (a *app) createPairing(w http.ResponseWriter, r *http.Request) {
@@ -166,9 +261,9 @@ func (a *app) createPairing(w http.ResponseWriter, r *http.Request) {
 	if body.Name == "" {
 		body.Name = "Hermes"
 	}
-	p, err := a.store.CreatePairing(r.Context(), body.AgentID, body.Name, 10*time.Minute)
+	p, err := a.store.CreatePairing(r.Context(), body.AgentID, body.Name, 10*time.Minute, bearerToken(r))
 	if err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
+		writeStoreError(w, err)
 		return
 	}
 	writeJSON(w, http.StatusCreated, p)

@@ -19,8 +19,9 @@ const (
 )
 
 type pairingState struct {
-	Payload   tunnel.PairingPayload `json:"payload"`
-	UpdatedAt time.Time             `json:"updated_at"`
+	Payload    tunnel.PairingPayload `json:"payload"`
+	RelayToken string                `json:"relay_token,omitempty"`
+	UpdatedAt  time.Time             `json:"updated_at"`
 }
 
 func brioHomeDir() (string, error) {
@@ -108,7 +109,7 @@ func writeLocalConfig(values map[string]string) error {
 	return os.WriteFile(path, []byte(b.String()), 0o600)
 }
 
-func writePairingState(payload tunnel.PairingPayload) error {
+func writePairingState(payload tunnel.PairingPayload, relayToken string) error {
 	dir, err := brioHomeDir()
 	if err != nil {
 		return err
@@ -117,7 +118,7 @@ func writePairingState(payload tunnel.PairingPayload) error {
 		return err
 	}
 	path := filepath.Join(dir, pairingFileName)
-	data, err := json.MarshalIndent(pairingState{Payload: payload, UpdatedAt: time.Now().UTC()}, "", "  ")
+	data, err := json.MarshalIndent(pairingState{Payload: payload, RelayToken: relayToken, UpdatedAt: time.Now().UTC()}, "", "  ")
 	if err != nil {
 		return err
 	}
@@ -153,6 +154,8 @@ func configValuesFromOptions(opts companionRunOptions) map[string]string {
 		"HERMES_API_KEY":     opts.cfg.HermesAPIKey,
 		"HERMES_HOME":        opts.cfg.HermesHome,
 		"BRIO_RELAY_URL":     opts.relayURL,
+		"BRIO_RELAY_TOKEN":   opts.relayToken,
+		"BRIO_RELAY_MODE":    opts.relayMode,
 		"BRIO_AGENT_ID":      opts.agentID,
 		"BRIO_ALLOWED_ROOTS": strings.Join(opts.cfg.AllowedRoots, ","),
 	}

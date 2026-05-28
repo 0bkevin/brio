@@ -16,6 +16,7 @@ type MemoryStore struct {
 	agents      map[string]Agent
 	agentToken  map[string]string
 	pairings    map[string]Pairing
+	enrollments map[string]Enrollment
 }
 
 func NewMemoryStore() *MemoryStore {
@@ -27,6 +28,7 @@ func NewMemoryStore() *MemoryStore {
 		agents:      map[string]Agent{},
 		agentToken:  map[string]string{},
 		pairings:    map[string]Pairing{},
+		enrollments: map[string]Enrollment{},
 	}
 }
 
@@ -71,6 +73,34 @@ func (s *MemoryStore) AuthenticateDevice(ctx context.Context, token string) (Aut
 	return Auth{User: user, Device: device}, nil
 }
 
+func (s *MemoryStore) ListDevices(ctx context.Context, userID string) ([]Device, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := []Device{}
+	for _, device := range s.devices {
+		if device.UserID == userID {
+			out = append(out, device)
+		}
+	}
+	return out, nil
+}
+
+func (s *MemoryStore) RevokeDevice(ctx context.Context, userID string, deviceID string) (Device, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	device, ok := s.devices[deviceID]
+	if !ok {
+		return Device{}, ErrNotFound
+	}
+	if device.UserID != userID {
+		return Device{}, ErrUnauthorized
+	}
+	now := time.Now().UTC()
+	device.RevokedAt = &now
+	s.devices[deviceID] = device
+	return device, nil
+}
+
 func (s *MemoryStore) AuthenticateCompanion(ctx context.Context, agentID string, token string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -110,16 +140,112 @@ func (s *MemoryStore) TouchAgent(ctx context.Context, agentID string, status str
 	return nil
 }
 
-func (s *MemoryStore) CreatePairing(ctx context.Context, agentID string, name string, ttl time.Duration) (Pairing, error) {
-	if _, err := s.UpsertAgent(ctx, agentID, name); err != nil {
-		return Pairing{}, err
-	}
+func (s *MemoryStore) CreateEnrollment(ctx context.Context, userID string, name string, ttl time.Duration) (Enrollment, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if name == "" {
+		name = "Hermes"
+	}
+	now := time.Now().UTC()
+	enrollment := Enrollment{
+		Code:      RandomCode(8),
+		UserID:    userID,
+		Name:      name,
+		ExpiresAt: now.Add(ttl),
+		CreatedAt: now,
+	}
+	s.enrollments[HashSecret(enrollment.Code)] = enrollment
+	return enrollment, nil
+}
+
+func (s *MemoryStore) ClaimEnrollment(ctx context.Context, code string, agentID string, name string) (Agent, string, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	key := HashSecret(strings.ToUpper(strings.TrimSpace(code)))
+	enrollment, ok := s.enrollments[key]
+	if !ok {
+		return Agent{}, "", ErrNotFound
+	}
+	if time.Now().After(enrollment.ExpiresAt) {
+		return Agent{}, "", ErrExpired
+	}
+	if enrollment.UsedAt != nil {
+		return Agent{}, "", ErrUsed
+	}
+	if name == "" {
+		name = enrollment.Name
+	}
+	agent := s.agents[agentID]
+	if agent.ID != "" && agent.OwnerUserID != nil && *agent.OwnerUserID != enrollment.UserID {
+		return Agent{}, "", ErrUnauthorized
+	}
+	now := time.Now().UTC()
+	agent.OwnerUserID = &enrollment.UserID
+	agent.ID = agentID
+	agent.Name = name
+	agent.Mode = "self_hosted"
+	agent.Status = "online"
+	agent.LastSeenAt = &now
+	if agent.CreatedAt.IsZero() {
+		agent.CreatedAt = now
+	}
+	s.agents[agentID] = agent
+	enrollment.UsedAt = &now
+	s.enrollments[key] = enrollment
+	token := "brio_agent_" + RandomCode(48)
+	s.agentToken[agentID] = HashSecret(token)
+	return agent, token, nil
+}
+
+func (s *MemoryStore) CreatePairing(ctx context.Context, agentID string, name string, ttl time.Duration, companionToken string) (Pairing, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if name == "" {
+		name = "Hermes"
+	}
+	agent := s.agents[agentID]
+	if agent.ID == "" {
+		agent = Agent{ID: agentID, Name: name, Mode: "self_hosted", Status: "online", CreatedAt: time.Now().UTC()}
+	} else {
+		if agent.OwnerUserID != nil && (companionToken == "" || s.agentToken[agentID] != HashSecret(companionToken)) {
+			return Pairing{}, ErrUnauthorized
+		}
+		agent.Name = name
+	}
+	now := time.Now().UTC()
+	agent.Status = "online"
+	agent.LastSeenAt = &now
+	s.agents[agentID] = agent
 	code := RandomCode(8)
 	agentToken := "brio_agent_" + RandomCode(48)
 	s.agentToken[agentID] = HashSecret(agentToken)
-	p := Pairing{Code: code, AgentToken: agentToken, AgentID: agentID, Name: name, ExpiresAt: time.Now().UTC().Add(ttl), CreatedAt: time.Now().UTC()}
+	p := Pairing{Code: code, AgentToken: agentToken, AgentID: agentID, Name: name, ExpiresAt: now.Add(ttl), CreatedAt: now}
+	s.pairings[HashSecret(code)] = p
+	return p, nil
+}
+
+func (s *MemoryStore) RecoverPairing(ctx context.Context, userID string, agentID string, name string, ttl time.Duration) (Pairing, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	agent := s.agents[agentID]
+	if agent.ID == "" {
+		return Pairing{}, ErrNotFound
+	}
+	if agent.OwnerUserID == nil || *agent.OwnerUserID != userID {
+		return Pairing{}, ErrUnauthorized
+	}
+	if name == "" {
+		name = agent.Name
+	}
+	agent.Name = name
+	now := time.Now().UTC()
+	agent.Status = "online"
+	agent.LastSeenAt = &now
+	s.agents[agentID] = agent
+	code := RandomCode(8)
+	agentToken := "brio_agent_" + RandomCode(48)
+	s.agentToken[agentID] = HashSecret(agentToken)
+	p := Pairing{Code: code, AgentToken: agentToken, AgentID: agentID, Name: name, ExpiresAt: now.Add(ttl), CreatedAt: now}
 	s.pairings[HashSecret(code)] = p
 	return p, nil
 }

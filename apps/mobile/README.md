@@ -42,7 +42,9 @@ Start the companion in a separate terminal:
 make dev-companion
 ```
 
-The companion prints a pairing payload. Paste it into the mobile app to create a direct local connection.
+In the mobile app, use `Ask your agent`, paste the generated message into
+Hermes, then paste Hermes's reply back into the app. Hermes can look up the
+pairing details with `brio companion pair`.
 
 For an installed companion binary on an end-user machine:
 
