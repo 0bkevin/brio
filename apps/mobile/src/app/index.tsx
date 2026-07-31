@@ -32,6 +32,7 @@ import { ThemedText } from '@/components/themed-text';
 import { ThemedView } from '@/components/themed-view';
 import { BottomTabInset, MaxContentWidth, Spacing } from '@/constants/theme';
 import { useTheme } from '@/hooks/use-theme';
+import { HermesHomeScreen } from '@/features/home/hermes-home-screen';
 import { useConnectionStore } from '@/state/connection-store';
 import { useRelaySessionStore, type RelaySession } from '@/state/relay-session-store';
 
@@ -93,7 +94,7 @@ export default function ChatScreen() {
   }
 
   if (connection) {
-    return <ConnectedChat connection={connection} />;
+    return <HermesHomeScreen connection={connection} />;
   }
 
   if (relaySession) {
@@ -589,7 +590,7 @@ function ManualConnectionCard({ embedded = false }: { embedded?: boolean }) {
   return <DashboardCard>{content}</DashboardCard>;
 }
 
-function ConnectedChat({ connection }: { connection: AgentConnection }) {
+export function ConnectedChat({ connection }: { connection: AgentConnection }) {
   const theme = useTheme();
   const clearConnection = useConnectionStore((state) => state.clearConnection);
   const [prompt, setPrompt] = useState('');

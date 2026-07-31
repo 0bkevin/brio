@@ -27,6 +27,86 @@ export type CapabilitiesResponse = {
   hermes?: unknown;
 };
 
+export type HermesSession = {
+  id: string;
+  source: string;
+  user_id?: string;
+  model?: string;
+  started_at: number;
+  ended_at?: number | null;
+  message_count: number;
+  title?: string;
+};
+
+export type HermesMessage = {
+  role: string;
+  content: string;
+  tool_name?: string;
+  timestamp: number;
+};
+
+export type HermesSearchResult = {
+  session_id: string;
+  role: string;
+  snippet: string;
+};
+
+export type HermesRunStatus = {
+  object: 'hermes.run';
+  run_id: string;
+  status:
+    | 'started'
+    | 'queued'
+    | 'running'
+    | 'waiting_for_approval'
+    | 'stopping'
+    | 'completed'
+    | 'failed'
+    | 'cancelled';
+  session_id?: string;
+  model?: string;
+  output?: string;
+  error?: string;
+  last_event?: string;
+  created_at?: number;
+  updated_at?: number;
+  usage?: {
+    input_tokens?: number;
+    output_tokens?: number;
+    total_tokens?: number;
+  };
+};
+
+export type HermesRunStart = {
+  run_id: string;
+  status: 'started';
+};
+
+export type HermesFileEntry = {
+  name: string;
+  path: string;
+  dir: boolean;
+  size: number;
+};
+
+export type HermesSkill = {
+  name: string;
+  category: string;
+  path: string;
+  description: string;
+  enabled: boolean;
+};
+
+export type HermesJob = Record<string, unknown> & {
+  id?: string;
+  job_id?: string;
+  name?: string;
+  prompt?: string;
+  enabled?: boolean;
+  paused?: boolean;
+  schedule?: string;
+};
+
 export type RelayDeviceSession = {
   user: { id: string; email: string };
   device: { id: string; user_id: string; name: string };
@@ -109,6 +189,199 @@ export function getCapabilities(
   connection: Pick<AgentConnection, 'url' | 'token'> & Partial<AgentConnection>,
 ) {
   return brioFetch<CapabilitiesResponse>(connection, '/capabilities');
+}
+
+export function listSessions(connection: AgentConnection, limit = 100) {
+  return brioFetch<{ sessions: HermesSession[]; error?: string }>(
+    connection,
+    `/sessions?limit=${limit}`,
+  );
+}
+
+export function searchSessions(connection: AgentConnection, query: string) {
+  return brioFetch<{ results: HermesSearchResult[]; error?: string }>(
+    connection,
+    `/sessions/search?q=${encodeURIComponent(query)}&limit=100`,
+  );
+}
+
+export function getSessionMessages(connection: AgentConnection, sessionId: string) {
+  return brioFetch<{ messages: HermesMessage[]; error?: string }>(
+    connection,
+    `/sessions/${encodeURIComponent(sessionId)}/messages`,
+  );
+}
+
+export function startRun(
+  connection: AgentConnection,
+  input: string,
+  options: {
+    sessionId?: string;
+    instructions?: string;
+    model?: string;
+    provider?: string;
+    conversationHistory?: { role: string; content: string }[];
+  } = {},
+) {
+  return brioFetch<HermesRunStart>(connection, '/runs', {
+    method: 'POST',
+    body: JSON.stringify({
+      input,
+      ...(options.sessionId ? { session_id: options.sessionId } : {}),
+      ...(options.instructions ? { instructions: options.instructions } : {}),
+      ...(options.model ? { model: options.model } : {}),
+      ...(options.provider ? { provider: options.provider } : {}),
+      ...(options.conversationHistory
+        ? { conversation_history: options.conversationHistory }
+        : {}),
+    }),
+  });
+}
+
+export function getRun(connection: AgentConnection, runId: string) {
+  return brioFetch<HermesRunStatus>(connection, `/runs/${encodeURIComponent(runId)}`);
+}
+
+export function approveRun(
+  connection: AgentConnection,
+  runId: string,
+  choice: 'once' | 'session' | 'always' | 'deny',
+) {
+  return brioFetch<Record<string, unknown>>(
+    connection,
+    `/runs/${encodeURIComponent(runId)}/approval`,
+    { method: 'POST', body: JSON.stringify({ choice }) },
+  );
+}
+
+export function stopRun(connection: AgentConnection, runId: string) {
+  return brioFetch<{ run_id: string; status: string }>(
+    connection,
+    `/runs/${encodeURIComponent(runId)}/stop`,
+    { method: 'POST', body: '{}' },
+  );
+}
+
+export function listFiles(connection: AgentConnection, path?: string) {
+  return brioFetch<{
+    path: string;
+    entries: HermesFileEntry[];
+    roots?: string[];
+    error?: string;
+  }>(connection, `/files${path ? `?path=${encodeURIComponent(path)}` : ''}`);
+}
+
+export function readFile(connection: AgentConnection, path: string) {
+  return brioFetch<{ path: string; content: string }>(
+    connection,
+    `/files/read?path=${encodeURIComponent(path)}`,
+  );
+}
+
+export function writeFile(connection: AgentConnection, path: string, content: string) {
+  return brioFetch<{ ok: boolean }>(connection, '/files/write', {
+    method: 'PUT',
+    body: JSON.stringify({ path, content }),
+  });
+}
+
+export function getMemory(connection: AgentConnection) {
+  return brioFetch<{ memory: string; user: string }>(connection, '/memory');
+}
+
+export function updateMemory(
+  connection: AgentConnection,
+  value: { memory?: string; user?: string },
+) {
+  return brioFetch<{ ok: boolean }>(connection, '/memory', {
+    method: 'PUT',
+    body: JSON.stringify(value),
+  });
+}
+
+export function getRawConfig(connection: AgentConnection) {
+  return brioFetch<{ yaml: string; error?: string }>(connection, '/config/raw');
+}
+
+export function updateRawConfig(connection: AgentConnection, yaml: string) {
+  return brioFetch<{ ok: boolean }>(connection, '/config/raw', {
+    method: 'PUT',
+    body: JSON.stringify({ yaml }),
+  });
+}
+
+export function listSkills(connection: AgentConnection) {
+  return brioFetch<{ skills: HermesSkill[] }>(connection, '/skills');
+}
+
+export function getToolsets(connection: AgentConnection) {
+  return brioFetch<{ toolsets: Record<string, string[]>; error?: string }>(
+    connection,
+    '/tools/toolsets',
+  );
+}
+
+export function updateToolset(
+  connection: AgentConnection,
+  name: string,
+  enabled: boolean,
+  platform = 'cli',
+) {
+  return brioFetch<{ ok: boolean; platform: string; toolsets: string[] }>(
+    connection,
+    `/tools/toolsets/${encodeURIComponent(name)}`,
+    { method: 'PATCH', body: JSON.stringify({ enabled, platform }) },
+  );
+}
+
+export function getGatewayStatus(connection: AgentConnection) {
+  return brioFetch<{ running: boolean; status?: unknown; raw?: string }>(
+    connection,
+    '/gateway/status',
+  );
+}
+
+export function restartGateway(connection: AgentConnection) {
+  return brioFetch<{ ok: boolean; output?: string; error?: string }>(
+    connection,
+    '/gateway/restart',
+    { method: 'POST', body: '{}' },
+  );
+}
+
+export function getLogs(
+  connection: AgentConnection,
+  file: 'agent' | 'errors' | 'gateway' = 'agent',
+  lines = 200,
+) {
+  return brioFetch<{ file: string; lines: string[] }>(
+    connection,
+    `/logs?file=${file}&lines=${lines}`,
+  );
+}
+
+export function listJobs(connection: AgentConnection) {
+  return brioFetch<HermesJob[] | { jobs: HermesJob[] }>(connection, '/jobs/');
+}
+
+export function runJobAction(
+  connection: AgentConnection,
+  jobId: string,
+  action: 'pause' | 'resume' | 'trigger',
+) {
+  return brioFetch<Record<string, unknown>>(
+    connection,
+    `/jobs/${encodeURIComponent(jobId)}/${action}`,
+    { method: 'POST', body: '{}' },
+  );
+}
+
+export function deleteJob(connection: AgentConnection, jobId: string) {
+  return brioFetch<Record<string, unknown>>(
+    connection,
+    `/jobs/${encodeURIComponent(jobId)}`,
+    { method: 'DELETE' },
+  );
 }
 
 export async function sendResponse(

@@ -2,6 +2,17 @@
 
 Expo app for the Brio mobile control plane.
 
+The interface follows the native T3 Code mobile work model, adapted to the
+Hermes/Brio protocol:
+
+- searchable Hermes session list and persistent run state
+- conversation history, long-running tasks, cancellation, and approvals
+- direct and relay-backed environments
+- workspace file browser and editor
+- memory, config, skills, toolsets, scheduled jobs, logs, and gateway controls
+
+Expo is configured to use the Hermes JavaScript engine on iOS and Android.
+
 ## Run
 
 From the repo root:
