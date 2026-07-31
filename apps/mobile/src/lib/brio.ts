@@ -155,6 +155,37 @@ function cleanConnectionValue(value: string) {
   return value.trim().replace(/^["'`]+|[,"'`.;]+$/g, '');
 }
 
+async function fetchWithTimeout(
+  input: string,
+  init: RequestInit = {},
+  timeoutMilliseconds = 15_000,
+) {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), timeoutMilliseconds);
+  try {
+    return await fetch(input, { ...init, signal: controller.signal });
+  } catch (reason) {
+    if (controller.signal.aborted) {
+      throw new Error('Connection timed out');
+    }
+    throw reason;
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+async function withTimeout<T>(promise: Promise<T>, timeoutMilliseconds = 15_000) {
+  let timeout: ReturnType<typeof setTimeout> | undefined;
+  const timeoutPromise = new Promise<never>((_, reject) => {
+    timeout = setTimeout(() => reject(new Error('Connection timed out')), timeoutMilliseconds);
+  });
+  try {
+    return await Promise.race([promise, timeoutPromise]);
+  } finally {
+    if (timeout) clearTimeout(timeout);
+  }
+}
+
 export async function brioFetch<T>(
   connection: Pick<AgentConnection, 'url' | 'token'> & Partial<AgentConnection>,
   path: string,
@@ -478,10 +509,16 @@ export function connectionFromPairingPayload(payload: PairingPayload): AgentConn
   };
 }
 
-export async function finalizeConnection(connection: AgentConnection) {
+export type ConnectionProgress = 'claiming' | 'checking_companion' | 'checking_hermes' | 'ready';
+
+export async function finalizeConnection(
+  connection: AgentConnection,
+  onProgress?: (progress: ConnectionProgress) => void,
+) {
   let nextConnection = connection;
 
   if (connection.transport === 'relay') {
+    onProgress?.('claiming');
     const session = await createRelayDevice(connection.url);
     if (!connection.pairingCode) {
       throw new Error('Relay pairing payload is missing a code');
@@ -497,13 +534,16 @@ export async function finalizeConnection(connection: AgentConnection) {
     };
   }
 
-  const health = await getHealth(nextConnection);
+  onProgress?.('checking_companion');
+  const health = await withTimeout(getHealth(nextConnection));
   if (!health.ok) {
     throw new Error('Brio Companion did not report a healthy connection');
   }
+  onProgress?.('checking_hermes');
   if (!health.hermes_ok) {
     throw new Error('Brio Companion is online, but Hermes Agent is not reachable');
   }
+  onProgress?.('ready');
   return { ...nextConnection, status: 'online' as const };
 }
 
@@ -512,7 +552,7 @@ export async function createRelayDevice(
   email = 'dev@brio.local',
   deviceName = 'Brio mobile',
 ) {
-  const response = await fetch(`${normalizeBaseURL(relayURL)}/auth/devices`, {
+  const response = await fetchWithTimeout(`${normalizeBaseURL(relayURL)}/auth/devices`, {
     method: 'POST',
     headers: {
       Accept: 'application/json',
@@ -532,7 +572,7 @@ export async function claimRelayPairing(
   relayToken: string,
   pairingCode: string,
 ) {
-  const response = await fetch(
+  const response = await fetchWithTimeout(
     `${normalizeBaseURL(relayURL)}/pairings/${encodeURIComponent(pairingCode)}/claim`,
     {
       method: 'POST',
