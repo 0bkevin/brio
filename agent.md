@@ -6,8 +6,10 @@ This project now uses a control-plane enrollment model as the primary way to con
 
 - `apps/relay`
   - Cloud control plane.
-  - Stores users, device sessions, signed environment links, managed endpoints,
-    enrollments, pairings, and recovery state.
+  - Verifies Clerk account JWTs, exchanges them for scoped DPoP tokens, and
+    persists proof replay protection.
+  - Stores external identity mappings, proof-bound device registrations, signed
+    environment links, managed endpoints, enrollments, pairings, and recovery state.
   - Mobile app talks to this service first.
 - `apps/companion`
   - Runs next to Hermes on each machine.
@@ -16,7 +18,8 @@ This project now uses a control-plane enrollment model as the primary way to con
   - Mints short-lived, DPoP-bound client sessions only after validating a
     relay-signed request.
 - `apps/mobile`
-  - Signs into the relay.
+  - Signs in through Clerk and does not persist the Clerk JWT itself.
+  - Holds a P-256 proof key and obtains short-lived relay/environment DPoP tokens.
   - Lists owned agents.
   - Generates enrollment codes.
   - Uses the relay to bootstrap a direct managed-endpoint connection.
@@ -24,7 +27,7 @@ This project now uses a control-plane enrollment model as the primary way to con
 ## Preferred User Flow
 
 1. User opens the mobile app.
-2. User signs into the relay with email + device name.
+2. User signs in with Clerk; the app registers its installation and proof key.
 3. User generates an enrollment code in the app.
 4. On the Hermes machine, user runs:
 
@@ -95,7 +98,9 @@ brio companion recover \
 
 Authenticated device endpoints:
 
-- `POST /auth/devices`
+- `POST /v1/client/dpop-token`
+- `POST /v1/mobile/devices`
+- `DELETE /v1/mobile/devices/{id}`
 - `GET /me`
 - `GET /devices`
 - `DELETE /devices/{id}`
@@ -103,6 +108,8 @@ Authenticated device endpoints:
 - `POST /enrollments`
 - `POST /agents/{id}/recover`
 - `POST /pairings/{code}/claim`
+
+`POST /auth/devices` is a loopback-only development compatibility endpoint.
 
 Public companion-facing endpoints:
 
@@ -155,13 +162,22 @@ Important config values:
 - `BRIO_AGENT_ID`
 - `BRIO_TOKEN`
 - `HERMES_API_BASE`
+- `BRIO_CLERK_SECRET_KEY` or `BRIO_CLERK_JWT_KEY`
+- `BRIO_CLERK_ISSUER`
+- `BRIO_CLERK_JWT_AUDIENCE`
+- `BRIO_CLERK_AUTHORIZED_PARTIES`
+- `EXPO_PUBLIC_CLERK_PUBLISHABLE_KEY`
+- `EXPO_PUBLIC_CLERK_JWT_TEMPLATE`
 
 ## Development Notes
 
 - Prefer the control-plane flow over manual pairing for product work.
 - Keep direct local connect as a fallback for development and offline debugging.
 - Recovery is owner-authenticated and intentionally separate from normal enrollment.
-- Mobile relay sign-in is still lightweight and not a production identity system yet.
+- Production startup fails closed unless Clerk verification is configured.
+- Legacy email/device auth requires explicit development mode and a loopback HTTP issuer.
+- Relay DPoP tokens last 30 minutes; companion DPoP tokens last one hour and
+  enforce `brio:read` / `brio:operate` permissions.
 - Production relay storage requires a stable `BRIO_RELAY_SIGNING_KEY`.
 - Managed endpoints use retry-safe stable Cloudflare tunnel/DNS names, a
   default per-user limit of three, bounded exponential startup reconciliation,

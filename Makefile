@@ -47,13 +47,13 @@ export-mobile:
 	cd $(MOBILE_DIR) && npm run export:web -- --output-dir "$(WEB_EXPORT_DIR)"
 
 dev-mobile:
-	cd $(MOBILE_DIR) && npm run web -- --localhost
+	cd $(MOBILE_DIR) && EXPO_PUBLIC_BRIO_DEV_AUTH=true EXPO_PUBLIC_BRIO_RELAY_URL="$(BRIO_RELAY_URL)" npm run web -- --localhost
 
 dev-companion:
 	cd apps/companion && go run . companion run --addr "$(BRIO_ADDR)" --hermes-url "$(HERMES_API_BASE)"
 
 dev-relay:
-	cd apps/relay && go run . serve --addr "$(BRIO_RELAY_ADDR)"
+	cd apps/relay && go run . serve --addr "$(BRIO_RELAY_ADDR)" --dev-auth
 
 dev-companion-relay:
 	cd apps/companion && go run . companion run --addr "$(BRIO_ADDR)" --hermes-url "$(HERMES_API_BASE)" --relay-url "$(BRIO_RELAY_URL)" --agent-id "$(BRIO_AGENT_ID)"

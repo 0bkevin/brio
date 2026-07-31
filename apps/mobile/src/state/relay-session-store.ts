@@ -1,14 +1,15 @@
-import * as SecureStore from 'expo-secure-store';
-import { Platform } from 'react-native';
-import { create } from 'zustand';
+import * as SecureStore from "expo-secure-store";
+import { Platform } from "react-native";
+import { create } from "zustand";
 
 type RelaySession = {
   relayURL: string;
   email: string;
   deviceName: string;
-  token: string;
+  devToken?: string;
   userID: string;
   deviceID: string;
+  installationID: string;
 };
 
 type RelaySessionState = {
@@ -19,17 +20,17 @@ type RelaySessionState = {
   clearSession: () => Promise<void>;
 };
 
-const STORAGE_KEY = 'brio.relaySession.v1';
+const STORAGE_KEY = "brio.relaySession.v2";
 
 async function getStoredValue(key: string) {
-  if (Platform.OS === 'web') {
+  if (Platform.OS === "web") {
     return globalThis.localStorage?.getItem(key) ?? null;
   }
   return SecureStore.getItemAsync(key);
 }
 
 async function setStoredValue(key: string, value: string) {
-  if (Platform.OS === 'web') {
+  if (Platform.OS === "web") {
     globalThis.localStorage?.setItem(key, value);
     return;
   }
@@ -37,7 +38,7 @@ async function setStoredValue(key: string, value: string) {
 }
 
 async function deleteStoredValue(key: string) {
-  if (Platform.OS === 'web') {
+  if (Platform.OS === "web") {
     globalThis.localStorage?.removeItem(key);
     return;
   }
@@ -52,7 +53,10 @@ export const useRelaySessionStore = create<RelaySessionState>((set) => ({
   hydrate: async () => {
     try {
       const raw = await getStoredValue(STORAGE_KEY);
-      set({ session: raw ? (JSON.parse(raw) as RelaySession) : null, hydrated: true });
+      set({
+        session: raw ? (JSON.parse(raw) as RelaySession) : null,
+        hydrated: true,
+      });
     } catch {
       set({ session: null, hydrated: true });
     }

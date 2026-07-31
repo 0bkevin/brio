@@ -3,6 +3,7 @@ package connect
 import (
 	"crypto/ecdsa"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -54,7 +55,14 @@ func TestMintExchangeAndDPoPAuthenticatedRequest(t *testing.T) {
 	}
 
 	tokenURL := "https://agent.example/oauth/token"
-	form := url.Values{"subject_token": {minted.Credential}, "client_proof_key_thumbprint": {thumbprint}}
+	form := url.Values{
+		"grant_type":                  {TokenExchangeGrantType},
+		"subject_token":               {minted.Credential},
+		"subject_token_type":          {EnvironmentBootstrapType},
+		"requested_token_type":        {AccessTokenType},
+		"client_proof_key_thumbprint": {thumbprint},
+		"scope":                       {ScopeRead},
+	}
 	exchangeRequest := httptest.NewRequest(http.MethodPost, tokenURL, strings.NewReader(form.Encode()))
 	exchangeRequest.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	exchangeRequest.Header.Set("DPoP", signDPoP(t, clientKey, http.MethodPost, tokenURL, "", "dpop-1"))
@@ -66,22 +74,30 @@ func TestMintExchangeAndDPoPAuthenticatedRequest(t *testing.T) {
 	var token struct {
 		AccessToken string `json:"access_token"`
 		TokenType   string `json:"token_type"`
+		Scope       string `json:"scope"`
 	}
 	if err := json.Unmarshal(exchangeResponse.Body.Bytes(), &token); err != nil {
 		t.Fatal(err)
 	}
-	if token.TokenType != "DPoP" || token.AccessToken == "" {
+	if token.TokenType != "DPoP" || token.AccessToken == "" || token.Scope != ScopeRead {
 		t.Fatalf("unexpected token: %#v", token)
 	}
 
 	protectedURL := "https://agent.example/health"
 	protected := httptest.NewRequest(http.MethodGet, protectedURL, nil)
 	protected.Header.Set("DPoP", signDPoP(t, clientKey, http.MethodGet, protectedURL, token.AccessToken, "dpop-2"))
-	if !m.AuthenticateRequest(protected, token.AccessToken) {
-		t.Fatal("expected DPoP-bound session authentication")
+	if err := m.AuthenticateRequest(protected, token.AccessToken, ScopeRead); err != nil {
+		t.Fatalf("expected DPoP-bound session authentication: %v", err)
 	}
-	if m.AuthenticateRequest(protected, token.AccessToken) {
-		t.Fatal("expected replayed DPoP proof rejection")
+	if err := m.AuthenticateRequest(protected, token.AccessToken, ScopeRead); !errors.Is(err, ErrInvalidSession) {
+		t.Fatalf("expected replayed DPoP proof rejection, got %v", err)
+	}
+
+	writeURL := "https://agent.example/runs"
+	writeRequest := httptest.NewRequest(http.MethodPost, writeURL, nil)
+	writeRequest.Header.Set("DPoP", signDPoP(t, clientKey, http.MethodPost, writeURL, token.AccessToken, "dpop-3"))
+	if err := m.AuthenticateRequest(writeRequest, token.AccessToken, ScopeOperate); !errors.Is(err, ErrInsufficientScope) {
+		t.Fatalf("expected read-only token to reject an operation, got %v", err)
 	}
 }
 

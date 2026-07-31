@@ -8,28 +8,54 @@ import (
 )
 
 type MemoryStore struct {
-	mu          sync.Mutex
-	users       map[string]User
-	userByEmail map[string]string
-	devices     map[string]Device
-	deviceToken map[string]string
-	agents      map[string]Agent
-	agentToken  map[string]string
-	pairings    map[string]Pairing
-	enrollments map[string]Enrollment
+	mu             sync.Mutex
+	users          map[string]User
+	userByEmail    map[string]string
+	userByIdentity map[string]string
+	devices        map[string]Device
+	deviceToken    map[string]string
+	dpopProofs     map[string]time.Time
+	agents         map[string]Agent
+	agentToken     map[string]string
+	pairings       map[string]Pairing
+	enrollments    map[string]Enrollment
 }
 
 func NewMemoryStore() *MemoryStore {
 	return &MemoryStore{
-		users:       map[string]User{},
-		userByEmail: map[string]string{},
-		devices:     map[string]Device{},
-		deviceToken: map[string]string{},
-		agents:      map[string]Agent{},
-		agentToken:  map[string]string{},
-		pairings:    map[string]Pairing{},
-		enrollments: map[string]Enrollment{},
+		users:          map[string]User{},
+		userByEmail:    map[string]string{},
+		userByIdentity: map[string]string{},
+		devices:        map[string]Device{},
+		deviceToken:    map[string]string{},
+		dpopProofs:     map[string]time.Time{},
+		agents:         map[string]Agent{},
+		agentToken:     map[string]string{},
+		pairings:       map[string]Pairing{},
+		enrollments:    map[string]Enrollment{},
 	}
+}
+
+func (s *MemoryStore) UpsertIdentity(ctx context.Context, issuer string, subject string, email string) (User, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	issuer = strings.TrimRight(strings.TrimSpace(issuer), "/")
+	subject = strings.TrimSpace(subject)
+	if issuer == "" || subject == "" {
+		return User{}, ErrUnauthorized
+	}
+	key := issuer + "\x00" + subject
+	userID := s.userByIdentity[key]
+	if userID == "" {
+		userID = IdentityUserID(issuer, subject)
+		s.users[userID] = User{ID: userID, Email: strings.TrimSpace(email), IdentityIssuer: issuer, IdentitySubject: subject, CreatedAt: time.Now().UTC()}
+		s.userByIdentity[key] = userID
+	} else if email = strings.TrimSpace(email); email != "" {
+		user := s.users[userID]
+		user.Email = email
+		s.users[userID] = user
+	}
+	return s.users[userID], nil
 }
 
 func (s *MemoryStore) Close() {}
@@ -71,6 +97,57 @@ func (s *MemoryStore) AuthenticateDevice(ctx context.Context, token string) (Aut
 		return Auth{}, ErrUnauthorized
 	}
 	return Auth{User: user, Device: device}, nil
+}
+
+func (s *MemoryStore) UpsertDevice(ctx context.Context, userID string, deviceID string, name string, proofKeyThumbprint string) (Device, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, ok := s.users[userID]; !ok {
+		return Device{}, ErrUnauthorized
+	}
+	installationID := strings.TrimSpace(deviceID)
+	proofKeyThumbprint = strings.TrimSpace(proofKeyThumbprint)
+	if installationID == "" || proofKeyThumbprint == "" {
+		return Device{}, ErrUnauthorized
+	}
+	if name = strings.TrimSpace(name); name == "" {
+		name = "Brio mobile"
+	}
+	deviceID = DeviceRecordID(userID, installationID)
+	device, exists := s.devices[deviceID]
+	if exists && device.UserID != userID {
+		return Device{}, ErrUnauthorized
+	}
+	if !exists {
+		device = Device{ID: deviceID, InstallationID: installationID, UserID: userID, CreatedAt: time.Now().UTC()}
+	}
+	device.Name = name
+	device.ProofKeyThumbprint = proofKeyThumbprint
+	device.RevokedAt = nil
+	s.devices[deviceID] = device
+	return device, nil
+}
+
+func (s *MemoryStore) ConsumeDPoPProof(ctx context.Context, thumbprint string, jti string, issuedAt int64, expiresAt time.Time) (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	key := thumbprint + "\x00" + jti
+	if _, exists := s.dpopProofs[key]; exists {
+		return false, nil
+	}
+	s.dpopProofs[key] = expiresAt
+	return true, nil
+}
+
+func (s *MemoryStore) PruneDPoPProofs(ctx context.Context, now time.Time) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for key, expiry := range s.dpopProofs {
+		if !expiry.After(now) {
+			delete(s.dpopProofs, key)
+		}
+	}
+	return nil
 }
 
 func (s *MemoryStore) ListDevices(ctx context.Context, userID string) ([]Device, error) {

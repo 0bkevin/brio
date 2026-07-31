@@ -25,6 +25,17 @@ const (
 	HealthResponseType = "brio-connect-health-response+jwt"
 	MintRequestType    = "brio-connect-mint-request+jwt"
 	MintResponseType   = "brio-connect-mint-response+jwt"
+
+	TokenExchangeGrantType   = "urn:ietf:params:oauth:grant-type:token-exchange"
+	EnvironmentBootstrapType = "urn:brio:params:oauth:token-type:environment-bootstrap"
+	AccessTokenType          = "urn:ietf:params:oauth:token-type:access_token"
+	ScopeRead                = "brio:read"
+	ScopeOperate             = "brio:operate"
+)
+
+var (
+	ErrInvalidSession    = errors.New("invalid DPoP session")
+	ErrInsufficientScope = errors.New("insufficient session scope")
 )
 
 type Endpoint struct {
@@ -71,11 +82,13 @@ type Manager struct {
 type bootstrap struct {
 	ExpiresAt  time.Time
 	Thumbprint string
+	Scopes     []string
 }
 
 type session struct {
 	ExpiresAt  time.Time
 	Thumbprint string
+	Scopes     map[string]struct{}
 }
 
 func Open(path string) (*Manager, error) {
@@ -258,15 +271,21 @@ func (m *Manager) State() (State, bool) {
 	return *m.state, true
 }
 
-func (m *Manager) AuthenticateRequest(r *http.Request, token string) bool {
+func (m *Manager) AuthenticateRequest(r *http.Request, token, requiredScope string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.pruneLocked(time.Now())
 	value, ok := m.sessions[connectauth.HashToken(token)]
 	if !ok || !value.ExpiresAt.After(time.Now()) {
-		return false
+		return ErrInvalidSession
 	}
-	return m.verifyDPoPLocked(r, value.Thumbprint, connectauth.HashToken(token)) == nil
+	if err := m.verifyDPoPLocked(r, value.Thumbprint, connectauth.HashToken(token)); err != nil {
+		return fmt.Errorf("%w: %v", ErrInvalidSession, err)
+	}
+	if _, ok := value.Scopes[requiredScope]; !ok {
+		return ErrInsufficientScope
+	}
+	return nil
 }
 
 func (m *Manager) Health(w http.ResponseWriter, r *http.Request, descriptor map[string]any) {
@@ -292,6 +311,7 @@ func (m *Manager) Health(w http.ResponseWriter, r *http.Request, descriptor map[
 		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": "could not sign health response"})
 		return
 	}
+	writeNoStore(w)
 	writeJSON(w, http.StatusOK, map[string]any{
 		"environment_id": state.EnvironmentID,
 		"status":         "online",
@@ -316,7 +336,11 @@ func (m *Manager) MintCredential(w http.ResponseWriter, r *http.Request) {
 	expiresAt := now.Add(2 * time.Minute)
 	m.mu.Lock()
 	m.pruneLocked(now)
-	m.bootstraps[connectauth.HashToken(credential)] = bootstrap{ExpiresAt: expiresAt, Thumbprint: thumbprint}
+	m.bootstraps[connectauth.HashToken(credential)] = bootstrap{
+		ExpiresAt:  expiresAt,
+		Thumbprint: thumbprint,
+		Scopes:     []string{ScopeRead, ScopeOperate},
+	}
 	m.mu.Unlock()
 	proof, err := connectauth.Sign(key, MintResponseType, map[string]any{
 		"iss":                         "brio-env:" + state.EnvironmentID,
@@ -343,40 +367,96 @@ func (m *Manager) MintCredential(w http.ResponseWriter, r *http.Request) {
 }
 
 func (m *Manager) ExchangeToken(w http.ResponseWriter, r *http.Request) {
+	r.Body = http.MaxBytesReader(w, r.Body, 64<<10)
 	if err := r.ParseForm(); err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "invalid token request"})
+		writeOAuthError(w, "invalid_request", "invalid token request")
 		return
 	}
-	credential := strings.TrimSpace(r.Form.Get("subject_token"))
-	thumbprint := strings.TrimSpace(r.Form.Get("client_proof_key_thumbprint"))
+	grantType, grantOK := singleFormValue(r.Form, "grant_type")
+	subjectType, subjectTypeOK := singleFormValue(r.Form, "subject_token_type")
+	requestedType, requestedTypeOK := singleFormValue(r.Form, "requested_token_type")
+	credential, credentialOK := singleFormValue(r.Form, "subject_token")
+	thumbprint, thumbprintOK := singleFormValue(r.Form, "client_proof_key_thumbprint")
+	requestedScope, scopeOK := singleFormValue(r.Form, "scope")
+	if !grantOK || grantType != TokenExchangeGrantType ||
+		!subjectTypeOK || subjectType != EnvironmentBootstrapType ||
+		!requestedTypeOK || requestedType != AccessTokenType ||
+		!credentialOK || !thumbprintOK || !scopeOK {
+		writeOAuthError(w, "invalid_request", "token exchange parameters are missing, duplicated, or unsupported")
+		return
+	}
 	now := time.Now().UTC()
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.pruneLocked(now)
 	entry, ok := m.bootstraps[connectauth.HashToken(credential)]
-	if !ok || entry.ExpiresAt.Before(now) || entry.Thumbprint == "" || entry.Thumbprint != thumbprint || m.verifyDPoPLocked(r, entry.Thumbprint, "") != nil {
+	if !ok || entry.ExpiresAt.Before(now) || entry.Thumbprint == "" || entry.Thumbprint != thumbprint {
 		writeNoStore(w)
 		w.Header().Set("WWW-Authenticate", "DPoP")
-		writeJSON(w, http.StatusUnauthorized, map[string]any{"error": "invalid or expired bootstrap credential"})
+		writeJSON(w, http.StatusUnauthorized, map[string]any{"error": "invalid_grant", "error_description": "invalid or expired bootstrap credential"})
+		return
+	}
+	scopes, validScopes := requestedScopes(requestedScope, entry.Scopes)
+	if !validScopes {
+		writeOAuthError(w, "invalid_scope", "requested scope is empty or is not allowed by the bootstrap credential")
+		return
+	}
+	if m.verifyDPoPLocked(r, entry.Thumbprint, "") != nil {
+		writeNoStore(w)
+		w.Header().Set("WWW-Authenticate", "DPoP")
+		writeJSON(w, http.StatusUnauthorized, map[string]any{"error": "invalid_dpop_proof", "error_description": "DPoP proof is missing or invalid"})
 		return
 	}
 	delete(m.bootstraps, connectauth.HashToken(credential))
 	token := "brio_access_" + mustRandomToken(32)
 	expiresAt := now.Add(time.Hour)
-	m.sessions[connectauth.HashToken(token)] = session{ExpiresAt: expiresAt, Thumbprint: thumbprint}
+	scopeSet := make(map[string]struct{}, len(scopes))
+	for _, scope := range scopes {
+		scopeSet[scope] = struct{}{}
+	}
+	m.sessions[connectauth.HashToken(token)] = session{ExpiresAt: expiresAt, Thumbprint: thumbprint, Scopes: scopeSet}
 	writeNoStore(w)
 	writeJSON(w, http.StatusOK, map[string]any{
 		"access_token":      token,
-		"issued_token_type": "urn:ietf:params:oauth:token-type:access_token",
+		"issued_token_type": AccessTokenType,
 		"token_type":        "DPoP",
 		"expires_in":        3600,
-		"scope":             "brio:read brio:operate",
+		"scope":             strings.Join(scopes, " "),
 	})
+}
+
+func singleFormValue(values url.Values, key string) (string, bool) {
+	items, ok := values[key]
+	if !ok || len(items) != 1 {
+		return "", false
+	}
+	value := strings.TrimSpace(items[0])
+	return value, value != ""
+}
+
+func requestedScopes(raw string, allowed []string) ([]string, bool) {
+	allowedSet := make(map[string]struct{}, len(allowed))
+	for _, scope := range allowed {
+		allowedSet[scope] = struct{}{}
+	}
+	seen := make(map[string]struct{})
+	var scopes []string
+	for _, scope := range strings.Fields(raw) {
+		if _, ok := allowedSet[scope]; !ok {
+			return nil, false
+		}
+		if _, duplicate := seen[scope]; duplicate {
+			return nil, false
+		}
+		seen[scope] = struct{}{}
+		scopes = append(scopes, scope)
+	}
+	return scopes, len(scopes) > 0
 }
 
 func (m *Manager) verifyDPoPLocked(r *http.Request, expectedThumbprint, expectedAccessHash string) error {
 	proof := strings.TrimSpace(r.Header.Get("DPoP"))
-	if proof == "" {
+	if proof == "" || len(proof) > 16<<10 {
 		return errors.New("missing DPoP proof")
 	}
 	header, _, err := connectauth.DecodeUnverified(proof)
@@ -405,10 +485,11 @@ func (m *Manager) verifyDPoPLocked(r *http.Request, expectedThumbprint, expected
 		return errors.New("DPoP proof time is outside allowed skew")
 	}
 	jti := connectauth.StringClaim(verified.Claims, "jti")
-	if jti == "" {
+	if jti == "" || len(jti) > 128 {
 		return errors.New("DPoP proof is missing jti")
 	}
-	if _, replayed := m.replay["dpop:"+jti]; replayed {
+	replayKey := "dpop:" + expectedThumbprint + ":" + jti
+	if _, replayed := m.replay[replayKey]; replayed {
 		return errors.New("DPoP proof was already used")
 	}
 	if !strings.EqualFold(connectauth.StringClaim(verified.Claims, "htm"), r.Method) {
@@ -423,7 +504,7 @@ func (m *Manager) verifyDPoPLocked(r *http.Request, expectedThumbprint, expected
 	if expectedAccessHash == "" && connectauth.StringClaim(verified.Claims, "ath") != "" {
 		return errors.New("unexpected DPoP access-token hash")
 	}
-	m.replay["dpop:"+jti] = time.Now().Add(2 * time.Minute)
+	m.replay[replayKey] = time.Now().Add(2 * time.Minute)
 	return nil
 }
 
@@ -525,6 +606,11 @@ func mustRandomToken(size int) string {
 func writeNoStore(w http.ResponseWriter) {
 	w.Header().Set("Cache-Control", "no-store")
 	w.Header().Set("Pragma", "no-cache")
+}
+
+func writeOAuthError(w http.ResponseWriter, code, description string) {
+	writeNoStore(w)
+	writeJSON(w, http.StatusBadRequest, map[string]any{"error": code, "error_description": description})
 }
 
 func writeJSON(w http.ResponseWriter, status int, value any) {

@@ -57,3 +57,12 @@ func TestVerifyRejectsExpiredAndWrongAudience(t *testing.T) {
 		t.Fatal("expected audience rejection")
 	}
 }
+
+func TestParsePublicJWKRejectsPrivateMaterial(t *testing.T) {
+	key, _ := GeneratePrivateKey()
+	jwk := PublicJWK(&key.PublicKey)
+	jwk.D = "private-key-material"
+	if _, err := ParsePublicJWK(jwk); err == nil {
+		t.Fatal("expected a DPoP header containing private key material to be rejected")
+	}
+}

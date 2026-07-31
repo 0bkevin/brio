@@ -29,6 +29,11 @@ Postgres is optional for development. Persistent deployments also require a
 stable `BRIO_RELAY_SIGNING_KEY`; changing it invalidates the trust installed in
 linked companions.
 
+Production Brio Connect uses Clerk for account identity and Brio-issued,
+proof-of-possession tokens for relay and environment access. The old
+email/device-token identity exists only behind explicit loopback development
+mode.
+
 ## Local Fallback
 
 ```bash
@@ -71,7 +76,7 @@ make dev-mobile
 
 In the app:
 
-1. Sign in to the relay.
+1. Sign in with the configured Clerk account.
 2. Generate an enrollment code.
 
 On the Hermes machine:
@@ -85,6 +90,12 @@ single-use link proof. When the app connects, the relay sends a short-lived
 signed mint request to the companion and verifies its signed response. The app
 exchanges that one-time credential for a one-hour DPoP-bound session, so neither
 the relay nor the tunnel transport can reuse the resulting access token.
+
+The account token is never the companion credential. It is exchanged for a
+30-minute, scope-limited relay DPoP token; the companion then independently
+issues the final one-hour token with `brio:read` and/or `brio:operate` scopes.
+Replay protection is persisted by the relay, and every protected request binds
+the proof to the HTTP method, URL, access token, and the device's P-256 key.
 
 For a hosted managed endpoint, put `cloudflared` on the companion's `PATH` and
 configure the Cloudflare variables described below. Without them, development
@@ -162,6 +173,19 @@ Common values:
 - `BRIO_DATABASE_URL` - optional Postgres URL for relay persistence.
 - `BRIO_RELAY_ISSUER` - public absolute relay URL used as the JWT issuer.
 - `BRIO_RELAY_SIGNING_KEY` - PEM P-256 private key; required with Postgres.
+- `BRIO_CLERK_SECRET_KEY` or `BRIO_CLERK_JWT_KEY` - Clerk verification key
+  source. The public-key option supports verification without a JWKS request.
+- `BRIO_CLERK_ISSUER` - exact trusted Clerk issuer; required in production.
+- `BRIO_CLERK_JWT_AUDIENCE` - exact JWT-template audience, default
+  `brio-relay`.
+- `BRIO_CLERK_AUTHORIZED_PARTIES` - comma-separated allowed Clerk `azp`
+  origins/schemes; strongly recommended for production web/mobile builds.
+- `EXPO_PUBLIC_CLERK_PUBLISHABLE_KEY` - Clerk key embedded in the mobile app.
+- `EXPO_PUBLIC_CLERK_JWT_TEMPLATE` - Clerk template name configured with
+  audience `brio-relay`.
+- `EXPO_PUBLIC_BRIO_RELAY_URL` - public relay URL embedded in the app.
+- `BRIO_DEV_AUTH` and `EXPO_PUBLIC_BRIO_DEV_AUTH` - explicit legacy identity
+  compatibility for loopback development only; never enable in production.
 - `BRIO_CLOUDFLARE_ACCOUNT_ID`, `BRIO_CLOUDFLARE_API_TOKEN`,
   `BRIO_CLOUDFLARE_ZONE_ID`, `BRIO_TUNNEL_BASE_DOMAIN` - enable stable managed
   Cloudflare Tunnel endpoints.
@@ -186,7 +210,7 @@ npm run web
 
 ```bash
 cd apps/relay
-go run . serve --addr 127.0.0.1:8082
+go run . serve --addr 127.0.0.1:8082 --dev-auth
 ```
 
 ## Validation
@@ -202,14 +226,22 @@ The web export is written to `/tmp/brio-web-export` by default.
 
 ## Relay Endpoints
 
-- `POST /auth/devices` - create a device auth token for a user.
-- `GET /me` - inspect the authenticated device/user.
+- `POST /v1/client/dpop-token` - exchange a Clerk JWT for a 30-minute,
+  scope-limited, DPoP-bound relay token.
+- `POST /v1/mobile/devices` - register or rotate a physical installation's
+  proof key.
+- `DELETE /v1/mobile/devices/{id}` - unregister an owned installation.
+- `POST /auth/devices` - create a legacy device token; available only with
+  loopback `BRIO_DEV_AUTH`.
+- `GET /me` - inspect the authenticated cloud user without returning its token.
 - `GET /devices` - list devices for the authenticated user.
 - `DELETE /devices/{id}` - revoke a device token.
 - `GET /agents` - list agents owned by the authenticated user.
 - `POST /enrollments` - create a short-lived enrollment code for a user.
 - `POST /enrollments/{code}/claim` - claim an enrollment code from a Hermes machine.
 - `GET /.well-known/brio-connect` - relay issuer and signing-key metadata.
+- `GET /.well-known/oauth-authorization-server` - token exchange and scope metadata.
+- `GET /.well-known/oauth-protected-resource` - DPoP resource metadata.
 - `GET /v1/environments` - list linked environments.
 - `POST /v1/environments/{id}/status` - verify a signed environment health response.
 - `POST /v1/environments/{id}/connect` - broker a one-time, DPoP-bound environment credential.
@@ -221,7 +253,8 @@ The web export is written to `/tmp/brio-web-export` by default.
 - `GET /pairings/{code}` - inspect a pairing record.
 - `POST /pairings/{code}/claim` - claim a pairing once with a device token.
 - `GET /tunnel/companion/{agentID}?token=...` - authenticated companion WebSocket tunnel.
-- `GET /tunnel/mobile/{agentID}?token=...` - authenticated mobile WebSocket tunnel.
+- `GET /tunnel/mobile/{agentID}?token=...` - legacy mobile WebSocket tunnel,
+  disabled outside development auth.
 
 The `/tunnel/*`, pairing, and recovery endpoints are compatibility surfaces.
 New control-plane connections use the managed endpoint and do not proxy normal
@@ -245,3 +278,6 @@ brio companion recover \
 The mobile app includes the same recovery flow. It can request the recovered
 relay token and code, but the companion still must restart with that token
 before a fresh pairing payload can be used to reconnect.
+
+See [Brio Connect security architecture](docs/brio-connect-security.md) for the
+trust boundaries, token lifetimes, scopes, and deployment checklist.

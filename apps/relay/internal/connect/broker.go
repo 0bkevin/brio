@@ -117,8 +117,9 @@ func New(config Config, st store.Store) (*Broker, error) {
 	}, nil
 }
 
-func (b *Broker) Issuer() string             { return b.issuer }
-func (b *Broker) PublicKey() connectauth.JWK { return connectauth.PublicJWK(&b.key.PublicKey) }
+func (b *Broker) Issuer() string                { return b.issuer }
+func (b *Broker) PublicKey() connectauth.JWK    { return connectauth.PublicJWK(&b.key.PublicKey) }
+func (b *Broker) SigningKey() *ecdsa.PrivateKey { return b.key }
 
 func (b *Broker) VerifyEnrollmentProof(proof, code, expectedEnvironmentID string) (EnrollmentLink, error) {
 	header, claims, err := connectauth.DecodeUnverified(proof)

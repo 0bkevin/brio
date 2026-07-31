@@ -4,31 +4,41 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"sync"
 	"time"
 
+	relayauth "github.com/brio/brio/apps/relay/internal/auth"
 	connectcontrol "github.com/brio/brio/apps/relay/internal/connect"
 	"github.com/brio/brio/apps/relay/internal/store"
+	"github.com/brio/brio/packages/connectauth"
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
 	"nhooyr.io/websocket"
 )
 
 type Config struct {
-	Addr                string
-	DatabaseURL         string
-	RelayIssuer         string
-	SigningPrivateKey   string
-	CloudflareAccountID string
-	CloudflareAPIToken  string
-	CloudflareZoneID    string
-	TunnelBaseDomain    string
-	ManagedTunnelLimit  int
+	Addr                   string
+	DatabaseURL            string
+	RelayIssuer            string
+	SigningPrivateKey      string
+	CloudflareAccountID    string
+	CloudflareAPIToken     string
+	CloudflareZoneID       string
+	TunnelBaseDomain       string
+	ManagedTunnelLimit     int
+	ClerkSecretKey         string
+	ClerkJWTKey            string
+	ClerkIssuer            string
+	ClerkJWTAudience       string
+	ClerkAuthorizedParties []string
+	DevelopmentAuth        bool
 }
 
 type hub struct {
@@ -44,9 +54,13 @@ type peer struct {
 }
 
 type app struct {
-	hub     *hub
-	store   store.Store
-	connect *connectcontrol.Broker
+	hub        *hub
+	store      store.Store
+	connect    *connectcontrol.Broker
+	identities *identityService
+	tokens     *relayauth.TokenManager
+	devAuth    bool
+	now        func() time.Time
 }
 
 func Run(ctx context.Context, cfg Config) error {
@@ -76,36 +90,35 @@ func Run(ctx context.Context, cfg Config) error {
 	if err != nil {
 		return err
 	}
-	a := &app{hub: &hub{agents: map[string]map[*peer]bool{}}, store: st, connect: broker}
-	router := chi.NewRouter()
-	router.Use(middleware.RequestID)
-	router.Use(middleware.RealIP)
-	router.Use(middleware.Logger)
-	router.Use(middleware.Recoverer)
-	router.Use(cors)
-	router.Get("/health", a.health)
-	router.Post("/auth/devices", a.createDevice)
-	router.Group(func(r chi.Router) {
-		r.Use(a.requireDevice)
-		r.Get("/me", a.me)
-		r.Get("/devices", a.listDevices)
-		r.Delete("/devices/{id}", a.revokeDevice)
-		r.Get("/agents", a.listAgents)
-		r.Get("/v1/environments", a.listEnvironments)
-		r.Post("/enrollments", a.createEnrollment)
-		r.Post("/agents/{id}/recover", a.recoverAgent)
-		r.Post("/pairings/{code}/claim", a.claimPairing)
-		r.Post("/v1/environments/{id}/connect", a.connectEnvironment)
-		r.Post("/v1/environments/{id}/status", a.environmentStatus)
-		r.Delete("/v1/client/environment-links/{id}", a.unlinkEnvironment)
-	})
-	router.Post("/enrollments/{code}/claim", a.claimEnrollment)
-	router.Post("/pairings", a.createPairing)
-	router.Get("/pairings/{code}", a.getPairing)
-	router.Get("/tunnel/{role}/{agentID}", a.tunnel)
-	router.Get("/.well-known/brio-connect", a.connectMetadata)
-	router.Post("/v1/environments/{id}/tunnel/reconcile", a.reconcileEnvironmentEndpoint)
-	router.Delete("/v1/environments/{id}/tunnel", a.releaseEnvironmentEndpoint)
+	var identityVerifier relayauth.IdentityVerifier
+	if strings.TrimSpace(cfg.ClerkSecretKey) != "" || strings.TrimSpace(cfg.ClerkJWTKey) != "" {
+		identityVerifier, err = relayauth.NewClerkVerifier(relayauth.ClerkConfig{
+			SecretKey:         cfg.ClerkSecretKey,
+			JWTKey:            cfg.ClerkJWTKey,
+			Issuer:            cfg.ClerkIssuer,
+			Audience:          cfg.ClerkJWTAudience,
+			AuthorizedParties: cfg.ClerkAuthorizedParties,
+		})
+		if err != nil {
+			return fmt.Errorf("configure Clerk authentication: %w", err)
+		}
+	}
+	if cfg.DevelopmentAuth && !isDevelopmentIssuer(issuer) {
+		return errors.New("BRIO_DEV_AUTH is allowed only for a loopback HTTP relay issuer")
+	}
+	if identityVerifier == nil && !cfg.DevelopmentAuth {
+		return errors.New("configure Clerk authentication or explicitly enable BRIO_DEV_AUTH for a loopback development relay")
+	}
+	a := &app{
+		hub:        &hub{agents: map[string]map[*peer]bool{}},
+		store:      st,
+		connect:    broker,
+		identities: &identityService{verifier: identityVerifier, store: st, devAuth: cfg.DevelopmentAuth},
+		tokens:     relayauth.NewTokenManager(issuer, broker.SigningKey()),
+		devAuth:    cfg.DevelopmentAuth,
+		now:        func() time.Time { return time.Now().UTC() },
+	}
+	router := newRouter(a)
 	apiHandler := http.TimeoutHandler(router, 9*time.Second, `{"error":"relay_request_deadline_exceeded"}`+"\n")
 
 	srv := &http.Server{
@@ -138,6 +151,7 @@ func Run(ctx context.Context, cfg Config) error {
 		defer cancel()
 		_ = srv.Shutdown(shutdownCtx)
 	}()
+	go pruneDPoPProofs(ctx, st)
 
 	slog.Info("brio relay listening", "addr", cfg.Addr)
 	err = srv.ListenAndServe()
@@ -145,6 +159,76 @@ func Run(ctx context.Context, cfg Config) error {
 		return nil
 	}
 	return err
+}
+
+func pruneDPoPProofs(ctx context.Context, st store.Store) {
+	ticker := time.NewTicker(5 * time.Minute)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case now := <-ticker.C:
+			if err := st.PruneDPoPProofs(ctx, now.UTC()); err != nil {
+				slog.Warn("could not prune expired DPoP proofs", "error", err)
+			}
+		}
+	}
+}
+
+func newRouter(a *app) chi.Router {
+	router := chi.NewRouter()
+	router.Use(middleware.RequestID)
+	router.Use(middleware.RealIP)
+	router.Use(middleware.Logger)
+	router.Use(middleware.Recoverer)
+	router.Use(cors)
+	router.Get("/health", a.health)
+	if a.devAuth {
+		router.Post("/auth/devices", a.createDevice)
+	}
+	router.Get("/.well-known/oauth-authorization-server", a.authorizationServerMetadata)
+	router.Get("/.well-known/oauth-protected-resource", a.protectedResourceMetadata)
+	router.Post("/v1/client/dpop-token", a.exchangeDPoPToken)
+	router.Group(func(r chi.Router) {
+		r.Use(a.requireIdentity)
+		r.Get("/me", a.me)
+		r.Get("/devices", a.listDevices)
+		r.Delete("/devices/{id}", a.revokeDevice)
+		r.Get("/agents", a.listAgents)
+		r.Get("/v1/environments", a.listEnvironments)
+		r.Post("/enrollments", a.createEnrollment)
+		r.Post("/agents/{id}/recover", a.recoverAgent)
+		r.Post("/pairings/{code}/claim", a.claimPairing)
+		r.Delete("/v1/client/environment-links/{id}", a.unlinkEnvironment)
+	})
+	router.With(a.requireDPoP(relayauth.ScopeEnvironmentConnect)).Post("/v1/environments/{id}/connect", a.connectEnvironment)
+	router.With(a.requireDPoP(relayauth.ScopeEnvironmentStatus)).Post("/v1/environments/{id}/status", a.environmentStatus)
+	router.With(a.requireDPoP(relayauth.ScopeMobileRegistration)).Post("/v1/mobile/devices", a.registerMobileDevice)
+	router.With(a.requireDPoP(relayauth.ScopeMobileRegistration)).Delete("/v1/mobile/devices/{id}", a.unregisterMobileDevice)
+	router.Post("/enrollments/{code}/claim", a.claimEnrollment)
+	router.Post("/pairings", a.createPairing)
+	router.Get("/pairings/{code}", a.getPairing)
+	router.Get("/tunnel/{role}/{agentID}", a.tunnel)
+	router.Get("/.well-known/brio-connect", a.connectMetadata)
+	router.Post("/v1/environments/{id}/tunnel/reconcile", a.reconcileEnvironmentEndpoint)
+	router.Delete("/v1/environments/{id}/tunnel", a.releaseEnvironmentEndpoint)
+	return router
+}
+
+func (a *app) requestURL(r *http.Request) string {
+	return strings.TrimRight(a.connect.Issuer(), "/") + r.URL.EscapedPath()
+}
+
+func (a *app) nowUTC() time.Time { return a.now().UTC() }
+
+func isDevelopmentIssuer(raw string) bool {
+	parsed, err := url.Parse(raw)
+	if err != nil || parsed.Scheme != "http" || parsed.User != nil {
+		return false
+	}
+	host := strings.Trim(strings.ToLower(parsed.Hostname()), "[]")
+	return host == "localhost" || host == "127.0.0.1" || host == "::1"
 }
 
 func cors(next http.Handler) http.Handler {
@@ -192,12 +276,20 @@ func (a *app) createDevice(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
 		return
 	}
+	writeNoStore(w)
 	writeJSON(w, http.StatusCreated, map[string]any{"user": user, "device": device, "token": token})
 }
 
 func (a *app) me(w http.ResponseWriter, r *http.Request) {
 	auth := authFromContext(r.Context())
-	writeJSON(w, http.StatusOK, auth)
+	writeJSON(w, http.StatusOK, map[string]any{
+		"user": auth.User,
+		"identity": map[string]string{
+			"issuer":  auth.Identity.Issuer,
+			"subject": auth.Identity.Subject,
+		},
+		"auth_mode": auth.Mode,
+	})
 }
 
 func (a *app) listDevices(w http.ResponseWriter, r *http.Request) {
@@ -256,6 +348,7 @@ func (a *app) createEnrollment(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
 		return
 	}
+	writeNoStore(w)
 	writeJSON(w, http.StatusCreated, enrollment)
 }
 
@@ -337,6 +430,141 @@ func (a *app) connectMetadata(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+func (a *app) authorizationServerMetadata(w http.ResponseWriter, r *http.Request) {
+	issuer := a.connect.Issuer()
+	writeJSON(w, http.StatusOK, map[string]any{
+		"issuer":                                issuer,
+		"token_endpoint":                        issuer + "/v1/client/dpop-token",
+		"grant_types_supported":                 []string{"urn:ietf:params:oauth:grant-type:token-exchange"},
+		"token_endpoint_auth_methods_supported": []string{"none"},
+		"dpop_signing_alg_values_supported":     []string{"ES256"},
+		"scopes_supported": []string{
+			relayauth.ScopeEnvironmentConnect,
+			relayauth.ScopeEnvironmentStatus,
+			relayauth.ScopeMobileRegistration,
+		},
+	})
+}
+
+func (a *app) protectedResourceMetadata(w http.ResponseWriter, r *http.Request) {
+	issuer := a.connect.Issuer()
+	writeJSON(w, http.StatusOK, map[string]any{
+		"resource":              issuer,
+		"authorization_servers": []string{issuer},
+		"scopes_supported": []string{
+			relayauth.ScopeEnvironmentConnect,
+			relayauth.ScopeEnvironmentStatus,
+			relayauth.ScopeMobileRegistration,
+		},
+		"dpop_bound_access_tokens_required": true,
+		"dpop_signing_alg_values_supported": []string{"ES256"},
+	})
+}
+
+func (a *app) exchangeDPoPToken(w http.ResponseWriter, r *http.Request) {
+	r.Body = http.MaxBytesReader(w, r.Body, 64<<10)
+	if err := r.ParseForm(); err != nil {
+		writeAuthError(w, "invalid_token_exchange")
+		return
+	}
+	grantType, grantOK := singleAuthFormValue(r.Form, "grant_type")
+	subjectToken, subjectOK := singleAuthFormValue(r.Form, "subject_token")
+	subjectType, subjectTypeOK := singleAuthFormValue(r.Form, "subject_token_type")
+	requestedType, requestedTypeOK := singleAuthFormValue(r.Form, "requested_token_type")
+	resource, resourceOK := singleAuthFormValue(r.Form, "resource")
+	clientID, clientOK := singleAuthFormValue(r.Form, "client_id")
+	scope, scopeOK := singleAuthFormValue(r.Form, "scope")
+	if !grantOK || grantType != "urn:ietf:params:oauth:grant-type:token-exchange" ||
+		!subjectOK || !subjectTypeOK || subjectType != "urn:ietf:params:oauth:token-type:jwt" ||
+		!requestedTypeOK || requestedType != "urn:ietf:params:oauth:token-type:access_token" ||
+		!resourceOK || strings.TrimRight(resource, "/") != a.connect.Issuer() || !clientOK || !scopeOK {
+		writeAuthError(w, "invalid_token_exchange")
+		return
+	}
+	scopes, ok := relayauth.ResolveScopes(clientID, scope)
+	if !ok {
+		writeAuthError(w, "invalid_scope")
+		return
+	}
+	principal, err := a.identities.authenticate(r.Context(), subjectToken)
+	if err != nil {
+		writeAuthError(w, "invalid_bearer")
+		return
+	}
+	proof, err := relayauth.VerifyAndConsumeDPoP(
+		r.Context(), a.store, r.Header.Get("DPoP"), r.Method, a.requestURL(r), "", "", a.nowUTC(),
+	)
+	if err != nil {
+		w.Header().Set("WWW-Authenticate", "DPoP")
+		writeAuthError(w, "invalid_dpop")
+		return
+	}
+	jti, err := connectauth.RandomToken(18)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": "internal_error"})
+		return
+	}
+	token, err := a.tokens.Issue(principal.User.ID, clientID, scopes, proof.Thumbprint, a.nowUTC(), jti)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": "internal_error"})
+		return
+	}
+	writeNoStore(w)
+	writeJSON(w, http.StatusOK, map[string]any{
+		"access_token":      token,
+		"issued_token_type": "urn:ietf:params:oauth:token-type:access_token",
+		"token_type":        "DPoP",
+		"expires_in":        int(relayauth.RelayAccessTokenTTL / time.Second),
+		"scope":             strings.Join(scopes, " "),
+	})
+}
+
+func singleAuthFormValue(values url.Values, key string) (string, bool) {
+	items, ok := values[key]
+	if !ok || len(items) != 1 {
+		return "", false
+	}
+	value := strings.TrimSpace(items[0])
+	return value, value != ""
+}
+
+func (a *app) registerMobileDevice(w http.ResponseWriter, r *http.Request) {
+	principal := authFromContext(r.Context())
+	var body struct {
+		DeviceID string `json:"device_id"`
+		Label    string `json:"label"`
+		Name     string `json:"name"`
+	}
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 64<<10)).Decode(&body); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "invalid JSON"})
+		return
+	}
+	label := strings.TrimSpace(body.Label)
+	if label == "" {
+		label = strings.TrimSpace(body.Name)
+	}
+	if len(strings.TrimSpace(body.DeviceID)) > 200 || len(label) > 200 {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "device fields are too long"})
+		return
+	}
+	device, err := a.store.UpsertDevice(r.Context(), principal.User.ID, strings.TrimSpace(body.DeviceID), label, principal.ProofKeyThumbprint)
+	if err != nil {
+		writeStoreError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"device": device})
+}
+
+func (a *app) unregisterMobileDevice(w http.ResponseWriter, r *http.Request) {
+	principal := authFromContext(r.Context())
+	device, err := a.store.RevokeDevice(r.Context(), principal.User.ID, strings.TrimSpace(chi.URLParam(r, "id")))
+	if err != nil {
+		writeStoreError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"device": device})
+}
+
 func (a *app) connectEnvironment(w http.ResponseWriter, r *http.Request) {
 	auth := authFromContext(r.Context())
 	var body struct {
@@ -351,6 +579,10 @@ func (a *app) connectEnvironment(w http.ResponseWriter, r *http.Request) {
 	thumbprint := strings.TrimSpace(body.ClientProofKeyThumbprint)
 	if thumbprint == "" {
 		thumbprint = strings.TrimSpace(body.ClientKeyThumbprint)
+	}
+	if thumbprint == "" || thumbprint != auth.ProofKeyThumbprint {
+		writeAuthError(w, "dpop_key_mismatch")
+		return
 	}
 	result, err := a.connect.Connect(r.Context(), auth.User.ID, strings.TrimSpace(chi.URLParam(r, "id")), thumbprint, strings.TrimSpace(body.DeviceID))
 	if err != nil {
@@ -442,6 +674,7 @@ func (a *app) recoverAgent(w http.ResponseWriter, r *http.Request) {
 		writeStoreError(w, err)
 		return
 	}
+	writeNoStore(w)
 	writeJSON(w, http.StatusCreated, p)
 }
 
@@ -467,6 +700,7 @@ func (a *app) createPairing(w http.ResponseWriter, r *http.Request) {
 		writeStoreError(w, err)
 		return
 	}
+	writeNoStore(w)
 	writeJSON(w, http.StatusCreated, p)
 }
 
@@ -477,6 +711,7 @@ func (a *app) getPairing(w http.ResponseWriter, r *http.Request) {
 		writeStoreError(w, err)
 		return
 	}
+	writeNoStore(w)
 	writeJSON(w, http.StatusOK, p)
 }
 
@@ -488,6 +723,7 @@ func (a *app) claimPairing(w http.ResponseWriter, r *http.Request) {
 		writeStoreError(w, err)
 		return
 	}
+	writeNoStore(w)
 	writeJSON(w, http.StatusOK, map[string]any{"agent": agent})
 }
 
@@ -503,6 +739,10 @@ func (a *app) tunnel(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if role == "mobile" {
+		if !a.devAuth {
+			writeJSON(w, http.StatusGone, map[string]any{"error": "legacy mobile tunnel is disabled"})
+			return
+		}
 		token := r.URL.Query().Get("token")
 		if token == "" {
 			writeJSON(w, http.StatusUnauthorized, map[string]any{"error": "missing device token"})

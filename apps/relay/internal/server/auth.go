@@ -7,39 +7,123 @@ import (
 	"net/http"
 	"strings"
 
+	relayauth "github.com/brio/brio/apps/relay/internal/auth"
 	"github.com/brio/brio/apps/relay/internal/store"
 )
 
 type authContextKey struct{}
 
-func (a *app) requireDevice(next http.Handler) http.Handler {
+type authPrincipal struct {
+	User               store.User
+	Identity           relayauth.Identity
+	Token              string
+	ProofKeyThumbprint string
+	Scopes             []string
+	Mode               string
+}
+
+type identityService struct {
+	verifier relayauth.IdentityVerifier
+	store    store.Store
+	devAuth  bool
+}
+
+func (s *identityService) authenticate(ctx context.Context, token string) (authPrincipal, error) {
+	if s.verifier != nil {
+		identity, err := s.verifier.Verify(ctx, token)
+		if err == nil {
+			user, err := s.store.UpsertIdentity(ctx, identity.Issuer, identity.Subject, identity.Email)
+			if err != nil {
+				return authPrincipal{}, err
+			}
+			return authPrincipal{User: user, Identity: identity, Token: token, Mode: "clerk_bearer"}, nil
+		}
+	}
+	if s.devAuth {
+		legacy, err := s.store.AuthenticateDevice(ctx, token)
+		if err == nil {
+			return authPrincipal{
+				User:     legacy.User,
+				Identity: relayauth.Identity{Issuer: "urn:brio:dev", Subject: legacy.User.ID, Email: legacy.User.Email},
+				Token:    token,
+				Mode:     "development_device_bearer",
+			}, nil
+		}
+	}
+	return authPrincipal{}, store.ErrUnauthorized
+}
+
+func (a *app) requireIdentity(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		token := bearerToken(r)
 		if token == "" {
-			writeJSON(w, http.StatusUnauthorized, map[string]any{"error": "missing bearer token"})
+			writeAuthError(w, "missing_bearer")
 			return
 		}
-		auth, err := a.store.AuthenticateDevice(r.Context(), token)
+		principal, err := a.identities.authenticate(r.Context(), token)
 		if err != nil {
-			writeStoreError(w, err)
+			writeAuthError(w, "invalid_bearer")
 			return
 		}
-		ctx := context.WithValue(r.Context(), authContextKey{}, auth)
-		next.ServeHTTP(w, r.WithContext(ctx))
+		next.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), authContextKey{}, principal)))
 	})
 }
 
-func authFromContext(ctx context.Context) store.Auth {
-	auth, _ := ctx.Value(authContextKey{}).(store.Auth)
+func (a *app) requireDPoP(scope string) func(http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("WWW-Authenticate", "DPoP")
+			token := authorizationToken(r, "DPoP")
+			if token == "" {
+				writeAuthError(w, "invalid_bearer")
+				return
+			}
+			claims, err := a.tokens.Verify(token, a.now())
+			if err != nil || !relayauth.HasScope(claims.Scopes, scope) {
+				writeAuthError(w, "invalid_bearer")
+				return
+			}
+			proof, err := relayauth.VerifyAndConsumeDPoP(
+				r.Context(), a.store, r.Header.Get("DPoP"), r.Method, a.requestURL(r),
+				claims.Thumbprint, token, a.now(),
+			)
+			if err != nil {
+				writeAuthError(w, "invalid_dpop")
+				return
+			}
+			principal := authPrincipal{
+				User:               store.User{ID: claims.UserID},
+				Token:              token,
+				ProofKeyThumbprint: proof.Thumbprint,
+				Scopes:             claims.Scopes,
+				Mode:               "relay_dpop",
+			}
+			next.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), authContextKey{}, principal)))
+		})
+	}
+}
+
+func authFromContext(ctx context.Context) authPrincipal {
+	auth, _ := ctx.Value(authContextKey{}).(authPrincipal)
 	return auth
 }
 
 func bearerToken(r *http.Request) string {
-	auth := strings.TrimSpace(r.Header.Get("Authorization"))
-	if !strings.HasPrefix(auth, "Bearer ") {
+	return authorizationToken(r, "Bearer")
+}
+
+func authorizationToken(r *http.Request, scheme string) string {
+	authorization := strings.TrimSpace(r.Header.Get("Authorization"))
+	prefix := scheme + " "
+	if !strings.HasPrefix(authorization, prefix) {
 		return ""
 	}
-	return strings.TrimSpace(strings.TrimPrefix(auth, "Bearer "))
+	return strings.TrimSpace(strings.TrimPrefix(authorization, prefix))
+}
+
+func writeAuthError(w http.ResponseWriter, reason string) {
+	writeNoStore(w)
+	writeJSON(w, http.StatusUnauthorized, map[string]any{"error": "auth_invalid", "reason": reason})
 }
 
 func openStore(ctx context.Context, databaseURL string) (store.Store, error) {
@@ -61,6 +145,6 @@ func writeStoreError(w http.ResponseWriter, err error) {
 	case errors.Is(err, store.ErrUsed):
 		writeJSON(w, http.StatusConflict, map[string]any{"error": "already used"})
 	default:
-		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
+		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": "internal_error"})
 	}
 }

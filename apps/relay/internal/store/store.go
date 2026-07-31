@@ -7,6 +7,7 @@ import (
 	"encoding/base32"
 	"encoding/hex"
 	"errors"
+	"strings"
 	"time"
 )
 
@@ -18,17 +19,21 @@ var (
 )
 
 type User struct {
-	ID        string    `json:"id"`
-	Email     string    `json:"email"`
-	CreatedAt time.Time `json:"created_at"`
+	ID              string    `json:"id"`
+	Email           string    `json:"email,omitempty"`
+	IdentityIssuer  string    `json:"identity_issuer,omitempty"`
+	IdentitySubject string    `json:"identity_subject,omitempty"`
+	CreatedAt       time.Time `json:"created_at"`
 }
 
 type Device struct {
-	ID        string     `json:"id"`
-	UserID    string     `json:"user_id"`
-	Name      string     `json:"name"`
-	CreatedAt time.Time  `json:"created_at"`
-	RevokedAt *time.Time `json:"revoked_at,omitempty"`
+	ID                 string     `json:"id"`
+	InstallationID     string     `json:"installation_id,omitempty"`
+	UserID             string     `json:"user_id"`
+	Name               string     `json:"name"`
+	ProofKeyThumbprint string     `json:"proof_key_thumbprint,omitempty"`
+	CreatedAt          time.Time  `json:"created_at"`
+	RevokedAt          *time.Time `json:"revoked_at,omitempty"`
 }
 
 type ManagedEndpoint struct {
@@ -82,10 +87,14 @@ type Auth struct {
 
 type Store interface {
 	Close()
+	UpsertIdentity(ctx context.Context, issuer string, subject string, email string) (User, error)
 	CreateDeviceToken(ctx context.Context, email string, deviceName string) (User, Device, string, error)
 	AuthenticateDevice(ctx context.Context, token string) (Auth, error)
+	UpsertDevice(ctx context.Context, userID string, deviceID string, name string, proofKeyThumbprint string) (Device, error)
 	ListDevices(ctx context.Context, userID string) ([]Device, error)
 	RevokeDevice(ctx context.Context, userID string, deviceID string) (Device, error)
+	ConsumeDPoPProof(ctx context.Context, thumbprint string, jti string, issuedAt int64, expiresAt time.Time) (bool, error)
+	PruneDPoPProofs(ctx context.Context, now time.Time) error
 	AuthenticateCompanion(ctx context.Context, agentID string, token string) error
 	AuthenticateEnvironment(ctx context.Context, agentID string, credential string) (Agent, error)
 	UpsertAgent(ctx context.Context, agentID string, name string) (Agent, error)
@@ -103,6 +112,16 @@ type Store interface {
 	UnlinkAgent(ctx context.Context, userID string, agentID string) (bool, error)
 	UpdateConnectEndpoint(ctx context.Context, agentID string, endpoint ManagedEndpoint) error
 	CountManagedEndpoints(ctx context.Context, userID string, excludingAgentID string) (int, error)
+}
+
+func IdentityUserID(issuer string, subject string) string {
+	sum := sha256.Sum256([]byte(strings.TrimRight(strings.TrimSpace(issuer), "/") + "\x00" + strings.TrimSpace(subject)))
+	return "usr_" + hex.EncodeToString(sum[:16])
+}
+
+func DeviceRecordID(userID string, installationID string) string {
+	sum := sha256.Sum256([]byte(strings.TrimSpace(userID) + "\x00" + strings.TrimSpace(installationID)))
+	return "dev_" + hex.EncodeToString(sum[:16])
 }
 
 func HashSecret(secret string) string {

@@ -1,13 +1,14 @@
-import { DarkTheme, DefaultTheme, ThemeProvider } from 'expo-router';
-import { useEffect } from 'react';
-import { useColorScheme } from 'react-native';
-import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
+import { DarkTheme, DefaultTheme, ThemeProvider } from "expo-router";
+import { useEffect } from "react";
+import { useColorScheme } from "react-native";
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 
-import { AnimatedSplashOverlay } from '@/components/animated-icon';
-import AppTabs from '@/components/app-tabs';
-import { useConnectionStore } from '@/state/connection-store';
-import { useRelaySessionStore } from '@/state/relay-session-store';
-import { useUIStore } from '@/state/ui-store';
+import { AnimatedSplashOverlay } from "@/components/animated-icon";
+import AppTabs from "@/components/app-tabs";
+import { CloudAuthProvider } from "@/lib/cloud-auth";
+import { useConnectionStore } from "@/state/connection-store";
+import { useRelaySessionStore } from "@/state/relay-session-store";
+import { useUIStore } from "@/state/ui-store";
 
 const queryClient = new QueryClient();
 
@@ -24,11 +25,15 @@ export default function TabLayout() {
   }, [hydrate, hydrateRelaySession, hydrateUI]);
 
   return (
-    <QueryClientProvider client={queryClient}>
-      <ThemeProvider value={colorScheme === 'dark' ? DarkTheme : DefaultTheme}>
-        <AnimatedSplashOverlay />
-        <AppTabs />
-      </ThemeProvider>
-    </QueryClientProvider>
+    <CloudAuthProvider>
+      <QueryClientProvider client={queryClient}>
+        <ThemeProvider
+          value={colorScheme === "dark" ? DarkTheme : DefaultTheme}
+        >
+          <AnimatedSplashOverlay />
+          <AppTabs />
+        </ThemeProvider>
+      </QueryClientProvider>
+    </CloudAuthProvider>
   );
 }

@@ -3,6 +3,7 @@ module github.com/brio/brio/apps/relay
 go 1.26.1
 
 require (
+	github.com/clerk/clerk-sdk-go/v2 v2.7.0
 	github.com/go-chi/chi/v5 v5.3.0
 	github.com/jackc/pgx/v5 v5.9.2
 	github.com/spf13/cobra v1.10.2

@@ -16,6 +16,7 @@ import (
 	"strings"
 	"time"
 
+	connectcontrol "github.com/brio/brio/apps/companion/internal/connect"
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
 	"gopkg.in/yaml.v3"
@@ -138,9 +139,20 @@ func (a *app) auth(next http.Handler) http.Handler {
 			next.ServeHTTP(w, r)
 			return
 		}
-		if strings.HasPrefix(auth, "DPoP ") && a.cfg.Connect != nil && a.cfg.Connect.AuthenticateRequest(r, strings.TrimSpace(strings.TrimPrefix(auth, "DPoP "))) {
-			next.ServeHTTP(w, r)
-			return
+		if strings.HasPrefix(auth, "DPoP ") && a.cfg.Connect != nil {
+			requiredScope := connectcontrol.ScopeOperate
+			if r.Method == http.MethodGet || r.Method == http.MethodHead {
+				requiredScope = connectcontrol.ScopeRead
+			}
+			err := a.cfg.Connect.AuthenticateRequest(r, strings.TrimSpace(strings.TrimPrefix(auth, "DPoP ")), requiredScope)
+			if err == nil {
+				next.ServeHTTP(w, r)
+				return
+			}
+			if errors.Is(err, connectcontrol.ErrInsufficientScope) {
+				writeJSON(w, http.StatusForbidden, map[string]any{"error": "insufficient_scope", "required_scope": requiredScope})
+				return
+			}
 		}
 		{
 			if strings.HasPrefix(auth, "DPoP ") {

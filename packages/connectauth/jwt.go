@@ -26,6 +26,7 @@ type JWK struct {
 	Crv string `json:"crv"`
 	X   string `json:"x"`
 	Y   string `json:"y"`
+	D   string `json:"d,omitempty"`
 }
 
 type Claims struct {
@@ -80,7 +81,7 @@ func PublicJWK(key *ecdsa.PublicKey) JWK {
 }
 
 func ParsePublicJWK(jwk JWK) (*ecdsa.PublicKey, error) {
-	if jwk.Kty != "EC" || jwk.Crv != "P-256" || jwk.X == "" || jwk.Y == "" {
+	if jwk.Kty != "EC" || jwk.Crv != "P-256" || jwk.X == "" || jwk.Y == "" || jwk.D != "" {
 		return nil, errors.New("JWK must be an EC P-256 public key")
 	}
 	xBytes, err := rawURL.DecodeString(jwk.X)

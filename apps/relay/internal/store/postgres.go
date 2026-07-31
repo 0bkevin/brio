@@ -35,14 +35,18 @@ func (s *PostgresStore) migrate(ctx context.Context) error {
 	_, err := s.pool.Exec(ctx, `
 CREATE TABLE IF NOT EXISTS users (
   id TEXT PRIMARY KEY,
-  email TEXT NOT NULL UNIQUE,
+  email TEXT,
+	identity_issuer TEXT,
+	identity_subject TEXT,
   created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 CREATE TABLE IF NOT EXISTS devices (
   id TEXT PRIMARY KEY,
   user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
   name TEXT NOT NULL,
-  token_hash TEXT NOT NULL UNIQUE,
+	token_hash TEXT UNIQUE,
+	proof_key_thumbprint TEXT,
+	installation_id TEXT,
   created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
   revoked_at TIMESTAMPTZ
 );
@@ -72,6 +76,14 @@ CREATE TABLE IF NOT EXISTS enrollment_sessions (
   used_at TIMESTAMPTZ,
   created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+CREATE TABLE IF NOT EXISTS dpop_proofs (
+	thumbprint TEXT NOT NULL,
+	jti TEXT NOT NULL,
+	issued_at BIGINT NOT NULL,
+	expires_at TIMESTAMPTZ NOT NULL,
+	created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+	PRIMARY KEY (thumbprint, jti)
+);
 CREATE INDEX IF NOT EXISTS idx_devices_user_id ON devices(user_id);
 CREATE INDEX IF NOT EXISTS idx_agents_owner_user_id ON agents(owner_user_id);
 CREATE INDEX IF NOT EXISTS idx_pairing_sessions_agent_id ON pairing_sessions(agent_id);
@@ -83,8 +95,41 @@ ALTER TABLE agents ADD COLUMN IF NOT EXISTS endpoint_http_url TEXT;
 ALTER TABLE agents ADD COLUMN IF NOT EXISTS endpoint_ws_url TEXT;
 ALTER TABLE agents ADD COLUMN IF NOT EXISTS endpoint_provider TEXT;
 ALTER TABLE agents ADD COLUMN IF NOT EXISTS linked_at TIMESTAMPTZ;
+ALTER TABLE users ALTER COLUMN email DROP NOT NULL;
+ALTER TABLE users DROP CONSTRAINT IF EXISTS users_email_key;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS identity_issuer TEXT;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS identity_subject TEXT;
+ALTER TABLE devices ALTER COLUMN token_hash DROP NOT NULL;
+ALTER TABLE devices ADD COLUMN IF NOT EXISTS proof_key_thumbprint TEXT;
+ALTER TABLE devices ADD COLUMN IF NOT EXISTS installation_id TEXT;
+CREATE UNIQUE INDEX IF NOT EXISTS idx_users_identity ON users(identity_issuer, identity_subject)
+	WHERE identity_issuer IS NOT NULL AND identity_subject IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_dpop_proofs_expires_at ON dpop_proofs(expires_at);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_devices_user_installation ON devices(user_id, installation_id)
+	WHERE installation_id IS NOT NULL;
 `)
 	return err
+}
+
+func (s *PostgresStore) UpsertIdentity(ctx context.Context, issuer string, subject string, email string) (User, error) {
+	issuer = strings.TrimRight(strings.TrimSpace(issuer), "/")
+	subject = strings.TrimSpace(subject)
+	email = strings.TrimSpace(email)
+	if issuer == "" || subject == "" {
+		return User{}, ErrUnauthorized
+	}
+	var user User
+	err := s.pool.QueryRow(ctx, `
+INSERT INTO users (id, email, identity_issuer, identity_subject)
+VALUES ($1, NULLIF(lower($2), ''), $3, $4)
+ON CONFLICT (identity_issuer, identity_subject)
+	WHERE identity_issuer IS NOT NULL AND identity_subject IS NOT NULL
+DO UPDATE SET email = COALESCE(NULLIF(EXCLUDED.email, ''), users.email)
+RETURNING id, COALESCE(email, ''), COALESCE(identity_issuer, ''), COALESCE(identity_subject, ''), created_at
+`, IdentityUserID(issuer, subject), email, issuer, subject).Scan(
+		&user.ID, &user.Email, &user.IdentityIssuer, &user.IdentitySubject, &user.CreatedAt,
+	)
+	return user, err
 }
 
 func (s *PostgresStore) CreateDeviceToken(ctx context.Context, email string, deviceName string) (User, Device, string, error) {
@@ -94,7 +139,7 @@ func (s *PostgresStore) CreateDeviceToken(ctx context.Context, email string, dev
 	if deviceName == "" {
 		deviceName = "Development device"
 	}
-	userID := "usr_" + RandomCode(24)
+	userID := IdentityUserID("urn:brio:development-email", strings.ToLower(strings.TrimSpace(email)))
 	deviceID := "dev_" + RandomCode(24)
 	token := "brio_" + RandomCode(48)
 	tokenHash := HashSecret(token)
@@ -107,13 +152,13 @@ func (s *PostgresStore) CreateDeviceToken(ctx context.Context, email string, dev
 
 	_, err = tx.Exec(ctx, `
 INSERT INTO users (id, email) VALUES ($1, lower($2))
-ON CONFLICT (email) DO NOTHING
+ON CONFLICT (id) DO UPDATE SET email = EXCLUDED.email
 `, userID, email)
 	if err != nil {
 		return User{}, Device{}, "", err
 	}
 	var user User
-	err = tx.QueryRow(ctx, `SELECT id, email, created_at FROM users WHERE email = lower($1)`, email).Scan(&user.ID, &user.Email, &user.CreatedAt)
+	err = tx.QueryRow(ctx, `SELECT id, email, created_at FROM users WHERE id = $1`, userID).Scan(&user.ID, &user.Email, &user.CreatedAt)
 	if err != nil {
 		return User{}, Device{}, "", err
 	}
@@ -149,9 +194,54 @@ WHERE d.token_hash = $1 AND d.revoked_at IS NULL
 	return auth, err
 }
 
+func (s *PostgresStore) UpsertDevice(ctx context.Context, userID string, deviceID string, name string, proofKeyThumbprint string) (Device, error) {
+	installationID := strings.TrimSpace(deviceID)
+	proofKeyThumbprint = strings.TrimSpace(proofKeyThumbprint)
+	if installationID == "" || proofKeyThumbprint == "" {
+		return Device{}, ErrUnauthorized
+	}
+	if name = strings.TrimSpace(name); name == "" {
+		name = "Brio mobile"
+	}
+	deviceID = DeviceRecordID(userID, installationID)
+	var device Device
+	err := s.pool.QueryRow(ctx, `
+INSERT INTO devices (id, user_id, name, proof_key_thumbprint, installation_id)
+VALUES ($1, $2, $3, $4, $5)
+ON CONFLICT (user_id, installation_id) WHERE installation_id IS NOT NULL DO UPDATE
+SET name = EXCLUDED.name,
+	proof_key_thumbprint = EXCLUDED.proof_key_thumbprint,
+	revoked_at = NULL
+RETURNING id, COALESCE(installation_id, ''), user_id, name, COALESCE(proof_key_thumbprint, ''), created_at, revoked_at
+`, deviceID, userID, name, proofKeyThumbprint, installationID).Scan(
+		&device.ID, &device.InstallationID, &device.UserID, &device.Name, &device.ProofKeyThumbprint, &device.CreatedAt, &device.RevokedAt,
+	)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return Device{}, ErrUnauthorized
+	}
+	return device, err
+}
+
+func (s *PostgresStore) ConsumeDPoPProof(ctx context.Context, thumbprint string, jti string, issuedAt int64, expiresAt time.Time) (bool, error) {
+	command, err := s.pool.Exec(ctx, `
+INSERT INTO dpop_proofs (thumbprint, jti, issued_at, expires_at)
+VALUES ($1, $2, $3, $4)
+ON CONFLICT DO NOTHING
+`, thumbprint, jti, issuedAt, expiresAt)
+	if err != nil {
+		return false, err
+	}
+	return command.RowsAffected() == 1, nil
+}
+
+func (s *PostgresStore) PruneDPoPProofs(ctx context.Context, now time.Time) error {
+	_, err := s.pool.Exec(ctx, `DELETE FROM dpop_proofs WHERE expires_at <= $1`, now)
+	return err
+}
+
 func (s *PostgresStore) ListDevices(ctx context.Context, userID string) ([]Device, error) {
 	rows, err := s.pool.Query(ctx, `
-SELECT id, user_id, name, created_at, revoked_at
+SELECT id, COALESCE(installation_id, ''), user_id, name, COALESCE(proof_key_thumbprint, ''), created_at, revoked_at
 FROM devices
 WHERE user_id = $1
 ORDER BY created_at DESC
@@ -164,7 +254,7 @@ ORDER BY created_at DESC
 	var out []Device
 	for rows.Next() {
 		var device Device
-		if err := rows.Scan(&device.ID, &device.UserID, &device.Name, &device.CreatedAt, &device.RevokedAt); err != nil {
+		if err := rows.Scan(&device.ID, &device.InstallationID, &device.UserID, &device.Name, &device.ProofKeyThumbprint, &device.CreatedAt, &device.RevokedAt); err != nil {
 			return nil, err
 		}
 		out = append(out, device)
