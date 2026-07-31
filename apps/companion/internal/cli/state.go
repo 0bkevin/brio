@@ -14,14 +14,23 @@ import (
 )
 
 const (
-	configFileName  = "companion.env"
-	pairingFileName = "pairing.json"
+	configFileName       = "companion.env"
+	pairingFileName      = "pairing.json"
+	connectStateFileName = "connect.json"
 )
 
 type pairingState struct {
 	Payload    tunnel.PairingPayload `json:"payload"`
 	RelayToken string                `json:"relay_token,omitempty"`
 	UpdatedAt  time.Time             `json:"updated_at"`
+}
+
+func connectStatePath() (string, error) {
+	dir, err := brioHomeDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(dir, connectStateFileName), nil
 }
 
 func brioHomeDir() (string, error) {
@@ -147,17 +156,18 @@ func readPairingState() (pairingState, error) {
 
 func configValuesFromOptions(opts companionRunOptions) map[string]string {
 	values := map[string]string{
-		"BRIO_ADDR":          opts.cfg.Addr,
-		"BRIO_PUBLIC_URL":    opts.publicURL,
-		"BRIO_TOKEN":         opts.cfg.Token,
-		"HERMES_API_BASE":    opts.cfg.HermesBaseURL,
-		"HERMES_API_KEY":     opts.cfg.HermesAPIKey,
-		"HERMES_HOME":        opts.cfg.HermesHome,
-		"BRIO_RELAY_URL":     opts.relayURL,
-		"BRIO_RELAY_TOKEN":   opts.relayToken,
-		"BRIO_RELAY_MODE":    opts.relayMode,
-		"BRIO_AGENT_ID":      opts.agentID,
-		"BRIO_ALLOWED_ROOTS": strings.Join(opts.cfg.AllowedRoots, ","),
+		"BRIO_ADDR":             opts.cfg.Addr,
+		"BRIO_PUBLIC_URL":       opts.publicURL,
+		"BRIO_TOKEN":            opts.cfg.Token,
+		"HERMES_API_BASE":       opts.cfg.HermesBaseURL,
+		"HERMES_API_KEY":        opts.cfg.HermesAPIKey,
+		"HERMES_HOME":           opts.cfg.HermesHome,
+		"BRIO_RELAY_URL":        opts.relayURL,
+		"BRIO_RELAY_TOKEN":      opts.relayToken,
+		"BRIO_RELAY_MODE":       opts.relayMode,
+		"BRIO_AGENT_ID":         opts.agentID,
+		"BRIO_CLOUDFLARED_PATH": opts.cloudflaredPath,
+		"BRIO_ALLOWED_ROOTS":    strings.Join(opts.cfg.AllowedRoots, ","),
 	}
 	return values
 }

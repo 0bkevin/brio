@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -14,6 +15,9 @@ import (
 	"time"
 
 	"nhooyr.io/websocket"
+
+	connectcontrol "github.com/brio/brio/apps/companion/internal/connect"
+	"github.com/brio/brio/packages/connectauth"
 )
 
 type Config struct {
@@ -47,8 +51,23 @@ type PairingPayload struct {
 }
 
 type EnrollmentResult struct {
-	Agent AgentInfo `json:"agent"`
-	Token string    `json:"relay_token"`
+	Agent   AgentInfo          `json:"agent"`
+	Token   string             `json:"relay_token"`
+	Connect *ConnectEnrollment `json:"connect,omitempty"`
+}
+
+type ConnectEnrollment struct {
+	RelayIssuer           string                          `json:"relay_issuer"`
+	RelayPublicKey        connectauth.JWK                 `json:"relay_public_key"`
+	CloudUserID           string                          `json:"cloud_user_id"`
+	EnvironmentCredential string                          `json:"environment_credential"`
+	Endpoint              connectcontrol.Endpoint         `json:"endpoint"`
+	EndpointRuntime       *connectcontrol.EndpointRuntime `json:"endpoint_runtime,omitempty"`
+}
+
+type RelayMetadata struct {
+	Issuer    string          `json:"issuer"`
+	PublicKey connectauth.JWK `json:"public_key"`
 }
 
 type AgentInfo struct {
@@ -68,8 +87,12 @@ func Run(ctx context.Context, cfg Config) {
 	go func() {
 		backoff := time.Second
 		for ctx.Err() == nil {
-			if err := connect(ctx, cfg); err != nil {
+			connected, err := connect(ctx, cfg)
+			if err != nil {
 				slog.Warn("relay tunnel disconnected", "error", err)
+			}
+			if connected {
+				backoff = time.Second
 			}
 			select {
 			case <-ctx.Done():
@@ -113,12 +136,15 @@ func RegisterPairing(ctx context.Context, cfg Config) (string, string, error) {
 	return result.Code, result.AgentToken, nil
 }
 
-func ClaimEnrollment(ctx context.Context, relayURL string, code string, agentID string, name string) (EnrollmentResult, error) {
+func ClaimEnrollment(ctx context.Context, relayURL string, code string, agentID string, name string, proof string) (EnrollmentResult, error) {
 	body := map[string]string{
 		"agent_id": agentID,
 	}
 	if strings.TrimSpace(name) != "" {
 		body["name"] = strings.TrimSpace(name)
+	}
+	if strings.TrimSpace(proof) != "" {
+		body["proof"] = strings.TrimSpace(proof)
 	}
 	encoded, _ := json.Marshal(body)
 	req, err := http.NewRequestWithContext(
@@ -150,21 +176,45 @@ func ClaimEnrollment(ctx context.Context, relayURL string, code string, agentID 
 	return result, nil
 }
 
-func connect(ctx context.Context, cfg Config) error {
+func GetRelayMetadata(ctx context.Context, relayURL string) (RelayMetadata, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, strings.TrimRight(relayURL, "/")+"/.well-known/brio-connect", nil)
+	if err != nil {
+		return RelayMetadata{}, err
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return RelayMetadata{}, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 300 {
+		data, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		return RelayMetadata{}, fmt.Errorf("relay metadata failed: %s", strings.TrimSpace(string(data)))
+	}
+	var metadata RelayMetadata
+	if err := json.NewDecoder(resp.Body).Decode(&metadata); err != nil {
+		return RelayMetadata{}, err
+	}
+	if metadata.Issuer == "" {
+		return RelayMetadata{}, errors.New("relay metadata is incomplete")
+	}
+	return metadata, nil
+}
+
+func connect(ctx context.Context, cfg Config) (bool, error) {
 	wsURL, err := tunnelURL(cfg.RelayURL, "companion", cfg.AgentID, cfg.RelayToken)
 	if err != nil {
-		return err
+		return false, err
 	}
 	conn, _, err := websocket.Dial(ctx, wsURL, nil)
 	if err != nil {
-		return err
+		return false, err
 	}
 	defer conn.Close(websocket.StatusNormalClosure, "bye")
 	slog.Info("connected relay tunnel", "agent_id", cfg.AgentID)
 	for {
 		_, data, err := conn.Read(ctx)
 		if err != nil {
-			return err
+			return true, err
 		}
 		var frame Frame
 		if err := json.Unmarshal(data, &frame); err != nil {
@@ -179,7 +229,7 @@ func connect(ctx context.Context, cfg Config) error {
 		err = conn.Write(writeCtx, websocket.MessageText, encoded)
 		cancel()
 		if err != nil {
-			return err
+			return true, err
 		}
 	}
 }

@@ -7,7 +7,6 @@ import (
 	"encoding/base32"
 	"encoding/hex"
 	"errors"
-	"strings"
 	"time"
 )
 
@@ -32,14 +31,29 @@ type Device struct {
 	RevokedAt *time.Time `json:"revoked_at,omitempty"`
 }
 
+type ManagedEndpoint struct {
+	HTTPBaseURL  string `json:"http_base_url"`
+	WSBaseURL    string `json:"ws_base_url"`
+	ProviderKind string `json:"provider_kind"`
+}
+
+type ConnectLink struct {
+	EnvironmentPublicKey string
+	Endpoint             ManagedEndpoint
+}
+
 type Agent struct {
-	ID          string     `json:"id"`
-	OwnerUserID *string    `json:"owner_user_id,omitempty"`
-	Name        string     `json:"name"`
-	Mode        string     `json:"mode"`
-	Status      string     `json:"status"`
-	LastSeenAt  *time.Time `json:"last_seen_at,omitempty"`
-	CreatedAt   time.Time  `json:"created_at"`
+	ID                        string           `json:"id"`
+	OwnerUserID               *string          `json:"owner_user_id,omitempty"`
+	Name                      string           `json:"name"`
+	Mode                      string           `json:"mode"`
+	Status                    string           `json:"status"`
+	LastSeenAt                *time.Time       `json:"last_seen_at,omitempty"`
+	CreatedAt                 time.Time        `json:"created_at"`
+	Endpoint                  *ManagedEndpoint `json:"endpoint,omitempty"`
+	LinkedAt                  *time.Time       `json:"linked_at,omitempty"`
+	EnvironmentPublicKey      string           `json:"-"`
+	EnvironmentCredentialHash string           `json:"-"`
 }
 
 type Pairing struct {
@@ -73,16 +87,22 @@ type Store interface {
 	ListDevices(ctx context.Context, userID string) ([]Device, error)
 	RevokeDevice(ctx context.Context, userID string, deviceID string) (Device, error)
 	AuthenticateCompanion(ctx context.Context, agentID string, token string) error
+	AuthenticateEnvironment(ctx context.Context, agentID string, credential string) (Agent, error)
 	UpsertAgent(ctx context.Context, agentID string, name string) (Agent, error)
 	TouchAgent(ctx context.Context, agentID string, status string) error
 	CreateEnrollment(ctx context.Context, userID string, name string, ttl time.Duration) (Enrollment, error)
-	ClaimEnrollment(ctx context.Context, code string, agentID string, name string) (Agent, string, error)
+	GetEnrollment(ctx context.Context, code string) (Enrollment, error)
+	ClaimEnrollment(ctx context.Context, code string, agentID string, name string, link *ConnectLink) (Agent, string, string, error)
 	CreatePairing(ctx context.Context, agentID string, name string, ttl time.Duration, companionToken string) (Pairing, error)
 	RecoverPairing(ctx context.Context, userID string, agentID string, name string, ttl time.Duration) (Pairing, error)
 	GetPairing(ctx context.Context, code string) (Pairing, error)
 	ClaimPairing(ctx context.Context, code string, userID string) (Agent, error)
 	ListAgents(ctx context.Context, userID string) ([]Agent, error)
 	UserCanAccessAgent(ctx context.Context, userID string, agentID string) (bool, error)
+	GetConnectEnvironment(ctx context.Context, userID string, agentID string) (Agent, error)
+	UnlinkAgent(ctx context.Context, userID string, agentID string) (bool, error)
+	UpdateConnectEndpoint(ctx context.Context, agentID string, endpoint ManagedEndpoint) error
+	CountManagedEndpoints(ctx context.Context, userID string, excludingAgentID string) (int, error)
 }
 
 func HashSecret(secret string) string {
@@ -101,7 +121,7 @@ func RandomToken(bytes int) (string, error) {
 func RandomCode(length int) string {
 	token, err := RandomToken(length)
 	if err != nil {
-		return strings.Repeat("A", length)
+		panic("crypto/rand is unavailable: " + err.Error())
 	}
 	if len(token) > length {
 		return token[:length]

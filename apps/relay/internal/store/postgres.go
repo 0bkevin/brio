@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"errors"
+	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -76,6 +77,12 @@ CREATE INDEX IF NOT EXISTS idx_agents_owner_user_id ON agents(owner_user_id);
 CREATE INDEX IF NOT EXISTS idx_pairing_sessions_agent_id ON pairing_sessions(agent_id);
 CREATE INDEX IF NOT EXISTS idx_enrollment_sessions_user_id ON enrollment_sessions(user_id);
 ALTER TABLE agents ADD COLUMN IF NOT EXISTS companion_token_hash TEXT;
+ALTER TABLE agents ADD COLUMN IF NOT EXISTS environment_public_key TEXT;
+ALTER TABLE agents ADD COLUMN IF NOT EXISTS environment_credential_hash TEXT;
+ALTER TABLE agents ADD COLUMN IF NOT EXISTS endpoint_http_url TEXT;
+ALTER TABLE agents ADD COLUMN IF NOT EXISTS endpoint_ws_url TEXT;
+ALTER TABLE agents ADD COLUMN IF NOT EXISTS endpoint_provider TEXT;
+ALTER TABLE agents ADD COLUMN IF NOT EXISTS linked_at TIMESTAMPTZ;
 `)
 	return err
 }
@@ -204,6 +211,33 @@ SELECT EXISTS(
 	return nil
 }
 
+func (s *PostgresStore) AuthenticateEnvironment(ctx context.Context, agentID string, credential string) (Agent, error) {
+	if credential == "" {
+		return Agent{}, ErrUnauthorized
+	}
+	var agent Agent
+	var endpointHTTP, endpointWS, endpointProvider string
+	err := s.pool.QueryRow(ctx, `
+SELECT id, owner_user_id, name, mode, status, last_seen_at, created_at,
+  COALESCE(environment_public_key, ''), COALESCE(environment_credential_hash, ''),
+  COALESCE(endpoint_http_url, ''), COALESCE(endpoint_ws_url, ''), COALESCE(endpoint_provider, ''), linked_at
+FROM agents
+WHERE id = $1 AND environment_credential_hash = $2 AND linked_at IS NOT NULL
+`, agentID, HashSecret(credential)).Scan(
+		&agent.ID, &agent.OwnerUserID, &agent.Name, &agent.Mode, &agent.Status, &agent.LastSeenAt, &agent.CreatedAt,
+		&agent.EnvironmentPublicKey, &agent.EnvironmentCredentialHash,
+		&endpointHTTP, &endpointWS, &endpointProvider, &agent.LinkedAt,
+	)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return Agent{}, ErrUnauthorized
+	}
+	if err != nil {
+		return Agent{}, err
+	}
+	setAgentEndpoint(&agent, endpointHTTP, endpointWS, endpointProvider)
+	return agent, nil
+}
+
 func (s *PostgresStore) UpsertAgent(ctx context.Context, agentID string, name string) (Agent, error) {
 	if name == "" {
 		name = "Hermes"
@@ -231,7 +265,7 @@ func (s *PostgresStore) CreateEnrollment(ctx context.Context, userID string, nam
 	if name == "" {
 		name = "Hermes"
 	}
-	code := RandomCode(8)
+	code := RandomCode(16)
 	var enrollment Enrollment
 	err := s.pool.QueryRow(ctx, `
 INSERT INTO enrollment_sessions (code_hash, user_id, name, expires_at)
@@ -251,10 +285,34 @@ RETURNING user_id, name, expires_at, used_at, created_at
 	return enrollment, nil
 }
 
-func (s *PostgresStore) ClaimEnrollment(ctx context.Context, code string, agentID string, name string) (Agent, string, error) {
+func (s *PostgresStore) GetEnrollment(ctx context.Context, code string) (Enrollment, error) {
+	code = strings.ToUpper(strings.TrimSpace(code))
+	var enrollment Enrollment
+	err := s.pool.QueryRow(ctx, `
+SELECT user_id, name, expires_at, used_at, created_at
+FROM enrollment_sessions
+WHERE code_hash = $1
+`, HashSecret(code)).Scan(&enrollment.UserID, &enrollment.Name, &enrollment.ExpiresAt, &enrollment.UsedAt, &enrollment.CreatedAt)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return Enrollment{}, ErrNotFound
+	}
+	if err != nil {
+		return Enrollment{}, err
+	}
+	if time.Now().After(enrollment.ExpiresAt) {
+		return Enrollment{}, ErrExpired
+	}
+	if enrollment.UsedAt != nil {
+		return Enrollment{}, ErrUsed
+	}
+	enrollment.Code = code
+	return enrollment, nil
+}
+
+func (s *PostgresStore) ClaimEnrollment(ctx context.Context, code string, agentID string, name string, link *ConnectLink) (Agent, string, string, error) {
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
-		return Agent{}, "", err
+		return Agent{}, "", "", err
 	}
 	defer tx.Rollback(ctx)
 
@@ -272,16 +330,16 @@ FOR UPDATE
 		&enrollment.CreatedAt,
 	)
 	if errors.Is(err, pgx.ErrNoRows) {
-		return Agent{}, "", ErrNotFound
+		return Agent{}, "", "", ErrNotFound
 	}
 	if err != nil {
-		return Agent{}, "", err
+		return Agent{}, "", "", err
 	}
 	if time.Now().After(enrollment.ExpiresAt) {
-		return Agent{}, "", ErrExpired
+		return Agent{}, "", "", ErrExpired
 	}
 	if enrollment.UsedAt != nil {
-		return Agent{}, "", ErrUsed
+		return Agent{}, "", "", ErrUsed
 	}
 	if name == "" {
 		name = enrollment.Name
@@ -295,26 +353,55 @@ WHERE id = $1
 FOR UPDATE
 `, agentID).Scan(&existingOwner)
 	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
-		return Agent{}, "", err
+		return Agent{}, "", "", err
 	}
 	if err == nil && existingOwner != nil && *existingOwner != enrollment.UserID {
-		return Agent{}, "", ErrUnauthorized
+		return Agent{}, "", "", ErrUnauthorized
 	}
 
 	token := "brio_agent_" + RandomCode(48)
+	environmentCredential := ""
+	environmentPublicKey := ""
+	endpointHTTP := ""
+	endpointWS := ""
+	endpointProvider := ""
+	var linkedAt *time.Time
+	if link != nil {
+		environmentCredential = "brio_env_" + RandomCode(48)
+		environmentPublicKey = link.EnvironmentPublicKey
+		endpointHTTP = link.Endpoint.HTTPBaseURL
+		endpointWS = link.Endpoint.WSBaseURL
+		endpointProvider = link.Endpoint.ProviderKind
+		now := time.Now().UTC()
+		linkedAt = &now
+	}
 	now := time.Now().UTC()
 	var agent Agent
+	var returnedEndpointHTTP, returnedEndpointWS, returnedEndpointProvider string
 	err = tx.QueryRow(ctx, `
-INSERT INTO agents (id, owner_user_id, name, companion_token_hash, mode, status, last_seen_at)
-VALUES ($1, $2, $3, $4, 'self_hosted', 'online', $5)
+INSERT INTO agents (
+  id, owner_user_id, name, companion_token_hash, mode, status, last_seen_at,
+  environment_public_key, environment_credential_hash,
+  endpoint_http_url, endpoint_ws_url, endpoint_provider, linked_at
+)
+VALUES ($1, $2, $3, $4, 'self_hosted', 'online', $5, NULLIF($6, ''), NULLIF($7, ''), NULLIF($8, ''), NULLIF($9, ''), NULLIF($10, ''), $11)
 ON CONFLICT (id) DO UPDATE
 SET owner_user_id = EXCLUDED.owner_user_id,
     name = EXCLUDED.name,
     companion_token_hash = EXCLUDED.companion_token_hash,
     status = 'online',
-    last_seen_at = EXCLUDED.last_seen_at
-RETURNING id, owner_user_id, name, mode, status, last_seen_at, created_at
-`, agentID, enrollment.UserID, name, HashSecret(token), now).Scan(
+    last_seen_at = EXCLUDED.last_seen_at,
+    environment_public_key = COALESCE(EXCLUDED.environment_public_key, agents.environment_public_key),
+    environment_credential_hash = COALESCE(EXCLUDED.environment_credential_hash, agents.environment_credential_hash),
+    endpoint_http_url = COALESCE(EXCLUDED.endpoint_http_url, agents.endpoint_http_url),
+    endpoint_ws_url = COALESCE(EXCLUDED.endpoint_ws_url, agents.endpoint_ws_url),
+    endpoint_provider = COALESCE(EXCLUDED.endpoint_provider, agents.endpoint_provider),
+    linked_at = COALESCE(EXCLUDED.linked_at, agents.linked_at)
+RETURNING id, owner_user_id, name, mode, status, last_seen_at, created_at,
+  COALESCE(environment_public_key, ''), COALESCE(environment_credential_hash, ''),
+  COALESCE(endpoint_http_url, ''), COALESCE(endpoint_ws_url, ''), COALESCE(endpoint_provider, ''), linked_at
+`, agentID, enrollment.UserID, name, HashSecret(token), now,
+		environmentPublicKey, hashOptional(environmentCredential), endpointHTTP, endpointWS, endpointProvider, linkedAt).Scan(
 		&agent.ID,
 		&agent.OwnerUserID,
 		&agent.Name,
@@ -322,19 +409,26 @@ RETURNING id, owner_user_id, name, mode, status, last_seen_at, created_at
 		&agent.Status,
 		&agent.LastSeenAt,
 		&agent.CreatedAt,
+		&agent.EnvironmentPublicKey,
+		&agent.EnvironmentCredentialHash,
+		&returnedEndpointHTTP,
+		&returnedEndpointWS,
+		&returnedEndpointProvider,
+		&agent.LinkedAt,
 	)
 	if err != nil {
-		return Agent{}, "", err
+		return Agent{}, "", "", err
 	}
+	setAgentEndpoint(&agent, returnedEndpointHTTP, returnedEndpointWS, returnedEndpointProvider)
 
 	_, err = tx.Exec(ctx, `UPDATE enrollment_sessions SET used_at = now() WHERE code_hash = $1`, HashSecret(code))
 	if err != nil {
-		return Agent{}, "", err
+		return Agent{}, "", "", err
 	}
 	if err := tx.Commit(ctx); err != nil {
-		return Agent{}, "", err
+		return Agent{}, "", "", err
 	}
-	return agent, token, nil
+	return agent, token, environmentCredential, nil
 }
 
 func (s *PostgresStore) CreatePairing(ctx context.Context, agentID string, name string, ttl time.Duration, companionToken string) (Pairing, error) {
@@ -532,7 +626,8 @@ RETURNING id, owner_user_id, name, mode, status, last_seen_at, created_at
 
 func (s *PostgresStore) ListAgents(ctx context.Context, userID string) ([]Agent, error) {
 	rows, err := s.pool.Query(ctx, `
-SELECT id, owner_user_id, name, mode, status, last_seen_at, created_at
+SELECT id, owner_user_id, name, mode, status, last_seen_at, created_at,
+  COALESCE(endpoint_http_url, ''), COALESCE(endpoint_ws_url, ''), COALESCE(endpoint_provider, ''), linked_at
 FROM agents
 WHERE owner_user_id = $1
 ORDER BY created_at DESC
@@ -544,9 +639,11 @@ ORDER BY created_at DESC
 	var out []Agent
 	for rows.Next() {
 		var agent Agent
-		if err := rows.Scan(&agent.ID, &agent.OwnerUserID, &agent.Name, &agent.Mode, &agent.Status, &agent.LastSeenAt, &agent.CreatedAt); err != nil {
+		var endpointHTTP, endpointWS, endpointProvider string
+		if err := rows.Scan(&agent.ID, &agent.OwnerUserID, &agent.Name, &agent.Mode, &agent.Status, &agent.LastSeenAt, &agent.CreatedAt, &endpointHTTP, &endpointWS, &endpointProvider, &agent.LinkedAt); err != nil {
 			return nil, err
 		}
+		setAgentEndpoint(&agent, endpointHTTP, endpointWS, endpointProvider)
 		out = append(out, agent)
 	}
 	return out, rows.Err()
@@ -556,4 +653,108 @@ func (s *PostgresStore) UserCanAccessAgent(ctx context.Context, userID string, a
 	var ok bool
 	err := s.pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM agents WHERE id = $1 AND owner_user_id = $2)`, agentID, userID).Scan(&ok)
 	return ok, err
+}
+
+func (s *PostgresStore) GetConnectEnvironment(ctx context.Context, userID string, agentID string) (Agent, error) {
+	var agent Agent
+	var endpointHTTP, endpointWS, endpointProvider string
+	err := s.pool.QueryRow(ctx, `
+SELECT id, owner_user_id, name, mode, status, last_seen_at, created_at,
+  COALESCE(environment_public_key, ''), COALESCE(environment_credential_hash, ''),
+  COALESCE(endpoint_http_url, ''), COALESCE(endpoint_ws_url, ''), COALESCE(endpoint_provider, ''), linked_at
+FROM agents
+WHERE id = $1 AND owner_user_id = $2
+`, agentID, userID).Scan(
+		&agent.ID, &agent.OwnerUserID, &agent.Name, &agent.Mode, &agent.Status, &agent.LastSeenAt, &agent.CreatedAt,
+		&agent.EnvironmentPublicKey, &agent.EnvironmentCredentialHash,
+		&endpointHTTP, &endpointWS, &endpointProvider, &agent.LinkedAt,
+	)
+	if errors.Is(err, pgx.ErrNoRows) {
+		var exists bool
+		if checkErr := s.pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM agents WHERE id = $1)`, agentID).Scan(&exists); checkErr != nil {
+			return Agent{}, checkErr
+		}
+		if exists {
+			return Agent{}, ErrUnauthorized
+		}
+		return Agent{}, ErrNotFound
+	}
+	if err != nil {
+		return Agent{}, err
+	}
+	setAgentEndpoint(&agent, endpointHTTP, endpointWS, endpointProvider)
+	if agent.Endpoint == nil || agent.EnvironmentPublicKey == "" || agent.LinkedAt == nil {
+		return Agent{}, ErrNotFound
+	}
+	return agent, nil
+}
+
+func (s *PostgresStore) UnlinkAgent(ctx context.Context, userID string, agentID string) (bool, error) {
+	command, err := s.pool.Exec(ctx, `
+UPDATE agents
+SET environment_public_key = NULL,
+    environment_credential_hash = NULL,
+    endpoint_http_url = NULL,
+    endpoint_ws_url = NULL,
+    endpoint_provider = NULL,
+    linked_at = NULL,
+    status = 'offline'
+WHERE id = $1 AND owner_user_id = $2
+  AND (environment_public_key IS NOT NULL OR endpoint_http_url IS NOT NULL)
+`, agentID, userID)
+	if err != nil {
+		return false, err
+	}
+	if command.RowsAffected() > 0 {
+		return true, nil
+	}
+	var owner *string
+	err = s.pool.QueryRow(ctx, `SELECT owner_user_id FROM agents WHERE id = $1`, agentID).Scan(&owner)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	if owner == nil || *owner != userID {
+		return false, ErrUnauthorized
+	}
+	return false, nil
+}
+
+func hashOptional(value string) string {
+	if value == "" {
+		return ""
+	}
+	return HashSecret(value)
+}
+
+func setAgentEndpoint(agent *Agent, httpURL, wsURL, provider string) {
+	if httpURL == "" || provider == "" {
+		return
+	}
+	agent.Endpoint = &ManagedEndpoint{HTTPBaseURL: httpURL, WSBaseURL: wsURL, ProviderKind: provider}
+}
+
+func (s *PostgresStore) UpdateConnectEndpoint(ctx context.Context, agentID string, endpoint ManagedEndpoint) error {
+	command, err := s.pool.Exec(ctx, `
+UPDATE agents SET endpoint_http_url = $2, endpoint_ws_url = $3, endpoint_provider = $4
+WHERE id = $1 AND linked_at IS NOT NULL
+`, agentID, endpoint.HTTPBaseURL, endpoint.WSBaseURL, endpoint.ProviderKind)
+	if err != nil {
+		return err
+	}
+	if command.RowsAffected() == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+func (s *PostgresStore) CountManagedEndpoints(ctx context.Context, userID string, excludingAgentID string) (int, error) {
+	var count int
+	err := s.pool.QueryRow(ctx, `
+SELECT count(*) FROM agents
+WHERE owner_user_id = $1 AND id <> $2 AND endpoint_provider = 'cloudflare_tunnel' AND linked_at IS NOT NULL
+`, userID, excludingAgentID).Scan(&count)
+	return count, err
 }

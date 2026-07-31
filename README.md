@@ -5,9 +5,12 @@ Brio is a mobile control plane for Hermes Agent.
 The preferred UX is:
 
 1. Open the mobile app.
-2. Use the `Ask your agent` card to copy a ready-made prompt into Hermes.
-3. Paste Hermes's reply back into the app to connect directly.
-4. Use relay enrollment only when you want persistent owned agents across devices.
+2. Sign in to Brio Connect and generate an enrollment code.
+3. Enroll the Hermes machine with `brio companion enroll`.
+4. Select the linked environment. The relay brokers a short-lived credential,
+   then the app talks directly to its managed endpoint.
+
+The `Ask your agent` handoff remains available as a local/offline fallback.
 
 ## What Is Here
 
@@ -22,9 +25,11 @@ The preferred UX is:
 - Node.js and npm.
 - Hermes Agent running at `http://127.0.0.1:8642` for a fully healthy companion connection.
 
-Postgres is optional. The relay uses in-memory development storage when `BRIO_DATABASE_URL` is unset.
+Postgres is optional for development. Persistent deployments also require a
+stable `BRIO_RELAY_SIGNING_KEY`; changing it invalidates the trust installed in
+linked companions.
 
-## Quick Start
+## Local Fallback
 
 ```bash
 make setup
@@ -47,10 +52,10 @@ In the app, use `Ask your agent` and paste the prompt into Hermes. Hermes can
 look up the current companion pairing details by running `brio companion pair`.
 Paste Hermes's reply back into Brio to connect.
 
-## Recommended Enrollment Flow
+## Brio Connect Flow
 
-If you want persistent remote ownership instead of the simple direct handoff,
-use the relay enrollment flow below.
+Brio Connect follows the same control-plane model as T3 Connect. The relay is
+not in the hot path for normal companion traffic.
 
 Start the relay:
 
@@ -75,8 +80,16 @@ On the Hermes machine:
 brio companion enroll --relay-url http://127.0.0.1:8082 --code ABCD1234 --run
 ```
 
-After enrollment, the agent is owned by that relay user and can be opened from
-the app without manual pairing payloads.
+Enrollment creates a persistent P-256 environment identity and a signed,
+single-use link proof. When the app connects, the relay sends a short-lived
+signed mint request to the companion and verifies its signed response. The app
+exchanges that one-time credential for a one-hour DPoP-bound session, so neither
+the relay nor the tunnel transport can reuse the resulting access token.
+
+For a hosted managed endpoint, put `cloudflared` on the companion's `PATH` and
+configure the Cloudflare variables described below. Without them, development
+uses the companion's `BRIO_PUBLIC_URL` (loopback HTTP is accepted only when the
+relay issuer is also HTTP).
 
 ## Companion Service
 
@@ -111,7 +124,7 @@ brio companion uninstall   # remove background service
 brio companion run         # foreground server for debugging
 ```
 
-## Optional Relay Mode
+## Legacy Relay Compatibility
 
 Start the relay:
 
@@ -147,6 +160,14 @@ Common values:
 - `BRIO_RELAY_URL` - relay URL used by the companion, default `http://127.0.0.1:8082`.
 - `BRIO_RELAY_TOKEN` - existing relay companion token used to recover relay mode if local pairing state is lost.
 - `BRIO_DATABASE_URL` - optional Postgres URL for relay persistence.
+- `BRIO_RELAY_ISSUER` - public absolute relay URL used as the JWT issuer.
+- `BRIO_RELAY_SIGNING_KEY` - PEM P-256 private key; required with Postgres.
+- `BRIO_CLOUDFLARE_ACCOUNT_ID`, `BRIO_CLOUDFLARE_API_TOKEN`,
+  `BRIO_CLOUDFLARE_ZONE_ID`, `BRIO_TUNNEL_BASE_DOMAIN` - enable stable managed
+  Cloudflare Tunnel endpoints.
+- `BRIO_MANAGED_TUNNEL_LIMIT` - per-user managed endpoint limit, default `3`.
+- `BRIO_CLOUDFLARED_PATH` - companion path to `cloudflared`, default
+  `cloudflared`.
 
 ## Direct Commands
 
@@ -188,12 +209,23 @@ The web export is written to `/tmp/brio-web-export` by default.
 - `GET /agents` - list agents owned by the authenticated user.
 - `POST /enrollments` - create a short-lived enrollment code for a user.
 - `POST /enrollments/{code}/claim` - claim an enrollment code from a Hermes machine.
+- `GET /.well-known/brio-connect` - relay issuer and signing-key metadata.
+- `GET /v1/environments` - list linked environments.
+- `POST /v1/environments/{id}/status` - verify a signed environment health response.
+- `POST /v1/environments/{id}/connect` - broker a one-time, DPoP-bound environment credential.
+- `DELETE /v1/client/environment-links/{id}` - deprovision and unlink an environment.
+- `POST /v1/environments/{id}/tunnel/reconcile` - retry-safe companion startup reconciliation.
+- `DELETE /v1/environments/{id}/tunnel` - release the billable managed tunnel on shutdown.
 - `POST /agents/{id}/recover` - owner-authenticated recovery path that returns a fresh relay pairing code and companion token.
 - `POST /pairings` - create a short-lived pairing record.
 - `GET /pairings/{code}` - inspect a pairing record.
 - `POST /pairings/{code}/claim` - claim a pairing once with a device token.
 - `GET /tunnel/companion/{agentID}?token=...` - authenticated companion WebSocket tunnel.
 - `GET /tunnel/mobile/{agentID}?token=...` - authenticated mobile WebSocket tunnel.
+
+The `/tunnel/*`, pairing, and recovery endpoints are compatibility surfaces.
+New control-plane connections use the managed endpoint and do not proxy normal
+API traffic through the relay.
 
 For claimed agents, `POST /pairings` accepts the current companion token through
 `Authorization: Bearer ...` so the companion can refresh relay pairing safely

@@ -140,6 +140,8 @@ const styles = StyleSheet.create({
     left: 0,
     minHeight: '100%',
     paddingTop: Spacing.three,
+    // React Native Web supports fixed positioning although ViewStyle omits it.
+    // @ts-expect-error web-only CSS value
     position: 'fixed',
     top: 0,
     width: 260,

@@ -110,6 +110,16 @@ func (s *MemoryStore) AuthenticateCompanion(ctx context.Context, agentID string,
 	return nil
 }
 
+func (s *MemoryStore) AuthenticateEnvironment(ctx context.Context, agentID string, credential string) (Agent, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	agent, ok := s.agents[agentID]
+	if !ok || credential == "" || agent.EnvironmentCredentialHash != HashSecret(credential) {
+		return Agent{}, ErrUnauthorized
+	}
+	return agent, nil
+}
+
 func (s *MemoryStore) UpsertAgent(ctx context.Context, agentID string, name string) (Agent, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -148,7 +158,7 @@ func (s *MemoryStore) CreateEnrollment(ctx context.Context, userID string, name 
 	}
 	now := time.Now().UTC()
 	enrollment := Enrollment{
-		Code:      RandomCode(8),
+		Code:      RandomCode(16),
 		UserID:    userID,
 		Name:      name,
 		ExpiresAt: now.Add(ttl),
@@ -158,26 +168,44 @@ func (s *MemoryStore) CreateEnrollment(ctx context.Context, userID string, name 
 	return enrollment, nil
 }
 
-func (s *MemoryStore) ClaimEnrollment(ctx context.Context, code string, agentID string, name string) (Agent, string, error) {
+func (s *MemoryStore) GetEnrollment(ctx context.Context, code string) (Enrollment, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	code = strings.ToUpper(strings.TrimSpace(code))
+	enrollment, ok := s.enrollments[HashSecret(code)]
+	if !ok {
+		return Enrollment{}, ErrNotFound
+	}
+	if time.Now().After(enrollment.ExpiresAt) {
+		return Enrollment{}, ErrExpired
+	}
+	if enrollment.UsedAt != nil {
+		return Enrollment{}, ErrUsed
+	}
+	enrollment.Code = code
+	return enrollment, nil
+}
+
+func (s *MemoryStore) ClaimEnrollment(ctx context.Context, code string, agentID string, name string, link *ConnectLink) (Agent, string, string, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	key := HashSecret(strings.ToUpper(strings.TrimSpace(code)))
 	enrollment, ok := s.enrollments[key]
 	if !ok {
-		return Agent{}, "", ErrNotFound
+		return Agent{}, "", "", ErrNotFound
 	}
 	if time.Now().After(enrollment.ExpiresAt) {
-		return Agent{}, "", ErrExpired
+		return Agent{}, "", "", ErrExpired
 	}
 	if enrollment.UsedAt != nil {
-		return Agent{}, "", ErrUsed
+		return Agent{}, "", "", ErrUsed
 	}
 	if name == "" {
 		name = enrollment.Name
 	}
 	agent := s.agents[agentID]
 	if agent.ID != "" && agent.OwnerUserID != nil && *agent.OwnerUserID != enrollment.UserID {
-		return Agent{}, "", ErrUnauthorized
+		return Agent{}, "", "", ErrUnauthorized
 	}
 	now := time.Now().UTC()
 	agent.OwnerUserID = &enrollment.UserID
@@ -186,6 +214,14 @@ func (s *MemoryStore) ClaimEnrollment(ctx context.Context, code string, agentID 
 	agent.Mode = "self_hosted"
 	agent.Status = "online"
 	agent.LastSeenAt = &now
+	var environmentCredential string
+	if link != nil {
+		agent.EnvironmentPublicKey = link.EnvironmentPublicKey
+		agent.Endpoint = &link.Endpoint
+		agent.LinkedAt = &now
+		environmentCredential = "brio_env_" + RandomCode(48)
+		agent.EnvironmentCredentialHash = HashSecret(environmentCredential)
+	}
 	if agent.CreatedAt.IsZero() {
 		agent.CreatedAt = now
 	}
@@ -194,7 +230,7 @@ func (s *MemoryStore) ClaimEnrollment(ctx context.Context, code string, agentID 
 	s.enrollments[key] = enrollment
 	token := "brio_agent_" + RandomCode(48)
 	s.agentToken[agentID] = HashSecret(token)
-	return agent, token, nil
+	return agent, token, environmentCredential, nil
 }
 
 func (s *MemoryStore) CreatePairing(ctx context.Context, agentID string, name string, ttl time.Duration, companionToken string) (Pairing, error) {
@@ -309,4 +345,64 @@ func (s *MemoryStore) UserCanAccessAgent(ctx context.Context, userID string, age
 	defer s.mu.Unlock()
 	agent := s.agents[agentID]
 	return agent.OwnerUserID != nil && *agent.OwnerUserID == userID, nil
+}
+
+func (s *MemoryStore) GetConnectEnvironment(ctx context.Context, userID string, agentID string) (Agent, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	agent, ok := s.agents[agentID]
+	if !ok {
+		return Agent{}, ErrNotFound
+	}
+	if agent.OwnerUserID == nil || *agent.OwnerUserID != userID {
+		return Agent{}, ErrUnauthorized
+	}
+	if agent.Endpoint == nil || agent.EnvironmentPublicKey == "" || agent.LinkedAt == nil {
+		return Agent{}, ErrNotFound
+	}
+	return agent, nil
+}
+
+func (s *MemoryStore) UnlinkAgent(ctx context.Context, userID string, agentID string) (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	agent, ok := s.agents[agentID]
+	if !ok {
+		return false, nil
+	}
+	if agent.OwnerUserID == nil || *agent.OwnerUserID != userID {
+		return false, ErrUnauthorized
+	}
+	linked := agent.Endpoint != nil || agent.EnvironmentPublicKey != ""
+	agent.Endpoint = nil
+	agent.LinkedAt = nil
+	agent.EnvironmentPublicKey = ""
+	agent.EnvironmentCredentialHash = ""
+	agent.Status = "offline"
+	s.agents[agentID] = agent
+	return linked, nil
+}
+
+func (s *MemoryStore) UpdateConnectEndpoint(ctx context.Context, agentID string, endpoint ManagedEndpoint) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	agent, ok := s.agents[agentID]
+	if !ok || agent.EnvironmentPublicKey == "" {
+		return ErrNotFound
+	}
+	agent.Endpoint = &endpoint
+	s.agents[agentID] = agent
+	return nil
+}
+
+func (s *MemoryStore) CountManagedEndpoints(ctx context.Context, userID string, excludingAgentID string) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	count := 0
+	for _, agent := range s.agents {
+		if agent.ID != excludingAgentID && agent.OwnerUserID != nil && *agent.OwnerUserID == userID && agent.Endpoint != nil && agent.Endpoint.ProviderKind == "cloudflare_tunnel" {
+			count++
+		}
+	}
+	return count, nil
 }

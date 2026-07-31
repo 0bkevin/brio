@@ -13,6 +13,7 @@ import (
 	"strings"
 	"time"
 
+	connectcontrol "github.com/brio/brio/apps/companion/internal/connect"
 	"github.com/brio/brio/apps/companion/internal/tunnel"
 	"github.com/spf13/cobra"
 )
@@ -242,9 +243,22 @@ func companionEnrollCommand() *cobra.Command {
 				opts.agentID = "agent_" + strings.ToLower(strings.ReplaceAll(randomTokenMust(9), "_", ""))
 			}
 
-			result, err := tunnel.ClaimEnrollment(cmd.Context(), strings.TrimRight(opts.relayURL, "/"), code, opts.agentID, name)
+			metadata, err := tunnel.GetRelayMetadata(cmd.Context(), strings.TrimRight(opts.relayURL, "/"))
 			if err != nil {
 				return err
+			}
+			proof, privateKey, err := connectcontrol.NewIdentityProof(
+				code, metadata.Issuer, opts.agentID, name, opts.publicURL, opts.cfg.Addr,
+			)
+			if err != nil {
+				return err
+			}
+			result, err := tunnel.ClaimEnrollment(cmd.Context(), strings.TrimRight(opts.relayURL, "/"), code, opts.agentID, name, proof)
+			if err != nil {
+				return err
+			}
+			if result.Connect == nil {
+				return fmt.Errorf("relay did not return Brio Connect configuration")
 			}
 			opts.agentID = result.Agent.ID
 			opts.relayToken = result.Token
@@ -255,11 +269,34 @@ func companionEnrollCommand() *cobra.Command {
 			if err := writeLocalConfig(configValuesFromOptions(opts)); err != nil {
 				return err
 			}
+			connectPath, err := connectStatePath()
+			if err != nil {
+				return err
+			}
+			manager, err := connectcontrol.Open(connectPath)
+			if err != nil {
+				return err
+			}
+			if err := manager.Configure(connectcontrol.State{
+				EnvironmentID:         opts.agentID,
+				EnvironmentName:       name,
+				PrivateKeyPEM:         privateKey,
+				RelayIssuer:           result.Connect.RelayIssuer,
+				RelayPublicKey:        result.Connect.RelayPublicKey,
+				CloudUserID:           result.Connect.CloudUserID,
+				EnvironmentCredential: result.Connect.EnvironmentCredential,
+				Endpoint:              result.Connect.Endpoint,
+				EndpointRuntime:       result.Connect.EndpointRuntime,
+				LinkedAt:              time.Now().UTC(),
+			}); err != nil {
+				return err
+			}
+			opts.cfg.Connect = manager
 			if err := writePairingState(tunnel.PairingPayload{
-				URL:       strings.TrimRight(opts.relayURL, "/"),
+				URL:       result.Connect.Endpoint.HTTPBaseURL,
 				Token:     opts.cfg.Token,
-				Mode:      "relay",
-				Transport: "relay",
+				Mode:      "direct",
+				Transport: "direct",
 				AgentID:   opts.agentID,
 			}, opts.relayToken); err != nil {
 				return err

@@ -9,8 +9,11 @@ import (
 	"net"
 	"net/url"
 	"os"
+	"os/exec"
 	"strings"
+	"time"
 
+	connectcontrol "github.com/brio/brio/apps/companion/internal/connect"
 	"github.com/brio/brio/apps/companion/internal/server"
 	"github.com/brio/brio/apps/companion/internal/tunnel"
 	"github.com/spf13/cobra"
@@ -30,12 +33,13 @@ func Execute() {
 }
 
 type companionRunOptions struct {
-	cfg        server.Config
-	publicURL  string
-	relayURL   string
-	relayToken string
-	relayMode  string
-	agentID    string
+	cfg             server.Config
+	publicURL       string
+	relayURL        string
+	relayToken      string
+	relayMode       string
+	agentID         string
+	cloudflaredPath string
 }
 
 func defaultCompanionRunOptions() companionRunOptions {
@@ -48,11 +52,12 @@ func defaultCompanionRunOptions() companionRunOptions {
 			HermesHome:    configDefault("HERMES_HOME", ""),
 			AllowedRoots:  configList("BRIO_ALLOWED_ROOTS"),
 		},
-		publicURL:  configDefault("BRIO_PUBLIC_URL", ""),
-		relayURL:   configDefault("BRIO_RELAY_URL", ""),
-		relayToken: configDefault("BRIO_RELAY_TOKEN", ""),
-		relayMode:  configDefault("BRIO_RELAY_MODE", "pairing"),
-		agentID:    configDefault("BRIO_AGENT_ID", ""),
+		publicURL:       configDefault("BRIO_PUBLIC_URL", ""),
+		relayURL:        configDefault("BRIO_RELAY_URL", ""),
+		relayToken:      configDefault("BRIO_RELAY_TOKEN", ""),
+		relayMode:       configDefault("BRIO_RELAY_MODE", "pairing"),
+		agentID:         configDefault("BRIO_AGENT_ID", ""),
+		cloudflaredPath: configDefault("BRIO_CLOUDFLARED_PATH", "cloudflared"),
 	}
 }
 
@@ -81,6 +86,7 @@ func addCompanionRunFlags(cmd *cobra.Command, opts *companionRunOptions) {
 	cmd.Flags().StringVar(&opts.relayToken, "relay-token", opts.relayToken, "existing relay companion token for recovery")
 	cmd.Flags().StringVar(&opts.relayMode, "relay-mode", opts.relayMode, "relay mode: pairing or control-plane")
 	cmd.Flags().StringVar(&opts.agentID, "agent-id", opts.agentID, "stable agent identifier for relay mode")
+	cmd.Flags().StringVar(&opts.cloudflaredPath, "cloudflared", opts.cloudflaredPath, "cloudflared executable for managed Brio Connect endpoints")
 }
 
 func runCompanion(ctx context.Context, opts companionRunOptions, print bool) error {
@@ -103,6 +109,13 @@ func runCompanion(ctx context.Context, opts companionRunOptions, print bool) err
 	if opts.agentID == "" {
 		opts.agentID = "agent_" + strings.ToLower(strings.ReplaceAll(randomTokenMust(9), "_", ""))
 	}
+	if path, err := connectStatePath(); err == nil {
+		manager, openErr := connectcontrol.Open(path)
+		if openErr != nil {
+			return openErr
+		}
+		opts.cfg.Connect = manager
+	}
 
 	localURL := strings.TrimRight(opts.publicURL, "/")
 	payload := tunnel.PairingPayload{
@@ -123,6 +136,23 @@ func runCompanion(ctx context.Context, opts companionRunOptions, print bool) err
 		if opts.relayMode == "control-plane" {
 			if relayCfg.RelayToken == "" {
 				return fmt.Errorf("control-plane relay mode requires a relay token; run `brio companion enroll` first")
+			}
+			if state, linked := opts.cfg.Connect.State(); linked && state.EnvironmentID == opts.agentID {
+				startManagedEndpointReconciliation(ctx, opts.cfg.Connect, state, opts.cfg.Addr, opts.cloudflaredPath)
+				if err := writePairingState(tunnel.PairingPayload{
+					URL: state.Endpoint.HTTPBaseURL, Token: opts.cfg.Token, Mode: "direct", Transport: "direct", AgentID: opts.agentID,
+				}, relayCfg.RelayToken); err != nil {
+					slog.Warn("could not write pairing state", "error", err)
+				}
+				serverErr := server.Run(ctx, opts.cfg)
+				if latest, ok := opts.cfg.Connect.State(); ok && latest.Endpoint.ProviderKind == "cloudflare_tunnel" {
+					releaseCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+					if err := connectcontrol.ReleaseEndpoint(releaseCtx, latest); err != nil {
+						slog.Warn("could not release managed endpoint on shutdown; next startup will reconcile it", "error", err)
+					}
+					cancel()
+				}
+				return serverErr
 			}
 			tunnel.Run(ctx, relayCfg)
 			if err := writePairingState(tunnel.PairingPayload{
@@ -165,6 +195,60 @@ func runCompanion(ctx context.Context, opts companionRunOptions, print bool) err
 		printPairing(payload)
 	}
 	return server.Run(ctx, opts.cfg)
+}
+
+func startManagedEndpointReconciliation(ctx context.Context, manager *connectcontrol.Manager, state connectcontrol.State, localAddr, executable string) {
+	if state.Endpoint.ProviderKind != "cloudflare_tunnel" && state.EndpointRuntime == nil {
+		return
+	}
+	go func() {
+		deadline := time.Now().Add(10 * time.Minute)
+		backoff := time.Second
+		for ctx.Err() == nil && time.Now().Before(deadline) {
+			result, err := connectcontrol.ReconcileEndpoint(ctx, state, localAddr)
+			if err == nil {
+				state.Endpoint = result.Endpoint
+				state.EndpointRuntime = result.EndpointRuntime
+				if err := manager.Configure(state); err != nil {
+					slog.Error("could not persist reconciled managed endpoint", "error", err)
+					return
+				}
+				if state.EndpointRuntime == nil {
+					return
+				}
+				cloudflaredPath, err := exec.LookPath(executable)
+				if err != nil {
+					slog.Error("managed endpoint is configured but cloudflared is unavailable", "error", err)
+					return
+				}
+				connectcontrol.RunManagedEndpoint(ctx, state, func(runCtx context.Context, connectorToken string) error {
+					command := exec.CommandContext(runCtx, cloudflaredPath, "tunnel", "--no-autoupdate", "run", "--token", connectorToken)
+					command.Stdout = os.Stdout
+					command.Stderr = os.Stderr
+					return command.Run()
+				}, func(err error) { slog.Warn("managed endpoint connector stopped", "error", err) })
+				return
+			}
+			slog.Warn("managed endpoint reconciliation failed", "error", err, "retry_in", backoff)
+			if strings.Contains(err.Error(), "(400)") || strings.Contains(err.Error(), "(401)") || strings.Contains(err.Error(), "(409)") {
+				return
+			}
+			timer := time.NewTimer(backoff)
+			select {
+			case <-ctx.Done():
+				timer.Stop()
+				return
+			case <-timer.C:
+			}
+			backoff *= 2
+			if backoff > 30*time.Second {
+				backoff = 30 * time.Second
+			}
+		}
+		if ctx.Err() == nil {
+			slog.Warn("managed endpoint reconciliation stopped after 10 minutes")
+		}
+	}()
 }
 
 func printPairing(payload tunnel.PairingPayload) {

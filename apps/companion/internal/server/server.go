@@ -45,6 +45,9 @@ func Run(ctx context.Context, cfg Config) error {
 
 	router.Get("/health", a.health)
 	router.Get("/capabilities", a.capabilities)
+	router.Post("/api/brio-connect/health", a.connectHealth)
+	router.Post("/api/brio-connect/mint-credential", a.connectMintCredential)
+	router.Post("/oauth/token", a.connectToken)
 	router.Post("/chat/responses", a.proxyHermes("/v1/responses"))
 	router.Post("/runs", a.proxyHermes("/v1/runs"))
 	router.Get("/runs/{id}", a.proxyHermesDynamic("/v1/runs/{id}"))
@@ -107,7 +110,8 @@ func cors(next http.Handler) http.Handler {
 		}
 		w.Header().Set("Access-Control-Allow-Origin", origin)
 		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, PATCH, DELETE, OPTIONS")
-		w.Header().Set("Access-Control-Allow-Headers", "Accept, Authorization, Content-Type")
+		w.Header().Set("Access-Control-Allow-Headers", "Accept, Authorization, Content-Type, DPoP")
+		w.Header().Set("Access-Control-Expose-Headers", "WWW-Authenticate")
 		w.Header().Set("Vary", "Origin")
 		if r.Method == http.MethodOptions {
 			w.WriteHeader(http.StatusNoContent)
@@ -119,17 +123,70 @@ func cors(next http.Handler) http.Handler {
 
 func (a *app) auth(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/brio-connect/health" ||
+			r.URL.Path == "/api/brio-connect/mint-credential" ||
+			r.URL.Path == "/oauth/token" {
+			next.ServeHTTP(w, r)
+			return
+		}
 		if a.cfg.Token == "" {
 			next.ServeHTTP(w, r)
 			return
 		}
 		auth := strings.TrimSpace(r.Header.Get("Authorization"))
-		if auth != "Bearer "+a.cfg.Token {
+		if auth == "Bearer "+a.cfg.Token {
+			next.ServeHTTP(w, r)
+			return
+		}
+		if strings.HasPrefix(auth, "DPoP ") && a.cfg.Connect != nil && a.cfg.Connect.AuthenticateRequest(r, strings.TrimSpace(strings.TrimPrefix(auth, "DPoP "))) {
+			next.ServeHTTP(w, r)
+			return
+		}
+		{
+			if strings.HasPrefix(auth, "DPoP ") {
+				w.Header().Set("WWW-Authenticate", "DPoP")
+			}
 			writeJSON(w, http.StatusUnauthorized, map[string]any{"error": "unauthorized"})
 			return
 		}
-		next.ServeHTTP(w, r)
 	})
+}
+
+func (a *app) connectHealth(w http.ResponseWriter, r *http.Request) {
+	if a.cfg.Connect == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"error": "Brio Connect is not configured"})
+		return
+	}
+	a.cfg.Connect.Health(w, r, a.connectDescriptor())
+}
+
+func (a *app) connectMintCredential(w http.ResponseWriter, r *http.Request) {
+	if a.cfg.Connect == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"error": "Brio Connect is not configured"})
+		return
+	}
+	a.cfg.Connect.MintCredential(w, r)
+}
+
+func (a *app) connectToken(w http.ResponseWriter, r *http.Request) {
+	if a.cfg.Connect == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"error": "Brio Connect is not configured"})
+		return
+	}
+	a.cfg.Connect.ExchangeToken(w, r)
+}
+
+func (a *app) connectDescriptor() map[string]any {
+	return map[string]any{
+		"kind":            "hermes",
+		"name":            "Brio Companion",
+		"version":         "1",
+		"session_methods": []string{"bearer-access-token"},
+		"capabilities": map[string]any{
+			"files": true, "config": true, "memory": true, "sessions": true,
+			"logs": true, "gateway": true,
+		},
+	}
 }
 
 func (a *app) health(w http.ResponseWriter, r *http.Request) {

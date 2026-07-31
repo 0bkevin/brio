@@ -3,6 +3,8 @@ package server
 import (
 	"os"
 	"path/filepath"
+
+	connectcontrol "github.com/brio/brio/apps/companion/internal/connect"
 )
 
 type Config struct {
@@ -12,6 +14,7 @@ type Config struct {
 	HermesAPIKey  string
 	HermesHome    string
 	AllowedRoots  []string
+	Connect       *connectcontrol.Manager
 }
 
 func (c Config) normalizedRoots() []string {

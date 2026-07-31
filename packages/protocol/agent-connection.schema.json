@@ -36,6 +36,16 @@
     "relayToken": {
       "type": "string"
     },
+    "relayURL": {
+      "type": "string"
+    },
+    "relayDeviceId": {
+      "type": "string"
+    },
+    "authMode": {
+      "type": "string",
+      "enum": ["bearer", "dpop"]
+    },
     "agentId": {
       "type": "string"
     },

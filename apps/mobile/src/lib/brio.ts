@@ -1,3 +1,5 @@
+import { createDPoPProof, getDPoPThumbprint } from '@/lib/dpop';
+
 export type AgentConnection = {
   id: string;
   name: string;
@@ -8,8 +10,11 @@ export type AgentConnection = {
   url: string;
   token: string;
   relayToken?: string;
+  relayURL?: string;
+  relayDeviceId?: string;
   agentId?: string;
   pairingCode?: string;
+  authMode?: 'bearer' | 'dpop';
 };
 
 export type HealthResponse = {
@@ -40,6 +45,20 @@ export type RelayAgent = {
   status: AgentConnection['status'];
   created_at?: string;
   last_seen_at?: string | null;
+  endpoint?: RelayManagedEndpoint;
+};
+
+export type RelayManagedEndpoint = {
+  http_base_url: string;
+  ws_base_url: string;
+  provider_kind: string;
+};
+
+export type RelayConnectResponse = {
+  environment_id: string;
+  endpoint: RelayManagedEndpoint;
+  credential: string;
+  expires_at: string;
 };
 
 export type RelayClaimResponse = {
@@ -83,15 +102,45 @@ export async function brioFetch<T>(
   if (connection.transport === 'relay') {
     return relayFetch<T>(connection, path, init);
   }
-  const response = await fetch(`${normalizeBaseURL(connection.url)}${path}`, {
-    ...init,
-    headers: {
-      Accept: 'application/json',
-      'Content-Type': 'application/json',
-      Authorization: `Bearer ${connection.token}`,
-      ...(init.headers ?? {}),
-    },
-  });
+  const target = `${normalizeBaseURL(connection.url)}${path}`;
+  const cacheKey = connection.agentId ?? connection.id ?? connection.url;
+  let accessToken = dpopAccessTokens.get(cacheKey) ?? connection.token;
+  const request = async () =>
+    fetch(target, {
+      ...init,
+      headers: {
+        Accept: 'application/json',
+        'Content-Type': 'application/json',
+        Authorization: `${connection.authMode === 'dpop' ? 'DPoP' : 'Bearer'} ${accessToken}`,
+        ...(connection.authMode === 'dpop'
+          ? { DPoP: await createDPoPProof(init.method ?? 'GET', target, accessToken) }
+          : {}),
+        ...(init.headers ?? {}),
+      },
+    });
+  let response = await request();
+  if (
+    response.status === 401 &&
+    connection.authMode === 'dpop' &&
+    connection.relayURL &&
+    connection.relayToken &&
+    connection.agentId
+  ) {
+    const refreshed = await connectRelayEnvironment(
+      connection.relayURL,
+      connection.relayToken,
+      connection.agentId,
+      connection.relayDeviceId,
+    );
+    const exchanged = await exchangeEnvironmentCredential(
+      refreshed.response.endpoint.http_base_url,
+      refreshed.response.credential,
+      refreshed.thumbprint,
+    );
+    accessToken = exchanged.access_token;
+    dpopAccessTokens.set(cacheKey, accessToken);
+    response = await request();
+  }
   const text = await response.text();
   const body = text ? JSON.parse(text) : null;
   if (!response.ok) {
@@ -100,6 +149,8 @@ export async function brioFetch<T>(
   }
   return body as T;
 }
+
+const dpopAccessTokens = new Map<string, string>();
 
 export function getHealth(connection: Pick<AgentConnection, 'url' | 'token'> & Partial<AgentConnection>) {
   return brioFetch<HealthResponse>(connection, '/health');
@@ -248,7 +299,7 @@ export async function claimRelayPairing(
 }
 
 export async function listRelayAgents(relayURL: string, relayToken: string) {
-  const response = await fetch(`${normalizeBaseURL(relayURL)}/agents`, {
+  const response = await fetch(`${normalizeBaseURL(relayURL)}/v1/environments`, {
     headers: {
       Accept: 'application/json',
       Authorization: `Bearer ${relayToken}`,
@@ -258,7 +309,27 @@ export async function listRelayAgents(relayURL: string, relayToken: string) {
   if (!response.ok) {
     throw new Error(body?.error ?? 'Could not load agents');
   }
-  return (body?.agents ?? []) as RelayAgent[];
+  return (body?.environments ?? []) as RelayAgent[];
+}
+
+export async function getRelayEnvironmentStatus(relayURL: string, relayToken: string, environmentID: string) {
+  const response = await fetch(
+    `${normalizeBaseURL(relayURL)}/v1/environments/${encodeURIComponent(environmentID)}/status`,
+    { method: 'POST', headers: { Accept: 'application/json', Authorization: `Bearer ${relayToken}` } },
+  );
+  const body = await response.json();
+  if (!response.ok) throw new Error(body?.reason ?? body?.error ?? 'Could not check environment status');
+  return body as { status: 'online' | 'offline'; error?: string };
+}
+
+export async function unlinkRelayEnvironment(relayURL: string, relayToken: string, environmentID: string) {
+  const response = await fetch(
+    `${normalizeBaseURL(relayURL)}/v1/client/environment-links/${encodeURIComponent(environmentID)}`,
+    { method: 'DELETE', headers: { Accept: 'application/json', Authorization: `Bearer ${relayToken}` } },
+  );
+  const body = await response.json();
+  if (!response.ok) throw new Error(body?.reason ?? body?.error ?? 'Could not unlink environment');
+  return body as { ok: boolean };
 }
 
 export async function createRelayEnrollment(
@@ -305,6 +376,59 @@ export async function recoverRelayAgent(
     throw new Error(body?.error ?? 'Could not recover relay agent');
   }
   return body as RelayRecoveryResponse;
+}
+
+export async function connectRelayEnvironment(
+  relayURL: string,
+  relayToken: string,
+  environmentID: string,
+  deviceID?: string,
+) {
+  const thumbprint = await getDPoPThumbprint();
+  const response = await fetch(
+    `${normalizeBaseURL(relayURL)}/v1/environments/${encodeURIComponent(environmentID)}/connect`,
+    {
+      method: 'POST',
+      headers: {
+        Accept: 'application/json',
+        Authorization: `Bearer ${relayToken}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({ client_proof_key_thumbprint: thumbprint, device_id: deviceID }),
+    },
+  );
+  const body = await response.json();
+  if (!response.ok) {
+    throw new Error(body?.reason ?? body?.error ?? 'Could not connect environment');
+  }
+  return { response: body as RelayConnectResponse, thumbprint };
+}
+
+export async function exchangeEnvironmentCredential(
+  endpointURL: string,
+  credential: string,
+  thumbprint: string,
+) {
+  const tokenURL = `${normalizeBaseURL(endpointURL)}/oauth/token`;
+  const form = new URLSearchParams({
+    grant_type: 'urn:ietf:params:oauth:grant-type:token-exchange',
+    subject_token: credential,
+    subject_token_type: 'urn:brio:params:oauth:token-type:environment-bootstrap',
+    requested_token_type: 'urn:ietf:params:oauth:token-type:access_token',
+    client_proof_key_thumbprint: thumbprint,
+  });
+  const response = await fetch(tokenURL, {
+    method: 'POST',
+    headers: {
+      Accept: 'application/json',
+      'Content-Type': 'application/x-www-form-urlencoded',
+      DPoP: await createDPoPProof('POST', tokenURL),
+    },
+    body: form.toString(),
+  });
+  const body = await response.json();
+  if (!response.ok) throw new Error(body?.error ?? 'Could not exchange environment credential');
+  return body as { access_token: string; token_type: 'DPoP'; expires_in: number };
 }
 
 type RelayFrame = {

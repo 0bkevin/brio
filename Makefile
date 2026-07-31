@@ -10,7 +10,7 @@ BRIO_AGENT_ID ?= local-brio
 HERMES_API_BASE ?= http://127.0.0.1:8642
 WEB_EXPORT_DIR ?= /tmp/brio-web-export
 
-GO_PACKAGES := ./apps/companion/... ./apps/relay/...
+GO_PACKAGES := ./apps/companion/... ./apps/relay/... ./packages/connectauth/...
 MOBILE_DIR := apps/mobile
 
 .PHONY: help setup check test-go lint-mobile typecheck-mobile export-mobile dev-mobile dev-companion dev-relay dev-companion-relay tidy
@@ -28,6 +28,7 @@ setup:
 	go work sync
 	cd apps/companion && go mod download
 	cd apps/relay && go mod download
+	cd packages/connectauth && go mod download
 	cd $(MOBILE_DIR) && npm ci
 
 check: test-go lint-mobile typecheck-mobile export-mobile
@@ -60,3 +61,4 @@ dev-companion-relay:
 tidy:
 	cd apps/companion && go mod tidy
 	cd apps/relay && go mod tidy
+	cd packages/connectauth && go mod tidy

@@ -120,7 +120,7 @@ func TestMemoryStoreEnrollmentLifecycle(t *testing.T) {
 		t.Fatalf("create enrollment: %v", err)
 	}
 
-	agent, relayToken, err := s.ClaimEnrollment(ctx, enrollment.Code, "agent-1", "")
+	agent, relayToken, _, err := s.ClaimEnrollment(ctx, enrollment.Code, "agent-1", "", nil)
 	if err != nil {
 		t.Fatalf("claim enrollment: %v", err)
 	}
@@ -134,7 +134,7 @@ func TestMemoryStoreEnrollmentLifecycle(t *testing.T) {
 		t.Fatalf("unexpected owner: %+v", agent.OwnerUserID)
 	}
 
-	if _, _, err := s.ClaimEnrollment(ctx, enrollment.Code, "agent-1", ""); err != ErrUsed {
+	if _, _, _, err := s.ClaimEnrollment(ctx, enrollment.Code, "agent-1", "", nil); err != ErrUsed {
 		t.Fatalf("expected used enrollment, got %v", err)
 	}
 }

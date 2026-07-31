@@ -4,6 +4,7 @@ import type { ReactNode } from 'react';
 import { useState } from 'react';
 import {
   ActivityIndicator,
+  Alert,
   Pressable,
   ScrollView,
   StyleSheet,
@@ -16,14 +17,18 @@ import { DashboardCard, SectionLabel, StatusBadge } from '@/components/dashboard
 import { Collapsible } from '@/components/ui/collapsible';
 import {
   claimRelayPairing,
+  connectRelayEnvironment,
   connectionFromPairingPayload,
   createRelayDevice,
   createRelayEnrollment,
+  exchangeEnvironmentCredential,
   extractPairingPayload,
   getHealth,
+  getRelayEnvironmentStatus,
   listRelayAgents,
   recoverRelayAgent,
   sendResponse,
+  unlinkRelayEnvironment,
   type AgentConnection,
   type RelayAgent,
   type RelayEnrollmentResponse,
@@ -341,17 +346,41 @@ function ControlPlaneHome({ session }: { session: RelaySession }) {
     },
   });
 
+  const unlink = useMutation({
+    mutationFn: (agentID: string) => unlinkRelayEnvironment(session.relayURL, session.token, agentID),
+    onSuccess: () => void agents.refetch(),
+  });
+
+  const status = useMutation({
+    mutationFn: (agentID: string) => getRelayEnvironmentStatus(session.relayURL, session.token, agentID),
+    onSuccess: () => void agents.refetch(),
+  });
+
   async function connectAgent(agent: RelayAgent) {
+	const { response, thumbprint } = await connectRelayEnvironment(
+	  session.relayURL,
+	  session.token,
+	  agent.id,
+	  session.deviceID,
+	);
+	const access = await exchangeEnvironmentCredential(
+	  response.endpoint.http_base_url,
+	  response.credential,
+	  thumbprint,
+	);
     await saveConnection({
       id: agent.id,
       name: agent.name,
       mode: agent.mode,
-      transport: 'relay',
-      status: agent.status,
+      transport: 'direct',
+      status: 'online',
       capabilities: {},
-      url: session.relayURL,
-      token: '',
+      url: response.endpoint.http_base_url,
+      token: access.access_token,
+      authMode: 'dpop',
+      relayURL: session.relayURL,
       relayToken: session.token,
+      relayDeviceId: session.deviceID,
       agentId: agent.id,
     });
   }
@@ -394,6 +423,19 @@ function ControlPlaneHome({ session }: { session: RelaySession }) {
                 {agent.status}
               </StatusBadge>
               <PrimaryButton label="Connect" onPress={() => void connectAgent(agent)} />
+              <SecondaryButton
+                label={status.isPending && status.variables === agent.id ? 'Checking' : 'Check status'}
+                onPress={() => status.mutate(agent.id)}
+              />
+              <SecondaryButton
+                label={unlink.isPending && unlink.variables === agent.id ? 'Unlinking' : 'Unlink'}
+                onPress={() =>
+                  Alert.alert('Unlink environment?', 'This removes its managed endpoint and cloud access.', [
+                    { text: 'Cancel', style: 'cancel' },
+                    { text: 'Unlink', style: 'destructive', onPress: () => unlink.mutate(agent.id) },
+                  ])
+                }
+              />
             </View>
           ))
         ) : (
