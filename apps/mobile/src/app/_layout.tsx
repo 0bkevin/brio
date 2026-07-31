@@ -76,6 +76,8 @@ export default function RootLayout() {
               headerTitleStyle: { fontFamily: T3Typography.bold, fontSize: 18 },
             }}>
             <Stack.Screen name="index" options={{ headerShown: false }} />
+            <Stack.Screen name="connect" options={{ presentation: 'modal', title: 'Add Environment' }} />
+            <Stack.Screen name="relay" options={{ presentation: 'modal', title: 'Brio Relay' }} />
             <Stack.Screen name="thread/[id]" options={{ title: 'Hermes' }} />
             <Stack.Screen name="files" options={{ title: 'Files' }} />
             <Stack.Screen name="settings" options={{ presentation: 'modal', title: 'Settings' }} />

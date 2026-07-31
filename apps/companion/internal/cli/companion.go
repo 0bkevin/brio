@@ -14,7 +14,9 @@ import (
 	"time"
 
 	"github.com/brio/brio/apps/companion/internal/tunnel"
+	"github.com/mdp/qrterminal/v3"
 	"github.com/spf13/cobra"
+	"golang.org/x/term"
 )
 
 const serviceName = "app.brio.companion"
@@ -370,11 +372,16 @@ func pairingFromConfig() (tunnel.PairingPayload, error) {
 }
 
 func printPairingPayload(payload tunnel.PairingPayload) {
+	encoded := tunnel.PairingCode(payload)
 	if payload.Code != "" {
 		fmt.Printf("Code: %s\n", payload.Code)
 	}
+	if term.IsTerminal(int(os.Stdout.Fd())) {
+		fmt.Println("Scan this QR code in Brio:")
+		qrterminal.GenerateHalfBlock(encoded, qrterminal.L, os.Stdout)
+	}
 	fmt.Println("Pairing payload:")
-	fmt.Println(tunnel.PairingCode(payload))
+	fmt.Println(encoded)
 }
 
 func printHealthStatus() error {

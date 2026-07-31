@@ -45,7 +45,16 @@
           }
         }
       ],
-      "expo-secure-store"
+      "expo-secure-store",
+      [
+        "expo-camera",
+        {
+          "cameraPermission": "Allow Brio to scan environment pairing QR codes.",
+          "microphonePermission": false,
+          "barcodeScannerEnabled": true,
+          "recordAudioAndroid": false
+        }
+      ]
     ],
     "experiments": {
       "typedRoutes": true,

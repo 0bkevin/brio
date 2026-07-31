@@ -15,11 +15,11 @@ import { SafeAreaView } from 'react-native-safe-area-context';
 import { DashboardCard, SectionLabel, StatusBadge } from '@/components/dashboard';
 import { Collapsible } from '@/components/ui/collapsible';
 import {
-  claimRelayPairing,
   connectionFromPairingPayload,
   createRelayDevice,
   createRelayEnrollment,
   extractPairingPayload,
+  finalizeConnection,
   getHealth,
   listRelayAgents,
   recoverRelayAgent,
@@ -33,6 +33,7 @@ import { ThemedView } from '@/components/themed-view';
 import { BottomTabInset, MaxContentWidth, Spacing } from '@/constants/theme';
 import { useTheme } from '@/hooks/use-theme';
 import { HermesHomeScreen } from '@/features/home/hermes-home-screen';
+import { EnvironmentOnboardingScreen } from '@/features/connection/environment-onboarding-screen';
 import { useConnectionStore } from '@/state/connection-store';
 import { useRelaySessionStore, type RelaySession } from '@/state/relay-session-store';
 
@@ -52,32 +53,6 @@ If Brio Companion is not ready, reply:
 NOT READY: <one short reason>
 
 Do not add markdown fences or extra explanation.`;
-
-async function finalizeConnection(connection: AgentConnection) {
-  let nextConnection = connection;
-
-  if (connection.transport === 'relay') {
-    const session = await createRelayDevice(connection.url);
-    if (!connection.pairingCode) {
-      throw new Error('Relay pairing payload is missing a code');
-    }
-    const claim = await claimRelayPairing(connection.url, session.token, connection.pairingCode);
-    nextConnection = {
-      ...connection,
-      id: claim.agent.id,
-      name: claim.agent.name,
-      status: claim.agent.status,
-      relayToken: session.token,
-      token: '',
-    };
-  }
-
-  const health = await getHealth(nextConnection);
-  return {
-    ...nextConnection,
-    status: health.hermes_ok ? 'online' : 'error',
-  } satisfies AgentConnection;
-}
 
 async function copyToClipboard(value: string) {
   await Clipboard.setStringAsync(value);
@@ -101,10 +76,10 @@ export default function ChatScreen() {
     return <ControlPlaneHome session={relaySession} />;
   }
 
-  return <ConnectionOnboarding />;
+  return <EnvironmentOnboardingScreen />;
 }
 
-function ConnectionOnboarding() {
+export function ConnectionOnboarding() {
   return (
     <Screen>
       <ThemedView style={styles.header}>

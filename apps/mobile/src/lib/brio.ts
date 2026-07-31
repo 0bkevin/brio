@@ -478,6 +478,35 @@ export function connectionFromPairingPayload(payload: PairingPayload): AgentConn
   };
 }
 
+export async function finalizeConnection(connection: AgentConnection) {
+  let nextConnection = connection;
+
+  if (connection.transport === 'relay') {
+    const session = await createRelayDevice(connection.url);
+    if (!connection.pairingCode) {
+      throw new Error('Relay pairing payload is missing a code');
+    }
+    const claim = await claimRelayPairing(connection.url, session.token, connection.pairingCode);
+    nextConnection = {
+      ...connection,
+      id: claim.agent.id,
+      name: claim.agent.name,
+      status: claim.agent.status,
+      relayToken: session.token,
+      token: '',
+    };
+  }
+
+  const health = await getHealth(nextConnection);
+  if (!health.ok) {
+    throw new Error('Brio Companion did not report a healthy connection');
+  }
+  if (!health.hermes_ok) {
+    throw new Error('Brio Companion is online, but Hermes Agent is not reachable');
+  }
+  return { ...nextConnection, status: 'online' as const };
+}
+
 export async function createRelayDevice(
   relayURL: string,
   email = 'dev@brio.local',

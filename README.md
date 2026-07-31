@@ -103,13 +103,16 @@ brio companion install     # install and start background service
 brio companion start       # start installed background service
 brio companion restart     # restart installed background service
 brio companion status      # service and /health status
-brio companion pair        # print current mobile pairing payload
+brio companion pair        # print current mobile pairing payload or QR
 brio companion enroll      # enroll this machine into the control plane
 brio companion recover     # recover relay credentials for a claimed agent
 brio companion stop        # stop background service
 brio companion uninstall   # remove background service
 brio companion run         # foreground server for debugging
 ```
+
+When run in a terminal, `brio companion pair` also renders a QR code that the
+mobile Add Environment sheet can scan. Piped output remains text-only.
 
 ## Optional Relay Mode
 

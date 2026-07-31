@@ -57,6 +57,10 @@ In the mobile app, use `Ask your agent`, paste the generated message into
 Hermes, then paste Hermes's reply back into the app. Hermes can look up the
 pairing details with `brio companion pair`.
 
+The Add Environment sheet also matches T3 Code's pairing flow: run
+`brio companion pair`, scan the terminal QR code, paste the pairing payload,
+or enter the host and token manually.
+
 For an installed companion binary on an end-user machine:
 
 ```bash
