@@ -8,6 +8,7 @@ Hermes/Brio protocol:
 - searchable Hermes session list and persistent run state
 - conversation history, long-running tasks, cancellation, and approvals
 - direct and relay-backed environments
+- saved multi-environment switching, reconnect, editing, and removal
 - workspace file browser and editor
 - memory, config, skills, toolsets, scheduled jobs, logs, and gateway controls
 
@@ -53,13 +54,14 @@ Start the companion in a separate terminal:
 make dev-companion
 ```
 
-In the mobile app, use `Ask your agent`, paste the generated message into
-Hermes, then paste Hermes's reply back into the app. Hermes can look up the
-pairing details with `brio companion pair`.
+In the mobile app, tap **Connect to Hermes**, run `brio companion pair` on the
+Hermes machine, and scan the terminal QR code. Brio validates the payload and
+checks both Companion and Hermes before saving the environment. Pasting the
+payload, asking Hermes for it, and entering host/token details manually remain
+available as fallback paths.
 
-The Add Environment sheet also matches T3 Code's pairing flow: run
-`brio companion pair`, scan the terminal QR code, paste the pairing payload,
-or enter the host and token manually.
+Saved environments can be switched, retried, renamed, updated, or removed
+from the environment picker and Settings.
 
 For an installed companion binary on an end-user machine:
 

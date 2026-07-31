@@ -1,7 +1,7 @@
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { useRouter } from 'expo-router';
 import { SymbolView } from 'expo-symbols';
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useId, useRef, useState } from 'react';
 import {
   FlatList,
   KeyboardAvoidingView,
@@ -39,9 +39,11 @@ export function HermesThreadScreen({
   const router = useRouter();
   const queryClient = useQueryClient();
   const listRef = useRef<FlatList<FeedItem>>(null);
-  const sessionId = routeSessionId;
+  const generatedSessionId = `brio_new_${useId().replace(/[^a-z0-9_-]/gi, '')}`;
+  const sessionId = routeSessionId === 'new' ? generatedSessionId : routeSessionId;
+  const runKey = `${connection.id}:${sessionId}`;
   const [draft, setDraft] = useState('');
-  const runId = useRunStore((state) => state.activeRuns[sessionId] ?? null);
+  const runId = useRunStore((state) => state.activeRuns[runKey] ?? null);
   const setActiveRun = useRunStore((state) => state.setActiveRun);
   const [optimisticPrompt, setOptimisticPrompt] = useState<{
     content: string;
@@ -49,12 +51,12 @@ export function HermesThreadScreen({
   } | null>(null);
 
   const messages = useQuery({
-    queryKey: ['session-messages', connection.id, sessionId],
+    queryKey: ['session-messages', connection.id, connection.url, sessionId],
     queryFn: () => getSessionMessages(connection, sessionId),
     enabled: routeSessionId !== 'new' || Boolean(runId),
   });
   const run = useQuery({
-    queryKey: ['run', connection.id, runId],
+    queryKey: ['run', connection.id, connection.url, runId],
     queryFn: () => getRun(connection, runId!),
     enabled: Boolean(runId),
     refetchInterval: (query) => {
@@ -66,9 +68,11 @@ export function HermesThreadScreen({
 
   useEffect(() => {
     if (!terminal) return;
-    void queryClient.invalidateQueries({ queryKey: ['session-messages', connection.id, sessionId] });
-    void queryClient.invalidateQueries({ queryKey: ['sessions', connection.id] });
-  }, [connection.id, queryClient, sessionId, terminal]);
+    void queryClient.invalidateQueries({
+      queryKey: ['session-messages', connection.id, connection.url, sessionId],
+    });
+    void queryClient.invalidateQueries({ queryKey: ['sessions', connection.id, connection.url] });
+  }, [connection.id, connection.url, queryClient, sessionId, terminal]);
 
   const submit = useMutation({
     mutationFn: (input: string) =>
@@ -85,10 +89,13 @@ export function HermesThreadScreen({
       setDraft('');
     },
     onSuccess: (result) => {
-      setActiveRun(sessionId, result.run_id);
+      setActiveRun(runKey, result.run_id);
       if (routeSessionId === 'new') router.replace(`/thread/${encodeURIComponent(sessionId)}`);
     },
-    onError: () => setDraft(optimisticPrompt?.content ?? ''),
+    onError: (_reason, input) => {
+      setOptimisticPrompt(null);
+      setDraft(input);
+    },
   });
   const approval = useMutation({
     mutationFn: (choice: 'once' | 'session' | 'always' | 'deny') =>

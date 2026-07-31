@@ -13,6 +13,7 @@ import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { T3Palette, T3Typography } from '@/constants/t3-theme';
 import { useConnectionStore } from '@/state/connection-store';
 import { useRelaySessionStore } from '@/state/relay-session-store';
+import { useRunStore } from '@/state/run-store';
 import { useUIStore } from '@/state/ui-store';
 
 void SplashScreen.preventAutoHideAsync().catch(() => undefined);
@@ -33,19 +34,22 @@ export default function RootLayout() {
   const connectionHydrated = useConnectionStore((state) => state.hydrated);
   const hydrateRelaySession = useRelaySessionStore((state) => state.hydrate);
   const relayHydrated = useRelaySessionStore((state) => state.hydrated);
+  const hydrateRuns = useRunStore((state) => state.hydrate);
+  const runsHydrated = useRunStore((state) => state.hydrated);
   const hydrateUI = useUIStore((state) => state.hydrate);
 
   useEffect(() => {
     void hydrate();
     void hydrateRelaySession();
+    void hydrateRuns();
     void hydrateUI();
-  }, [hydrate, hydrateRelaySession, hydrateUI]);
+  }, [hydrate, hydrateRelaySession, hydrateRuns, hydrateUI]);
 
   useEffect(() => {
-    if (fontsLoaded && connectionHydrated && relayHydrated) {
+    if (fontsLoaded && connectionHydrated && relayHydrated && runsHydrated) {
       void SplashScreen.hideAsync();
     }
-  }, [connectionHydrated, fontsLoaded, relayHydrated]);
+  }, [connectionHydrated, fontsLoaded, relayHydrated, runsHydrated]);
 
   if (!fontsLoaded) return null;
 
@@ -78,6 +82,7 @@ export default function RootLayout() {
             <Stack.Screen name="index" options={{ headerShown: false }} />
             <Stack.Screen name="connect" options={{ presentation: 'modal', title: 'Add Environment' }} />
             <Stack.Screen name="relay" options={{ presentation: 'modal', title: 'Brio Relay' }} />
+            <Stack.Screen name="environments" options={{ presentation: 'modal', title: 'Environments' }} />
             <Stack.Screen name="thread/[id]" options={{ title: 'Hermes' }} />
             <Stack.Screen name="files" options={{ title: 'Files' }} />
             <Stack.Screen name="settings" options={{ presentation: 'modal', title: 'Settings' }} />

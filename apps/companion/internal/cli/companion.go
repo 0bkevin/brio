@@ -373,6 +373,12 @@ func pairingFromConfig() (tunnel.PairingPayload, error) {
 
 func printPairingPayload(payload tunnel.PairingPayload) {
 	encoded := tunnel.PairingCode(payload)
+	if parsed, err := url.Parse(payload.URL); err == nil {
+		host := parsed.Hostname()
+		if host == "localhost" || strings.HasPrefix(host, "127.") || host == "::1" {
+			fmt.Fprintln(os.Stderr, "Warning: this Companion address is only reachable from the same computer. Bind to 0.0.0.0 or set BRIO_PUBLIC_URL to an address your phone can reach.")
+		}
+	}
 	if payload.Code != "" {
 		fmt.Printf("Code: %s\n", payload.Code)
 	}

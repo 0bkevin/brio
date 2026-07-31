@@ -438,22 +438,99 @@ export type PairingPayload = {
   code?: string;
 };
 
+function isPairingTransport(value: unknown): value is 'direct' | 'relay' {
+  return value === 'direct' || value === 'relay';
+}
+
+function pairingPayloadFromUnknown(value: unknown): PairingPayload {
+  if (!value || typeof value !== 'object') {
+    throw new Error('Pairing details are not a valid object');
+  }
+  const candidate = value as Record<string, unknown>;
+  const url = typeof candidate.url === 'string' ? candidate.url.trim() : '';
+  const token = typeof candidate.token === 'string' ? candidate.token.trim() : '';
+  const transport = candidate.transport ?? candidate.mode ?? 'direct';
+  const code = typeof candidate.code === 'string' ? candidate.code.trim() : undefined;
+  const agentId = typeof candidate.agent_id === 'string' ? candidate.agent_id.trim() : undefined;
+
+  if (
+    candidate.transport !== undefined &&
+    candidate.mode !== undefined &&
+    candidate.transport !== candidate.mode
+  ) {
+    throw new Error('Pairing details contain conflicting connection types');
+  }
+
+  if (!url) throw new Error('Pairing details do not include an address');
+  let parsedURL: URL;
+  try {
+    parsedURL = new URL(url);
+  } catch {
+    throw new Error('Pairing details include an invalid address');
+  }
+  if (!['http:', 'https:'].includes(parsedURL.protocol) || !parsedURL.hostname) {
+    throw new Error('Pairing details must use an HTTP or HTTPS address');
+  }
+  if (parsedURL.search || parsedURL.hash) {
+    throw new Error('Pairing details include an invalid Companion address');
+  }
+  if (!isPairingTransport(transport)) {
+    throw new Error('Pairing details include an unsupported connection type');
+  }
+  if (transport === 'direct' && !token) {
+    throw new Error('Pairing details do not include a token');
+  }
+  if (transport === 'relay' && !code) {
+    throw new Error('Relay pairing details do not include a claim code');
+  }
+
+  return {
+    url: parsedURL.toString().replace(/\/$/, ''),
+    token,
+    mode: transport,
+    transport,
+    ...(agentId ? { agent_id: agentId } : {}),
+    ...(code ? { code } : {}),
+  };
+}
+
 export function decodePairingPayload(raw: string): PairingPayload {
   const value = raw.trim();
   if (!value) {
     throw new Error('Pairing payload is empty');
   }
-  try {
-    return JSON.parse(value) as PairingPayload;
-  } catch {
-    return JSON.parse(decodeBase64URL(value)) as PairingPayload;
+  if (value.length > 65_536) {
+    throw new Error('Pairing payload is too large');
   }
+  let decoded: unknown;
+  try {
+    decoded = JSON.parse(value);
+  } catch {
+    decoded = JSON.parse(decodeBase64URL(value));
+  }
+  return pairingPayloadFromUnknown(decoded);
 }
 
 export function extractPairingPayload(raw: string): PairingPayload {
-  const value = raw.trim();
+  let value = raw.trim();
   if (!value) {
     throw new Error('Hermes reply is empty');
+  }
+  if (value.length > 65_536) {
+    throw new Error('Pairing payload is too large');
+  }
+
+  try {
+    const deepLink = new URL(value);
+    if (deepLink.protocol === 'brio:') {
+      value =
+        deepLink.searchParams.get('pairingPayload')?.trim() ??
+        deepLink.searchParams.get('payload')?.trim() ??
+        '';
+      if (!value) throw new Error('Brio pairing link does not contain pairing details');
+    }
+  } catch (reason) {
+    if (/^brio:/i.test(value)) throw reason;
   }
 
   const notReadyMatch = value.match(/^\s*NOT\s+READY\s*:\s*(.+)$/is);
@@ -470,7 +547,7 @@ export function extractPairingPayload(raw: string): PairingPayload {
   const jsonBlock = value.match(/\{[\s\S]*\}/)?.[0];
   if (jsonBlock) {
     try {
-      return JSON.parse(jsonBlock) as PairingPayload;
+      return pairingPayloadFromUnknown(JSON.parse(jsonBlock));
     } catch {
       // Ignore and continue with label-based parsing.
     }
@@ -485,19 +562,20 @@ export function extractPairingPayload(raw: string): PairingPayload {
     throw new Error('Could not find a pairing payload or URL/token in the Hermes reply');
   }
 
-  return {
+  return pairingPayloadFromUnknown({
     url: cleanConnectionValue(urlMatch[1] ?? urlMatch[0]),
     token: cleanConnectionValue(tokenMatch[1]),
     mode: 'direct',
     transport: 'direct',
-  };
+  });
 }
 
 export function connectionFromPairingPayload(payload: PairingPayload): AgentConnection {
   const transport = payload.transport ?? payload.mode ?? 'direct';
+  const directId = `direct_${stableConnectionHash(payload.url)}`;
   return {
-    id: payload.agent_id ?? 'self-hosted-local',
-    name: 'Hermes',
+    id: payload.agent_id ?? directId,
+    name: transport === 'direct' ? directConnectionName(payload.url) : 'Hermes',
     mode: 'self_hosted',
     transport,
     status: 'connecting',
@@ -507,6 +585,44 @@ export function connectionFromPairingPayload(payload: PairingPayload): AgentConn
     agentId: payload.agent_id,
     pairingCode: payload.code,
   };
+}
+
+export function normalizeConnectionURL(value: string) {
+  const trimmed = value.trim().replace(/\/+$/, '');
+  if (/^https?:\/\//i.test(trimmed)) return trimmed;
+  const localHostname = /^(localhost|[^/:]+\.local)(?::\d+)?$/i.test(trimmed);
+  return `${isIPLiteral(trimmed) || localHostname ? 'http' : 'https'}://${trimmed}`;
+}
+
+function isIPLiteral(host: string) {
+  try {
+    const hostname = new URL(`http://${host}`).hostname.replace(/^\[|\]$/g, '');
+    if (hostname.includes(':')) return true;
+    const octets = hostname.split('.');
+    return (
+      octets.length === 4 &&
+      octets.every((octet) => /^\d{1,3}$/.test(octet) && Number(octet) <= 255)
+    );
+  } catch {
+    return false;
+  }
+}
+
+function stableConnectionHash(value: string) {
+  let hash = 2166136261;
+  for (let index = 0; index < value.length; index += 1) {
+    hash ^= value.charCodeAt(index);
+    hash = Math.imul(hash, 16777619);
+  }
+  return (hash >>> 0).toString(36);
+}
+
+function directConnectionName(value: string) {
+  try {
+    return new URL(value).hostname || 'Hermes';
+  } catch {
+    return 'Hermes';
+  }
 }
 
 export type ConnectionProgress = 'claiming' | 'checking_companion' | 'checking_hermes' | 'ready';
@@ -590,7 +706,7 @@ export async function claimRelayPairing(
 }
 
 export async function listRelayAgents(relayURL: string, relayToken: string) {
-  const response = await fetch(`${normalizeBaseURL(relayURL)}/agents`, {
+  const response = await fetchWithTimeout(`${normalizeBaseURL(relayURL)}/agents`, {
     headers: {
       Accept: 'application/json',
       Authorization: `Bearer ${relayToken}`,
@@ -608,7 +724,7 @@ export async function createRelayEnrollment(
   relayToken: string,
   name = 'Hermes',
 ) {
-  const response = await fetch(`${normalizeBaseURL(relayURL)}/enrollments`, {
+  const response = await fetchWithTimeout(`${normalizeBaseURL(relayURL)}/enrollments`, {
     method: 'POST',
     headers: {
       Accept: 'application/json',
@@ -630,7 +746,7 @@ export async function recoverRelayAgent(
   agentID: string,
   name?: string,
 ) {
-  const response = await fetch(
+  const response = await fetchWithTimeout(
     `${normalizeBaseURL(relayURL)}/agents/${encodeURIComponent(agentID)}/recover`,
     {
       method: 'POST',

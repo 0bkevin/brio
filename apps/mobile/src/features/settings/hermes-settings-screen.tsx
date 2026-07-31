@@ -4,7 +4,7 @@ import { useMemo, useState } from 'react';
 import { Alert, Platform, ScrollView, StyleSheet, Switch, View } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 
-import { AppText, AppTextInput, Button, Divider, Row, Section, StatusDot } from '@/components/t3-ui';
+import { AppText, AppTextInput, Button, Divider, EmptyState, Row, Section, StatusDot } from '@/components/t3-ui';
 import { T3Spacing, T3Typography } from '@/constants/t3-theme';
 import { useT3Theme } from '@/hooks/use-t3-theme';
 import {
@@ -34,14 +34,15 @@ export function HermesSettingsScreen({ connection }: { connection: AgentConnecti
   const colors = useT3Theme();
   const router = useRouter();
   const clearConnection = useConnectionStore((state) => state.clearConnection);
+  const connections = useConnectionStore((state) => state.connections);
   const [panel, setPanel] = useState<Panel>(null);
-  const health = useQuery({ queryKey: ['health', connection.id], queryFn: () => getHealth(connection) });
+  const health = useQuery({ queryKey: ['health', connection.id, connection.url], queryFn: () => getHealth(connection) });
   const capabilities = useQuery({
-    queryKey: ['capabilities', connection.id],
+    queryKey: ['capabilities', connection.id, connection.url],
     queryFn: () => getCapabilities(connection),
   });
   const gateway = useQuery({
-    queryKey: ['gateway', connection.id],
+    queryKey: ['gateway', connection.id, connection.url],
     queryFn: () => getGatewayStatus(connection),
   });
   const restart = useMutation({
@@ -54,14 +55,20 @@ export function HermesSettingsScreen({ connection }: { connection: AgentConnecti
 
   const disconnect = () => {
     const perform = () => {
-      void clearConnection().then(() => router.dismissTo('/'));
+      void clearConnection()
+        .then(() => router.dismissTo('/'))
+        .catch((reason: unknown) => {
+          const message = reason instanceof Error ? reason.message : 'The environment could not be removed.';
+          if (Platform.OS === 'web') globalThis.alert?.(message);
+          else Alert.alert('Could not remove environment', message);
+        });
     };
     if (Platform.OS === 'web') {
-      if (globalThis.confirm?.('Disconnect this environment?')) perform();
+      if (globalThis.confirm?.('Remove this environment from Brio?')) perform();
     } else {
-      Alert.alert('Disconnect environment?', 'You can reconnect later with the same pairing details.', [
+      Alert.alert('Remove environment?', 'Its saved connection will be removed from this device. You can pair it again later.', [
         { text: 'Cancel', style: 'cancel' },
-        { text: 'Disconnect', style: 'destructive', onPress: perform },
+        { text: 'Remove', style: 'destructive', onPress: perform },
       ]);
     }
   };
@@ -74,6 +81,7 @@ export function HermesSettingsScreen({ connection }: { connection: AgentConnecti
             accessory={<StatusDot status={health.data?.hermes_ok ? 'online' : health.isError ? 'error' : 'busy'} />}
             detail={connection.url}
             label={connection.name || 'Hermes'}
+            onPress={() => router.push('/environments')}
           />
           <Divider />
           <Row
@@ -112,16 +120,29 @@ export function HermesSettingsScreen({ connection }: { connection: AgentConnecti
             <Button loading={restart.isPending} onPress={() => restart.mutate()} tone="secondary">
               Restart gateway
             </Button>
+            {restart.isError ? (
+              <AppText style={[styles.inlineError, { color: colors.danger }]}>{errorMessage(restart.error)}</AppText>
+            ) : null}
           </View>
         </Section>
 
         <Section title="Connection">
+          <Row
+            accessory={<AppText style={{ color: colors.muted }}>{connections.length}</AppText>}
+            label="Saved environments"
+            onPress={() => router.push('/environments')}
+          />
+          <Divider />
+          <View style={styles.actionRow}>
+            <Button onPress={() => router.push('/connect')} tone="secondary">Add environment</Button>
+          </View>
+          <Divider />
           <View style={styles.actionRow}>
             <Button onPress={() => void health.refetch()} tone="secondary">Check connection</Button>
           </View>
           <Divider />
           <View style={styles.actionRow}>
-            <Button onPress={disconnect} tone="danger">Disconnect environment</Button>
+            <Button onPress={disconnect} tone="danger">Remove current environment</Button>
           </View>
         </Section>
 
@@ -156,7 +177,10 @@ function PanelHeader({ title, onClose }: { title: string; onClose: () => void })
 
 function MemoryPanel({ connection }: { connection: AgentConnection }) {
   const colors = useT3Theme();
-  const memory = useQuery({ queryKey: ['memory', connection.id], queryFn: () => getMemory(connection) });
+  const memory = useQuery({ queryKey: ['memory', connection.id, connection.url], queryFn: () => getMemory(connection) });
+  if (memory.isError) {
+    return <QueryFailure error={memory.error} onRetry={() => void memory.refetch()} title="Memory unavailable" />;
+  }
   if (!memory.data) {
     return <AppText style={[styles.loadingCopy, { color: colors.muted }]}>Loading memory…</AppText>;
   }
@@ -190,7 +214,10 @@ function MemoryForm({
 
 function ConfigPanel({ connection }: { connection: AgentConnection }) {
   const colors = useT3Theme();
-  const config = useQuery({ queryKey: ['config', connection.id], queryFn: () => getRawConfig(connection) });
+  const config = useQuery({ queryKey: ['config', connection.id, connection.url], queryFn: () => getRawConfig(connection) });
+  if (config.isError) {
+    return <QueryFailure error={config.error} onRetry={() => void config.refetch()} title="Configuration unavailable" />;
+  }
   if (!config.data) {
     return <AppText style={[styles.loadingCopy, { color: colors.muted }]}>Loading configuration…</AppText>;
   }
@@ -222,7 +249,10 @@ function ConfigForm({ connection, initialYaml }: { connection: AgentConnection; 
 
 function SkillsPanel({ connection }: { connection: AgentConnection }) {
   const colors = useT3Theme();
-  const skills = useQuery({ queryKey: ['skills', connection.id], queryFn: () => listSkills(connection) });
+  const skills = useQuery({ queryKey: ['skills', connection.id, connection.url], queryFn: () => listSkills(connection) });
+  if (skills.isError) {
+    return <QueryFailure error={skills.error} onRetry={() => void skills.refetch()} title="Skills unavailable" />;
+  }
   return (
     <ScrollView contentContainerStyle={styles.panelContent}>
       <Section title={`${skills.data?.skills.length ?? 0} installed`}>
@@ -245,7 +275,7 @@ function SkillsPanel({ connection }: { connection: AgentConnection }) {
 function ToolsetsPanel({ connection }: { connection: AgentConnection }) {
   const colors = useT3Theme();
   const queryClient = useQueryClient();
-  const toolsets = useQuery({ queryKey: ['toolsets', connection.id], queryFn: () => getToolsets(connection) });
+  const toolsets = useQuery({ queryKey: ['toolsets', connection.id, connection.url], queryFn: () => getToolsets(connection) });
   const cli = useMemo(() => toolsets.data?.toolsets?.cli ?? [], [toolsets.data?.toolsets?.cli]);
   const known = useMemo(
     () =>
@@ -274,8 +304,11 @@ function ToolsetsPanel({ connection }: { connection: AgentConnection }) {
   const toggle = useMutation({
     mutationFn: ({ enabled, name }: { enabled: boolean; name: string }) =>
       updateToolset(connection, name, enabled),
-    onSuccess: () => void queryClient.invalidateQueries({ queryKey: ['toolsets', connection.id] }),
+    onSuccess: () => void queryClient.invalidateQueries({ queryKey: ['toolsets', connection.id, connection.url] }),
   });
+  if (toolsets.isError) {
+    return <QueryFailure error={toolsets.error} onRetry={() => void toolsets.refetch()} title="Toolsets unavailable" />;
+  }
   return (
     <ScrollView contentContainerStyle={styles.panelContent}>
       <Section title="CLI toolsets">
@@ -303,13 +336,16 @@ function ToolsetsPanel({ connection }: { connection: AgentConnection }) {
 function JobsPanel({ connection }: { connection: AgentConnection }) {
   const colors = useT3Theme();
   const queryClient = useQueryClient();
-  const jobsQuery = useQuery({ queryKey: ['jobs', connection.id], queryFn: () => listJobs(connection) });
+  const jobsQuery = useQuery({ queryKey: ['jobs', connection.id, connection.url], queryFn: () => listJobs(connection) });
   const jobs = Array.isArray(jobsQuery.data) ? jobsQuery.data : (jobsQuery.data?.jobs ?? []);
   const action = useMutation({
     mutationFn: ({ action: nextAction, id }: { action: 'pause' | 'resume' | 'trigger' | 'delete'; id: string }) =>
       nextAction === 'delete' ? deleteJob(connection, id) : runJobAction(connection, id, nextAction),
-    onSuccess: () => void queryClient.invalidateQueries({ queryKey: ['jobs', connection.id] }),
+    onSuccess: () => void queryClient.invalidateQueries({ queryKey: ['jobs', connection.id, connection.url] }),
   });
+  if (jobsQuery.isError) {
+    return <QueryFailure error={jobsQuery.error} onRetry={() => void jobsQuery.refetch()} title="Scheduled jobs unavailable" />;
+  }
   return (
     <ScrollView contentContainerStyle={styles.panelContent}>
       {jobs.length === 0 ? (
@@ -336,6 +372,7 @@ function JobsPanel({ connection }: { connection: AgentConnection }) {
           );
         })
       )}
+      {action.isError ? <AppText style={[styles.inlineError, { color: colors.danger }]}>{errorMessage(action.error)}</AppText> : null}
     </ScrollView>
   );
 }
@@ -344,9 +381,12 @@ function LogsPanel({ connection }: { connection: AgentConnection }) {
   const colors = useT3Theme();
   const [file, setFile] = useState<'agent' | 'errors' | 'gateway'>('agent');
   const logs = useQuery({
-    queryKey: ['logs', connection.id, file],
+    queryKey: ['logs', connection.id, connection.url, file],
     queryFn: () => getLogs(connection, file, 500),
   });
+  if (logs.isError) {
+    return <QueryFailure error={logs.error} onRetry={() => void logs.refetch()} title="Logs unavailable" />;
+  }
   return (
     <View style={styles.logsPanel}>
       <View style={styles.logTabs}>
@@ -362,6 +402,16 @@ function LogsPanel({ connection }: { connection: AgentConnection }) {
         </AppText>
       </ScrollView>
     </View>
+  );
+}
+
+function QueryFailure({ error, onRetry, title }: { error: unknown; onRetry: () => void; title: string }) {
+  return (
+    <EmptyState
+      action={<Button onPress={onRetry}>Try again</Button>}
+      detail={errorMessage(error)}
+      title={title}
+    />
   );
 }
 
@@ -398,6 +448,7 @@ const styles = StyleSheet.create({
     width: '100%',
   },
   actionRow: { paddingVertical: T3Spacing.md },
+  inlineError: { fontSize: 13, lineHeight: 18, paddingTop: T3Spacing.sm },
   footer: { fontSize: 12, lineHeight: 16, paddingBottom: T3Spacing.huge, textAlign: 'center' },
   panelHeader: {
     alignItems: 'center',

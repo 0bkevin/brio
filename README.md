@@ -5,9 +5,9 @@ Brio is a mobile control plane for Hermes Agent.
 The preferred UX is:
 
 1. Open the mobile app.
-2. Use the `Ask your agent` card to copy a ready-made prompt into Hermes.
-3. Paste Hermes's reply back into the app to connect directly.
-4. Use relay enrollment only when you want persistent owned agents across devices.
+2. Run `brio companion pair` on the Hermes machine.
+3. Scan the terminal QR code; Brio verifies Companion and Hermes before saving it.
+4. Add or switch environments from the environment picker. Use Relay for access away from the local network.
 
 ## What Is Here
 
@@ -43,9 +43,9 @@ Start the mobile app in another terminal:
 make dev-mobile
 ```
 
-In the app, use `Ask your agent` and paste the prompt into Hermes. Hermes can
-look up the current companion pairing details by running `brio companion pair`.
-Paste Hermes's reply back into Brio to connect.
+In the app, tap **Connect to Hermes** and scan the QR code shown by
+`brio companion pair`. Pasting the payload and manual host/token entry remain
+available as fallbacks.
 
 ## Recommended Enrollment Flow
 
@@ -144,7 +144,8 @@ cp .env.example .env
 
 Common values:
 
-- `BRIO_ADDR` - companion bind address, default `127.0.0.1:8787`.
+- `BRIO_ADDR` - companion bind address, default `0.0.0.0:8787` so phones on the local network can connect.
+- `BRIO_PUBLIC_URL` - optional explicit address advertised in pairing payloads; by default Brio discovers the active LAN address.
 - `HERMES_API_BASE` - Hermes API base URL, default `http://127.0.0.1:8642`.
 - `BRIO_RELAY_ADDR` - relay bind address, default `127.0.0.1:8082`.
 - `BRIO_RELAY_URL` - relay URL used by the companion, default `http://127.0.0.1:8082`.

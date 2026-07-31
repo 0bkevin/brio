@@ -46,9 +46,10 @@
     "ios": "expo start --ios",
     "web": "expo start --web",
     "lint": "expo lint",
+    "test:pairing": "node --no-warnings --experimental-strip-types --test src/lib/brio.test.mjs",
     "typecheck": "tsc --noEmit",
     "export:web": "expo export --platform web",
-    "check": "npm run lint && npm run typecheck && npm run export:web"
+    "check": "npm run test:pairing && npm run lint && npm run typecheck && npm run export:web"
   },
   "private": true
 }

@@ -20,7 +20,7 @@ export function HermesFilesScreen({ connection }: { connection: AgentConnection 
   const [path, setPath] = useState<string | undefined>();
   const [selectedFile, setSelectedFile] = useState<string | null>(null);
   const files = useQuery({
-    queryKey: ['files', connection.id, path ?? 'root'],
+    queryKey: ['files', connection.id, connection.url, path ?? 'root'],
     queryFn: () => listFiles(connection, path),
   });
   const entries = [...(files.data?.entries ?? [])].sort((left, right) => {
@@ -130,7 +130,7 @@ function FileEditor({
 }) {
   const colors = useT3Theme();
   const file = useQuery({
-    queryKey: ['file', connection.id, path],
+    queryKey: ['file', connection.id, connection.url, path],
     queryFn: () => readFile(connection, path),
   });
   return (
@@ -169,7 +169,10 @@ function LoadedFileEditor({
   const dirty = content !== initialContent;
   const save = useMutation({
     mutationFn: () => writeFile(connection, path, content),
-    onSuccess: () => void queryClient.invalidateQueries({ queryKey: ['file', connection.id, path] }),
+    onSuccess: () =>
+      void queryClient.invalidateQueries({
+        queryKey: ['file', connection.id, connection.url, path],
+      }),
   });
 
   return (

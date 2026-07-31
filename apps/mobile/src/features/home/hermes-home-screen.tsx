@@ -29,17 +29,17 @@ export function HermesHomeScreen({ connection }: { connection: AgentConnection }
   const { width } = useWindowDimensions();
   const [search, setSearch] = useState('');
   const health = useQuery({
-    queryKey: ['home-health', connection.id],
+    queryKey: ['home-health', connection.id, connection.url],
     queryFn: () => getHealth(connection),
     refetchInterval: 15_000,
   });
   const sessions = useQuery({
-    queryKey: ['sessions', connection.id],
+    queryKey: ['sessions', connection.id, connection.url],
     queryFn: () => listSessions(connection),
     refetchInterval: 15_000,
   });
   const searchResults = useQuery({
-    queryKey: ['session-search', connection.id, search.trim()],
+    queryKey: ['session-search', connection.id, connection.url, search.trim()],
     queryFn: () => searchSessions(connection, search.trim()),
     enabled: search.trim().length > 1,
   });
@@ -68,15 +68,23 @@ export function HermesHomeScreen({ connection }: { connection: AgentConnection }
     <SafeAreaView edges={['top', 'left', 'right']} style={[styles.safe, { backgroundColor: colors.screen }]}>
       <View style={[styles.header, { borderBottomColor: colors.border }]}>
         <View style={styles.brandRow}>
-          <View>
+          <Pressable
+            accessibilityHint="Opens saved environments"
+            accessibilityLabel={`Current environment: ${connection.name || 'Hermes'}`}
+            accessibilityRole="button"
+            hitSlop={8}
+            onPress={() => router.push('/environments')}
+            style={({ pressed }) => [styles.environmentButton, { opacity: pressed ? 0.6 : 1 }]}
+          >
             <AppText style={styles.brand}>Brio</AppText>
             <View style={styles.environmentRow}>
               <StatusDot status={health.data?.hermes_ok ? 'online' : health.isError ? 'error' : 'busy'} />
               <AppText numberOfLines={1} style={[styles.environment, { color: colors.muted }]}>
                 {connection.name || 'Hermes'}
               </AppText>
+              <SymbolView name="chevron.down" size={10} tintColor={colors.tertiary} />
             </View>
-          </View>
+          </Pressable>
           <View style={styles.headerActions}>
             <HeaderButton
               accessibilityLabel="Browse files"
@@ -234,6 +242,7 @@ const styles = StyleSheet.create({
     paddingTop: T3Spacing.md,
   },
   brandRow: { alignItems: 'center', flexDirection: 'row', justifyContent: 'space-between' },
+  environmentButton: { flexShrink: 1 },
   brand: { fontFamily: T3Typography.bold, fontSize: 26, lineHeight: 32 },
   environmentRow: { alignItems: 'center', flexDirection: 'row', gap: 7 },
   environment: { fontSize: 13, lineHeight: 17, maxWidth: 220 },

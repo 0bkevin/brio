@@ -34,6 +34,7 @@ import { BottomTabInset, MaxContentWidth, Spacing } from '@/constants/theme';
 import { useTheme } from '@/hooks/use-theme';
 import { HermesHomeScreen } from '@/features/home/hermes-home-screen';
 import { EnvironmentOnboardingScreen } from '@/features/connection/environment-onboarding-screen';
+import { RelayEnvironmentsScreen } from '@/features/connection/relay-environments-screen';
 import { useConnectionStore } from '@/state/connection-store';
 import { useRelaySessionStore, type RelaySession } from '@/state/relay-session-store';
 
@@ -73,7 +74,7 @@ export default function ChatScreen() {
   }
 
   if (relaySession) {
-    return <ControlPlaneHome session={relaySession} />;
+    return <RelayEnvironmentsScreen session={relaySession} />;
   }
 
   return <EnvironmentOnboardingScreen />;
@@ -282,7 +283,7 @@ function RelaySignInCard({ embedded = false }: { embedded?: boolean }) {
   return <DashboardCard>{content}</DashboardCard>;
 }
 
-function ControlPlaneHome({ session }: { session: RelaySession }) {
+export function ControlPlaneHome({ session }: { session: RelaySession }) {
   const clearSession = useRelaySessionStore((state) => state.clearSession);
   const clearConnection = useConnectionStore((state) => state.clearConnection);
   const saveConnection = useConnectionStore((state) => state.saveConnection);

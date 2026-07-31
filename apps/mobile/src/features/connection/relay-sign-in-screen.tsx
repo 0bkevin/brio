@@ -11,6 +11,8 @@ import { useT3Theme } from '@/hooks/use-t3-theme';
 import { createRelayDevice } from '@/lib/brio';
 import { useRelaySessionStore } from '@/state/relay-session-store';
 
+type RelayDetails = { relayURL: string; email: string; deviceName: string };
+
 export function RelaySignInScreen() {
   const colors = useT3Theme();
   const router = useRouter();
@@ -21,11 +23,11 @@ export function RelaySignInScreen() {
   const [error, setError] = useState('');
 
   const signIn = useMutation({
-    mutationFn: () =>
-      createRelayDevice(normalizeRelayURL(relayURL), email.trim(), deviceName.trim()),
-    onSuccess: async (session) => {
+    mutationFn: (details: RelayDetails) =>
+      createRelayDevice(details.relayURL, details.email, details.deviceName),
+    onSuccess: async (session, details) => {
       await saveSession({
-        relayURL: normalizeRelayURL(relayURL),
+        relayURL: details.relayURL,
         email: session.user.email,
         deviceName: session.device.name,
         token: session.token,
@@ -43,9 +45,14 @@ export function RelaySignInScreen() {
       setError(validation);
       return;
     }
-    setRelayURL(normalizeRelayURL(relayURL));
+    const details = {
+      relayURL: normalizeRelayURL(relayURL),
+      email: email.trim(),
+      deviceName: deviceName.trim(),
+    };
+    setRelayURL(details.relayURL);
     setError('');
-    signIn.mutate();
+    signIn.mutate(details);
   };
 
   return (
@@ -77,6 +84,7 @@ export function RelaySignInScreen() {
               accessibilityLabel="Relay address"
               autoCapitalize="none"
               autoCorrect={false}
+              editable={!signIn.isPending}
               inputMode="url"
               onChangeText={(value) => {
                 setRelayURL(value);
@@ -91,6 +99,7 @@ export function RelaySignInScreen() {
               accessibilityLabel="Email"
               autoCapitalize="none"
               autoCorrect={false}
+              editable={!signIn.isPending}
               inputMode="email"
               onChangeText={(value) => {
                 setEmail(value);
@@ -105,6 +114,7 @@ export function RelaySignInScreen() {
               accessibilityLabel="Device name"
               autoCapitalize="words"
               autoCorrect={false}
+              editable={!signIn.isPending}
               onChangeText={(value) => {
                 setDeviceName(value);
                 setError('');

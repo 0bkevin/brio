@@ -24,6 +24,7 @@ import {
   connectionFromPairingPayload,
   extractPairingPayload,
   finalizeConnection,
+  normalizeConnectionURL,
   type ConnectionProgress,
   type PairingPayload,
 } from '@/lib/brio';
@@ -54,6 +55,7 @@ export function AddEnvironmentScreen() {
   const [issue, setIssue] = useState<ConnectionIssue | null>(null);
   const [progress, setProgress] = useState('Checking pairing details…');
   const scannerLocked = useRef(false);
+  const connectionAttemptActive = useRef(false);
   const [copied, setCopied] = useState(false);
   const [showCode, setShowCode] = useState(false);
   const [cameraPermission, requestCameraPermission] = useCameraPermissions();
@@ -70,7 +72,6 @@ export function AddEnvironmentScreen() {
 
   const applyPayload = (raw: string) => {
     const parsed = extractPairingPayload(raw);
-    validatePayload(parsed);
     setHost(parsed.url);
     setCode(parsed.token ?? '');
     setIssue(null);
@@ -78,6 +79,8 @@ export function AddEnvironmentScreen() {
   };
 
   const attemptConnection = async (candidate: PairingPayload, returnFlow: ReturnFlow) => {
+    if (connectionAttemptActive.current) return;
+    connectionAttemptActive.current = true;
     setIssue(null);
     setProgress('Checking pairing details…');
     setFlow('connecting');
@@ -98,6 +101,8 @@ export function AddEnvironmentScreen() {
           scannerLocked.current = false;
         }, 900);
       }
+    } finally {
+      connectionAttemptActive.current = false;
     }
   };
 
@@ -118,9 +123,17 @@ export function AddEnvironmentScreen() {
   };
 
   const copyHermesPrompt = async () => {
-    await Clipboard.setStringAsync(HERMES_PAIRING_PROMPT);
-    setCopied(true);
-    setTimeout(() => setCopied(false), 1800);
+    try {
+      await Clipboard.setStringAsync(HERMES_PAIRING_PROMPT);
+      setIssue(null);
+      setCopied(true);
+      setTimeout(() => setCopied(false), 1800);
+    } catch {
+      setIssue({
+        title: 'Couldn’t copy the message',
+        detail: 'Copy `brio companion pair` manually and run it on the Hermes machine.',
+      });
+    }
   };
 
   const openScanner = async () => {
@@ -176,7 +189,7 @@ export function AddEnvironmentScreen() {
   };
 
   const submitManual = async () => {
-    const normalizedHost = normalizeHost(host);
+    const normalizedHost = normalizeConnectionURL(host);
     const validation = validateManualConnection(normalizedHost, code);
     if (validation) {
       setIssue(validation);
@@ -535,17 +548,6 @@ function FieldLabel({ children }: { children: string }) {
   return <AppText style={[styles.fieldLabel, { color: colors.muted }]}>{children}</AppText>;
 }
 
-function validatePayload(payload: PairingPayload) {
-  if (!payload.url?.trim()) throw new Error('The pairing details do not include an address.');
-  const transport = payload.transport ?? payload.mode ?? 'direct';
-  if (transport === 'relay' && !payload.code?.trim()) {
-    throw new Error('The relay pairing details do not include a claim code.');
-  }
-  if (transport === 'direct' && !payload.token?.trim()) {
-    throw new Error('The pairing details do not include a token.');
-  }
-}
-
 function validateManualConnection(host: string, code: string): ConnectionIssue | null {
   if (!host || !code.trim()) {
     return {
@@ -612,13 +614,6 @@ function friendlyPayloadError(message: string) {
   }
   if (message.toLowerCase().includes('not ready')) return message;
   return 'Use the QR code or full payload shown by `brio companion pair`.';
-}
-
-function normalizeHost(host: string) {
-  const trimmed = host.trim().replace(/\/+$/, '');
-  if (/^https?:\/\//i.test(trimmed)) return trimmed;
-  const local = /^(localhost|127\.|10\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.)/i.test(trimmed);
-  return `${local ? 'http' : 'https'}://${trimmed}`;
 }
 
 function delay(milliseconds: number) {
