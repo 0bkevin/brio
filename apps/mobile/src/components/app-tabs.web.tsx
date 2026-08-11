@@ -140,7 +140,7 @@ const styles = StyleSheet.create({
     left: 0,
     minHeight: '100%',
     paddingTop: Spacing.three,
-    position: 'absolute',
+    position: 'fixed',
     top: 0,
     width: 260,
     zIndex: 10,

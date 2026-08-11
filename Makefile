@@ -3,7 +3,7 @@ include .env
 export
 endif
 
-BRIO_ADDR ?= 0.0.0.0:8787
+BRIO_ADDR ?= 127.0.0.1:8787
 BRIO_RELAY_ADDR ?= 127.0.0.1:8082
 BRIO_RELAY_URL ?= http://127.0.0.1:8082
 BRIO_AGENT_ID ?= local-brio
@@ -13,7 +13,7 @@ WEB_EXPORT_DIR ?= /tmp/brio-web-export
 GO_PACKAGES := ./apps/companion/... ./apps/relay/...
 MOBILE_DIR := apps/mobile
 
-.PHONY: help setup check test-go test-mobile lint-mobile typecheck-mobile export-mobile dev-mobile dev-companion dev-relay dev-companion-relay tidy
+.PHONY: help setup check test-go lint-mobile typecheck-mobile export-mobile dev-mobile dev-companion dev-relay dev-companion-relay tidy
 
 help:
 	@printf "Brio setup commands:\n"
@@ -30,13 +30,10 @@ setup:
 	cd apps/relay && go mod download
 	cd $(MOBILE_DIR) && npm ci
 
-check: test-go test-mobile lint-mobile typecheck-mobile export-mobile
+check: test-go lint-mobile typecheck-mobile export-mobile
 
 test-go:
 	go test $(GO_PACKAGES)
-
-test-mobile:
-	cd $(MOBILE_DIR) && npm run test:pairing
 
 lint-mobile:
 	cd $(MOBILE_DIR) && npm run lint

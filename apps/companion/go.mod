@@ -4,9 +4,7 @@ go 1.26.1
 
 require (
 	github.com/go-chi/chi/v5 v5.3.0
-	github.com/mdp/qrterminal/v3 v3.2.1
 	github.com/spf13/cobra v1.10.2
-	golang.org/x/term v0.13.0
 	gopkg.in/yaml.v3 v3.0.1
 	modernc.org/sqlite v1.50.1
 	nhooyr.io/websocket v1.8.17
@@ -26,5 +24,4 @@ require (
 	modernc.org/libc v1.72.3 // indirect
 	modernc.org/mathutil v1.7.1 // indirect
 	modernc.org/memory v1.11.0 // indirect
-	rsc.io/qr v0.2.0 // indirect
 )

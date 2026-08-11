@@ -6,19 +6,9 @@
     "orientation": "portrait",
     "icon": "./assets/images/icon.png",
     "scheme": "brio",
-    "jsEngine": "hermes",
     "userInterfaceStyle": "automatic",
     "ios": {
-      "icon": "./assets/expo.icon",
-      "supportsTablet": true,
-      "infoPlist": {
-        "NSAppTransportSecurity": {
-          "NSAllowsArbitraryLoads": true
-        },
-        "NSLocalNetworkUsageDescription": "Allow Brio to connect to Hermes Agent on your local network or tailnet.",
-        "ITSAppUsesNonExemptEncryption": false
-      },
-      "bundleIdentifier": "com.anonymous.brio"
+      "icon": "./assets/expo.icon"
     },
     "android": {
       "adaptiveIcon": {
@@ -27,11 +17,7 @@
         "backgroundImage": "./assets/images/android-icon-background.png",
         "monochromeImage": "./assets/images/android-icon-monochrome.png"
       },
-      "usesCleartextTraffic": true,
-      "predictiveBackGestureEnabled": true,
-      "permissions": [
-        "android.permission.CAMERA"
-      ]
+      "predictiveBackGestureEnabled": false
     },
     "web": {
       "output": "static",
@@ -49,18 +35,7 @@
           }
         }
       ],
-      "expo-secure-store",
-      [
-        "expo-camera",
-        {
-          "cameraPermission": "Allow Brio to scan environment pairing QR codes.",
-          "microphonePermission": false,
-          "barcodeScannerEnabled": true,
-          "recordAudioAndroid": false
-        }
-      ],
-      "expo-image",
-      "expo-web-browser"
+      "expo-secure-store"
     ],
     "experiments": {
       "typedRoutes": true,

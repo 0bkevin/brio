@@ -41,7 +41,7 @@ type companionRunOptions struct {
 func defaultCompanionRunOptions() companionRunOptions {
 	return companionRunOptions{
 		cfg: server.Config{
-			Addr:          configDefault("BRIO_ADDR", "0.0.0.0:8787"),
+			Addr:          configDefault("BRIO_ADDR", "127.0.0.1:8787"),
 			Token:         configDefault("BRIO_TOKEN", ""),
 			HermesBaseURL: configDefault("HERMES_API_BASE", "http://127.0.0.1:8642"),
 			HermesAPIKey:  configDefault("HERMES_API_KEY", ""),
@@ -233,57 +233,13 @@ func defaultHermesHome() string {
 }
 
 func publicURLFromAddr(addr string) string {
-	return publicURLFromAddrWithWildcardHost(addr, localNetworkHost())
-}
-
-func publicURLFromAddrWithWildcardHost(addr string, wildcardHost string) string {
 	host, port, err := net.SplitHostPort(addr)
 	if err != nil {
 		return "http://" + addr
 	}
 	if host == "" || host == "0.0.0.0" || host == "::" {
-		host = wildcardHost
-		if host == "" {
-			host = "127.0.0.1"
-		}
+		host = "127.0.0.1"
 	}
 	u := url.URL{Scheme: "http", Host: net.JoinHostPort(host, port)}
 	return u.String()
-}
-
-func localNetworkHost() string {
-	connection, err := net.Dial("udp", "8.8.8.8:80")
-	if err == nil {
-		defer connection.Close()
-		if address, ok := connection.LocalAddr().(*net.UDPAddr); ok && address.IP != nil && !address.IP.IsLoopback() {
-			return address.IP.String()
-		}
-	}
-
-	addresses, err := net.InterfaceAddrs()
-	if err != nil {
-		return ""
-	}
-	var fallback string
-	for _, address := range addresses {
-		var ip net.IP
-		switch value := address.(type) {
-		case *net.IPNet:
-			ip = value.IP
-		case *net.IPAddr:
-			ip = value.IP
-		}
-		if ip == nil || ip.IsLoopback() || ip.IsUnspecified() {
-			continue
-		}
-		if ipv4 := ip.To4(); ipv4 != nil {
-			if ipv4.IsPrivate() {
-				return ipv4.String()
-			}
-			if fallback == "" {
-				fallback = ipv4.String()
-			}
-		}
-	}
-	return fallback
 }
