@@ -17,7 +17,8 @@
         },
         "NSLocalNetworkUsageDescription": "Allow Brio to connect to Hermes Agent on your local network or tailnet.",
         "ITSAppUsesNonExemptEncryption": false
-      }
+      },
+      "bundleIdentifier": "com.anonymous.brio"
     },
     "android": {
       "adaptiveIcon": {
@@ -27,7 +28,10 @@
         "monochromeImage": "./assets/images/android-icon-monochrome.png"
       },
       "usesCleartextTraffic": true,
-      "predictiveBackGestureEnabled": true
+      "predictiveBackGestureEnabled": true,
+      "permissions": [
+        "android.permission.CAMERA"
+      ]
     },
     "web": {
       "output": "static",
@@ -54,7 +58,9 @@
           "barcodeScannerEnabled": true,
           "recordAudioAndroid": false
         }
-      ]
+      ],
+      "expo-image",
+      "expo-web-browser"
     ],
     "experiments": {
       "typedRoutes": true,
