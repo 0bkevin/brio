@@ -14,7 +14,9 @@ import (
 	"time"
 
 	"github.com/brio/brio/apps/companion/internal/tunnel"
+	"github.com/mdp/qrterminal/v3"
 	"github.com/spf13/cobra"
+	"golang.org/x/term"
 )
 
 const serviceName = "app.brio.companion"
@@ -370,11 +372,22 @@ func pairingFromConfig() (tunnel.PairingPayload, error) {
 }
 
 func printPairingPayload(payload tunnel.PairingPayload) {
+	encoded := tunnel.PairingCode(payload)
+	if parsed, err := url.Parse(payload.URL); err == nil {
+		host := parsed.Hostname()
+		if host == "localhost" || strings.HasPrefix(host, "127.") || host == "::1" {
+			fmt.Fprintln(os.Stderr, "Warning: this Companion address is only reachable from the same computer. Bind to 0.0.0.0 or set BRIO_PUBLIC_URL to an address your phone can reach.")
+		}
+	}
 	if payload.Code != "" {
 		fmt.Printf("Code: %s\n", payload.Code)
 	}
+	if term.IsTerminal(int(os.Stdout.Fd())) {
+		fmt.Println("Scan this QR code in Brio:")
+		qrterminal.GenerateHalfBlock(encoded, qrterminal.L, os.Stdout)
+	}
 	fmt.Println("Pairing payload:")
-	fmt.Println(tunnel.PairingCode(payload))
+	fmt.Println(encoded)
 }
 
 func printHealthStatus() error {

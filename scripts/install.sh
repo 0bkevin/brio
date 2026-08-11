@@ -8,7 +8,6 @@
 set -eu
 
 REPO="0bkevin/brio"
-RELAY_URL="https://brio-relay.xa95xa94cj2n4.us-east-1.cs.amazonlightsail.com"
 VERSION="${BRIO_VERSION:-latest}"
 
 # ---- detect platform ----
@@ -63,12 +62,10 @@ case ":$PATH:" in
 esac
 
 echo ""
-echo "Next — enroll this machine with the Brio relay (Hermes must be running at 127.0.0.1:8642):"
+echo "Next — start Brio Companion (Hermes must be running at 127.0.0.1:8642):"
 echo ""
-echo "  brio companion enroll \\"
-echo "    --relay-url ${RELAY_URL} \\"
-echo "    --code <CODE_FROM_THE_APP> \\"
-echo "    --run"
+echo "  brio companion install"
+echo "  brio companion pair"
 echo ""
-echo "Generate <CODE_FROM_THE_APP> in the Brio mobile app (Sign in → Generate enrollment code)."
-echo "To keep it running across reboots, use 'brio companion install' instead of --run."
+echo "Scan the QR code from the Brio mobile app."
+echo "For Tailscale or optional development Relay setup, see the project README."

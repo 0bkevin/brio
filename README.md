@@ -5,9 +5,9 @@ Brio is a mobile control plane for Hermes Agent.
 The preferred UX is:
 
 1. Open the mobile app.
-2. Use the `Ask your agent` card to copy a ready-made prompt into Hermes.
-3. Paste Hermes's reply back into the app to connect directly.
-4. Use relay enrollment only when you want persistent owned agents across devices.
+2. Run `brio companion pair` on the Hermes machine.
+3. Scan the terminal QR code; Brio verifies Companion and Hermes before saving it.
+4. Add or switch environments from the environment picker. Use Tailscale for private access away from the local network.
 
 ## What Is Here
 
@@ -43,14 +43,15 @@ Start the mobile app in another terminal:
 make dev-mobile
 ```
 
-In the app, use `Ask your agent` and paste the prompt into Hermes. Hermes can
-look up the current companion pairing details by running `brio companion pair`.
-Paste Hermes's reply back into Brio to connect.
+In the app, tap **Connect to Hermes** and scan the QR code shown by
+`brio companion pair`. Pasting the payload and manual host/token entry remain
+available as fallbacks.
 
-## Recommended Enrollment Flow
+## Development Relay Flow
 
-If you want persistent remote ownership instead of the simple direct handoff,
-use the relay enrollment flow below.
+The current Relay flow is for local development only. It trusts the entered
+email without verification, so it does not establish secure account ownership
+and must not be exposed as a public production service.
 
 Start the relay:
 
@@ -66,7 +67,7 @@ make dev-mobile
 
 In the app:
 
-1. Sign in to the relay.
+1. Open **Development Relay** and connect to a Relay you control.
 2. Generate an enrollment code.
 
 On the Hermes machine:
@@ -75,8 +76,8 @@ On the Hermes machine:
 brio companion enroll --relay-url http://127.0.0.1:8082 --code ABCD1234 --run
 ```
 
-After enrollment, the agent is owned by that relay user and can be opened from
-the app without manual pairing payloads.
+After enrollment, the agent appears under that development identity and can be
+opened without another manual pairing payload.
 
 ## Companion Service
 
@@ -103,13 +104,16 @@ brio companion install     # install and start background service
 brio companion start       # start installed background service
 brio companion restart     # restart installed background service
 brio companion status      # service and /health status
-brio companion pair        # print current mobile pairing payload
+brio companion pair        # print current mobile pairing payload or QR
 brio companion enroll      # enroll this machine into the control plane
 brio companion recover     # recover relay credentials for a claimed agent
 brio companion stop        # stop background service
 brio companion uninstall   # remove background service
 brio companion run         # foreground server for debugging
 ```
+
+When run in a terminal, `brio companion pair` also renders a QR code that the
+mobile Add Environment sheet can scan. Piped output remains text-only.
 
 ## Optional Relay Mode
 
@@ -141,12 +145,31 @@ cp .env.example .env
 
 Common values:
 
-- `BRIO_ADDR` - companion bind address, default `127.0.0.1:8787`.
+- `BRIO_ADDR` - companion bind address, default `0.0.0.0:8787` so phones on the local network can connect.
+- `BRIO_PUBLIC_URL` - optional explicit address advertised in pairing payloads; by default Brio discovers the active LAN address.
 - `HERMES_API_BASE` - Hermes API base URL, default `http://127.0.0.1:8642`.
 - `BRIO_RELAY_ADDR` - relay bind address, default `127.0.0.1:8082`.
 - `BRIO_RELAY_URL` - relay URL used by the companion, default `http://127.0.0.1:8082`.
 - `BRIO_RELAY_TOKEN` - existing relay companion token used to recover relay mode if local pairing state is lost.
 - `BRIO_DATABASE_URL` - optional Postgres URL for relay persistence.
+
+### Connect through Tailscale
+
+Tailscale can replace the Relay for private remote connectivity. Keep Brio Companion: it is the small bridge that translates the mobile app's requests to the agent running on your computer.
+
+On the computer running Hermes, bind Companion only to its Tailscale address and advertise that same address:
+
+```bash
+BRIO_TAILSCALE_IP="$(tailscale ip -4)"
+brio companion install \
+  --addr "${BRIO_TAILSCALE_IP}:8787" \
+  --public-url "http://${BRIO_TAILSCALE_IP}:8787"
+brio companion pair
+```
+
+Then scan the QR code while the phone is connected to the same tailnet. The tailnet policy must allow the phone to reach TCP port `8787` on the computer. Binding to the Tailscale address keeps Companion off the regular LAN.
+
+For a MagicDNS hostname with the default HTTP Companion, include `http://` explicitly in `--public-url`. Bare remote hostnames are treated as HTTPS. Direct HTTP on an ordinary LAN is not transport-encrypted; Tailscale encrypts it underneath.
 
 ## Direct Commands
 
