@@ -60,13 +60,13 @@ export function EnvironmentOnboardingScreen() {
 
         <Pressable
           accessibilityHint="Connect through an existing Brio Relay"
-          accessibilityLabel="Use Brio Relay"
+          accessibilityLabel="Use development Relay"
           accessibilityRole="button"
           onPress={() => router.push('/relay')}
           style={({ pressed }) => [styles.relayLink, { opacity: pressed ? 0.55 : 1 }]}
         >
           <SymbolView accessible={false} name="network" size={15} tintColor={colors.tertiary} />
-          <AppText style={[styles.relayLabel, { color: colors.tertiary }]}>Use Brio Relay</AppText>
+          <AppText style={[styles.relayLabel, { color: colors.tertiary }]}>Development Relay</AppText>
         </Pressable>
       </ScrollView>
     </SafeAreaView>

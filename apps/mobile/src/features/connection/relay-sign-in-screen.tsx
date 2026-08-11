@@ -68,7 +68,7 @@ export function RelaySignInScreen() {
 
   const close = () => {
     abortController.current?.abort();
-    router.back();
+    router.dismissTo('/');
   };
 
   return (
@@ -107,14 +107,14 @@ export function RelaySignInScreen() {
             <View style={[styles.heroIcon, { backgroundColor: colors.subtleStrong }]}>
               <SymbolView name="network" size={25} tintColor={colors.foreground} />
             </View>
-            <AppText style={styles.title}>Use an existing Brio Relay</AppText>
-            <AppText style={[styles.detail, { color: colors.muted }]}>Connect to environments available through a Relay you or your organization already operates.</AppText>
+            <AppText style={styles.title}>Connect a development Relay</AppText>
+            <AppText style={[styles.detail, { color: colors.muted }]}>For local testing with a Relay you control. This preview does not verify account ownership.</AppText>
           </View>
 
           <Card style={styles.formCard}>
             <FieldLabel>Relay address</FieldLabel>
             <AppTextInput
-              accessibilityHint="The address supplied by your Relay administrator"
+              accessibilityHint="The address of a development Relay you control"
               accessibilityLabel="Relay address"
               autoCapitalize="none"
               autoCorrect={false}
@@ -128,9 +128,9 @@ export function RelaySignInScreen() {
               value={relayURL}
             />
 
-            <FieldLabel>Account email</FieldLabel>
+            <FieldLabel>Developer identity email</FieldLabel>
             <AppTextInput
-              accessibilityLabel="Relay account email"
+              accessibilityLabel="Relay developer identity email"
               autoCapitalize="none"
               autoCorrect={false}
               editable={!connecting}
@@ -172,13 +172,13 @@ export function RelaySignInScreen() {
               loading={connecting}
               onPress={() => void connect()}
             >
-              {connecting ? 'Connecting…' : 'Continue to environments'}
+              {connecting ? 'Connecting…' : 'Continue to test environments'}
             </Button>
           </Card>
 
           <View style={[styles.privacyNote, { backgroundColor: colors.subtle }]}>
             <SymbolView name="info.circle" size={17} tintColor={colors.tertiary} />
-            <AppText style={[styles.note, { color: colors.muted }]}>Relay access rules depend on your deployment. Brio sends this address, email, and device name to the Relay you enter.</AppText>
+            <AppText style={[styles.note, { color: colors.muted }]}>This development flow trusts the email you enter without verification. Do not use it with a public or untrusted Relay.</AppText>
           </View>
 
           <Button onPress={() => router.replace('/connect')} tone="plain">Connect directly instead</Button>

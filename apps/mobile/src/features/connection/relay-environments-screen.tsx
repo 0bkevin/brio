@@ -78,13 +78,13 @@ export function RelayEnvironmentsScreen({ session }: { session: RelaySession }) 
     }
   };
 
-  const signOut = async () => {
+  const disconnectRelay = async () => {
     setConnectionError('');
     try {
       await removeRelayConnections(session.relayURL);
       await clearSession();
     } catch (reason) {
-      setConnectionError(reason instanceof Error ? reason.message : 'Could not sign out of Relay.');
+      setConnectionError(reason instanceof Error ? reason.message : 'Could not disconnect Relay.');
     }
   };
 
@@ -117,14 +117,14 @@ export function RelayEnvironmentsScreen({ session }: { session: RelaySession }) 
       >
         <View style={styles.header}>
           <View style={styles.headerCopy}>
-            <AppText style={styles.title}>Brio Relay</AppText>
+            <AppText style={styles.title}>Development Relay</AppText>
             <AppText style={[styles.subtitle, { color: colors.muted }]}>{session.email}</AppText>
             <AppText numberOfLines={1} style={[styles.relayURL, { color: colors.tertiary }]}>
               {session.relayURL}
             </AppText>
           </View>
-          <Button onPress={() => void signOut()} tone="plain">
-            Sign out
+          <Button onPress={() => void disconnectRelay()} tone="plain">
+            Disconnect
           </Button>
         </View>
 

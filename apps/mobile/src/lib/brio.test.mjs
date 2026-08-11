@@ -93,10 +93,32 @@ test('rejects incomplete, unsupported, and unsafe pairing payloads', () => {
   );
 });
 
-test('normalizes local IPv4, IPv6, and mDNS hosts to HTTP', () => {
+test('normalizes only private and tailnet addresses to HTTP by default', () => {
   assert.equal(normalizeConnectionURL('192.168.1.25:8787'), 'http://192.168.1.25:8787');
+  assert.equal(normalizeConnectionURL('100.64.0.1:8787'), 'http://100.64.0.1:8787');
+  assert.equal(normalizeConnectionURL('100.100.10.25:8787'), 'http://100.100.10.25:8787');
+  assert.equal(normalizeConnectionURL('100.127.255.254:8787'), 'http://100.127.255.254:8787');
+  assert.equal(normalizeConnectionURL('100.63.255.255:8787'), 'https://100.63.255.255:8787');
+  assert.equal(normalizeConnectionURL('100.128.0.1:8787'), 'https://100.128.0.1:8787');
+  assert.equal(normalizeConnectionURL('8.8.8.8:8787'), 'https://8.8.8.8:8787');
   assert.equal(normalizeConnectionURL('[::1]:8787'), 'http://[::1]:8787');
+  assert.equal(
+    normalizeConnectionURL('[fd7a:115c:a1e0::1]:8787'),
+    'http://[fd7a:115c:a1e0::1]:8787',
+  );
+  assert.equal(
+    normalizeConnectionURL('[2001:4860:4860::8888]:8787'),
+    'https://[2001:4860:4860::8888]:8787',
+  );
   assert.equal(normalizeConnectionURL('hermes.local:8787'), 'http://hermes.local:8787');
+  assert.equal(
+    normalizeConnectionURL('mac.tailnet.ts.net:8787'),
+    'https://mac.tailnet.ts.net:8787',
+  );
+  assert.equal(
+    normalizeConnectionURL('http://mac.tailnet.ts.net:8787'),
+    'http://mac.tailnet.ts.net:8787',
+  );
   assert.equal(normalizeConnectionURL('remote.example.com'), 'https://remote.example.com');
 });
 
@@ -190,13 +212,22 @@ test('onboarding translates pairing parser errors without exposing implementatio
   assert.match(friendlyPayloadError('Malformed JSON'), /QR code or full connection code/);
 });
 
-test('connection verification accepts provider-neutral agent health', async () => {
+test('connection verification accepts the newer health alias for Hermes', async () => {
   const originalFetch = globalThis.fetch;
   globalThis.fetch = async () =>
-    new Response(JSON.stringify({ ok: true, agent_ok: true, hermes_ok: false }), {
+    new Response(
+      JSON.stringify({
+        ok: true,
+        agent_ok: true,
+        agent_kind: 'hermes',
+        agent_name: 'Hermes Agent',
+        hermes_ok: false,
+      }),
+      {
       headers: { 'Content-Type': 'application/json' },
       status: 200,
-    });
+      },
+    );
   try {
     const connection = connectionFromPairingPayload(directPayload);
     const connected = await finalizeConnection(connection);
@@ -220,6 +251,37 @@ test('connection verification can be cancelled without waiting for timeout', asy
     const health = getHealth(connectionFromPairingPayload(directPayload), controller.signal);
     controller.abort();
     await assert.rejects(health, /Connection cancelled/);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test('Relay pairing never creates an implicit shared development identity', async () => {
+  const relay = connectionFromPairingPayload({
+    url: 'https://relay.example.com',
+    token: '',
+    code: 'PAIR1234',
+    mode: 'relay',
+    transport: 'relay',
+  });
+  await assert.rejects(
+    finalizeConnection(relay),
+    /Development Relay pairing must be completed from the Relay screen/,
+  );
+});
+
+test('unknown agent adapters are rejected before saving an incompatible environment', async () => {
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async () =>
+    new Response(
+      JSON.stringify({ ok: true, agent_ok: true, agent_kind: 'openclaw', agent_name: 'OpenClaw' }),
+      { headers: { 'Content-Type': 'application/json' }, status: 200 },
+    );
+  try {
+    await assert.rejects(
+      finalizeConnection(connectionFromPairingPayload(directPayload)),
+      /OpenClaw is not supported by this version of Brio/,
+    );
   } finally {
     globalThis.fetch = originalFetch;
   }

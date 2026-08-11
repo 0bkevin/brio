@@ -6,6 +6,7 @@ import { useEffect, useRef, useState } from 'react';
 import {
   AccessibilityInfo,
   ActivityIndicator,
+  AppState,
   KeyboardAvoidingView,
   Linking,
   Platform,
@@ -39,6 +40,9 @@ import {
 
 const PAIR_COMMAND = 'brio companion pair';
 const INSTALL_COMMAND = 'brio companion install';
+const BINARY_INSTALL_COMMAND =
+  'curl -fsSL https://github.com/0bkevin/brio/releases/latest/download/install.sh | sh';
+const BRIO_RELEASES_URL = 'https://github.com/0bkevin/brio/releases/latest';
 const AGENT_SETUP_PROMPT = `Help me connect the Brio mobile app to this computer.
 
 Run "brio companion pair" and return only the QR code or connection payload. If Brio Companion is not installed or running, set it up first and then create a fresh pairing code.`;
@@ -82,11 +86,12 @@ export function AddEnvironmentScreen() {
   const [showCode, setShowCode] = useState(false);
   const [copiedValue, setCopiedValue] = useState('');
   const [torchEnabled, setTorchEnabled] = useState(false);
-  const [cameraPermission, requestCameraPermission] = useCameraPermissions();
+  const [cameraPermission, requestCameraPermission, getCameraPermission] = useCameraPermissions();
   const scannerLocked = useRef(false);
   const automaticCameraRequestStarted = useRef(false);
   const attemptID = useRef(0);
   const abortController = useRef<AbortController | null>(null);
+  const commitStarted = useRef(false);
 
   const busy = flow === 'connecting' || flow === 'success';
   const displayFlow =
@@ -106,6 +111,24 @@ export function AddEnvironmentScreen() {
   }, [flow, issue, progress]);
 
   useEffect(() => () => abortController.current?.abort(), []);
+
+  useEffect(() => {
+    const subscription = AppState.addEventListener('change', (nextState) => {
+      if (nextState !== 'active' || flow !== 'camera_permission') return;
+      void getCameraPermission().then((permission) => {
+        if (permission.granted) {
+          scannerLocked.current = false;
+          setFlow('scanner');
+        }
+      }).catch(() => {
+        setIssue({
+          title: 'Could not check camera access',
+          detail: 'Try again, or paste the connection code instead.',
+        });
+      });
+    });
+    return () => subscription.remove();
+  }, [flow, getCameraPermission]);
 
   useEffect(() => {
     if (
@@ -141,6 +164,7 @@ export function AddEnvironmentScreen() {
     const controller = new AbortController();
     abortController.current?.abort();
     abortController.current = controller;
+    commitStarted.current = false;
     setLastCandidate(candidate);
     setReturnFlow(fallback);
     setIssue(null);
@@ -157,6 +181,7 @@ export function AddEnvironmentScreen() {
         controller.signal,
       );
       if (controller.signal.aborted) throw new Error('Connection cancelled');
+      commitStarted.current = true;
       setProgress('saving');
       await saveConnection(connected);
       if (currentAttempt !== attemptID.current) return;
@@ -173,12 +198,25 @@ export function AddEnvironmentScreen() {
       }
     } finally {
       if (currentAttempt === attemptID.current) abortController.current = null;
+      if (currentAttempt === attemptID.current) commitStarted.current = false;
       scannerLocked.current = false;
     }
   };
 
   const cancelConnection = () => {
+    if (commitStarted.current) return;
     abortController.current?.abort();
+  };
+
+  const openCameraSettings = async () => {
+    try {
+      await Linking.openSettings();
+    } catch {
+      setIssue({
+        title: 'Could not open Settings',
+        detail: 'Open Settings and allow camera access for Brio, or paste the connection code.',
+      });
+    }
   };
 
   const copyText = async (value: string) => {
@@ -191,6 +229,17 @@ export function AddEnvironmentScreen() {
       setIssue({
         title: 'Could not copy to the clipboard',
         detail: 'Select the command and copy it manually.',
+      });
+    }
+  };
+
+  const openBrioDownloads = async () => {
+    try {
+      await Linking.openURL(BRIO_RELEASES_URL);
+    } catch {
+      setIssue({
+        title: 'Could not open Brio downloads',
+        detail: 'Open github.com/0bkevin/brio/releases/latest on your computer.',
       });
     }
   };
@@ -345,7 +394,7 @@ export function AddEnvironmentScreen() {
                 <Pressable
                   accessibilityLabel="Close setup"
                   accessibilityRole="button"
-                  onPress={() => router.back()}
+                  onPress={() => router.dismissTo('/')}
                   style={({ pressed }) => [styles.headerIcon, { opacity: pressed ? 0.5 : 1 }]}
                 >
                   <SymbolView name="xmark" size={17} tintColor={colors.foreground} />
@@ -391,7 +440,7 @@ export function AddEnvironmentScreen() {
             scannerLocked.current = false;
             setIssue(null);
             if (params.mode === 'scan') {
-              router.back();
+              router.dismissTo('/');
             } else {
               setFlow('guide');
             }
@@ -407,8 +456,9 @@ export function AddEnvironmentScreen() {
       ) : displayFlow === 'camera_permission' ? (
         <CameraPermissionScreen
           canAskAgain={cameraPermission?.canAskAgain !== false}
+          issue={issue}
           onAllow={() => void askForCamera()}
-          onOpenSettings={() => void Linking.openSettings()}
+          onOpenSettings={() => void openCameraSettings()}
           onPaste={() => setFlow('paste')}
         />
       ) : (
@@ -456,6 +506,7 @@ export function AddEnvironmentScreen() {
                 issue={issue}
                 onCopy={(value) => void copyText(value)}
                 onManual={() => setFlow('manual')}
+                onOpenDownloads={() => void openBrioDownloads()}
                 onPaste={() => setFlow('paste')}
                 onScan={() => void openScanner()}
                 onToggleFirstTime={() => setShowFirstTimeHelp((current) => !current)}
@@ -474,6 +525,7 @@ function SetupGuide({
   issue,
   onCopy,
   onManual,
+  onOpenDownloads,
   onPaste,
   onScan,
   onToggleFirstTime,
@@ -483,6 +535,7 @@ function SetupGuide({
   issue: ConnectionIssue | null;
   onCopy: (value: string) => void;
   onManual: () => void;
+  onOpenDownloads: () => void;
   onPaste: () => void;
   onScan: () => void;
   onToggleFirstTime: () => void;
@@ -522,12 +575,27 @@ function SetupGuide({
         </Pressable>
         {showFirstTimeHelp ? (
           <View style={[styles.helpBox, { backgroundColor: colors.subtle }]}>
-            <AppText style={[styles.helpText, { color: colors.secondary }]}>Install and start the small Brio bridge first. Then run the pairing command again.</AppText>
+            <AppText style={[styles.helpText, { color: colors.secondary }]}>If the <AppText style={styles.inlineCode}>brio</AppText> command is missing on macOS or Linux:</AppText>
+            <CommandRow
+              command={BINARY_INSTALL_COMMAND}
+              copied={copiedValue === BINARY_INSTALL_COMMAND}
+              onCopy={() => onCopy(BINARY_INSTALL_COMMAND)}
+            />
+            <AppText style={[styles.helpText, { color: colors.secondary }]}>Then start the Brio bridge:</AppText>
             <CommandRow
               command={INSTALL_COMMAND}
               copied={copiedValue === INSTALL_COMMAND}
               onCopy={() => onCopy(INSTALL_COMMAND)}
             />
+            <Pressable
+              accessibilityHint="Opens the latest Brio downloads, including Windows builds"
+              accessibilityRole="link"
+              onPress={onOpenDownloads}
+              style={({ pressed }) => [styles.downloadLink, { opacity: pressed ? 0.55 : 1 }]}
+            >
+              <AppText style={[styles.downloadLabel, { color: colors.secondary }]}>Windows or manual download</AppText>
+              <AppText accessible={false} style={{ color: colors.tertiary }}>›</AppText>
+            </Pressable>
             <Pressable
               accessibilityRole="button"
               onPress={() => onCopy(AGENT_SETUP_PROMPT)}
@@ -631,7 +699,7 @@ function ManualConnectionForm({
           <SymbolView name="keyboard" size={24} tintColor={colors.foreground} />
         </View>
         <AppText style={styles.title}>Enter connection details</AppText>
-        <AppText style={[styles.detail, { color: colors.muted }]}>Use the address and temporary code shown on your computer.</AppText>
+        <AppText style={[styles.detail, { color: colors.muted }]}>Use the address and access token shown on your computer.</AppText>
       </View>
       {issue ? <IssueCard issue={issue} /> : null}
       <Card style={styles.formCard}>
@@ -647,9 +715,9 @@ function ManualConnectionForm({
           returnKeyType="next"
           value={host}
         />
-        <AppText style={[styles.fieldHint, { color: colors.muted }]}>For a local address, your phone usually needs to be on the same Wi-Fi network.</AppText>
+        <AppText style={[styles.fieldHint, { color: colors.muted }]}>Your phone must be on the same Wi-Fi or private network, such as the same tailnet.</AppText>
         <View style={styles.labelRow}>
-          <FieldLabel>Pairing code</FieldLabel>
+          <FieldLabel>Access token</FieldLabel>
           {code ? (
             <Pressable accessibilityRole="button" onPress={onToggleCode}>
               <AppText style={[styles.revealCode, { color: colors.secondary }]}>{showCode ? 'Hide' : 'Show'}</AppText>
@@ -657,12 +725,12 @@ function ManualConnectionForm({
           ) : null}
         </View>
         <AppTextInput
-          accessibilityLabel="Pairing code"
+          accessibilityLabel="Access token"
           autoCapitalize="none"
           autoCorrect={false}
           onChangeText={onCodeChange}
           onSubmitEditing={onSubmit}
-          placeholder="Paste the temporary code"
+          placeholder="Paste the access token"
           returnKeyType="go"
           secureTextEntry={!showCode}
           value={code}
@@ -690,7 +758,11 @@ function Scanner({
 }) {
   const colors = useT3Theme();
   return (
-    <View style={[styles.scannerScreen, { backgroundColor: colors.screen }]}>
+    <ScrollView
+      contentContainerStyle={styles.scannerScreen}
+      showsVerticalScrollIndicator={false}
+      style={[styles.scrollScreen, { backgroundColor: colors.screen }]}
+    >
       <View style={styles.scannerCopy}>
         <AppText style={styles.scannerTitle}>Scan the QR code on your computer</AppText>
         <AppText style={[styles.scannerDetail, { color: colors.muted }]}>Brio will continue automatically when the code is recognized.</AppText>
@@ -710,34 +782,41 @@ function Scanner({
       {issue ? <IssueCard issue={issue} /> : null}
       <Button onPress={onPaste} tone="secondary">Paste code instead</Button>
       <Button onPress={onClose} tone="plain">Cancel scanning</Button>
-    </View>
+    </ScrollView>
   );
 }
 
 function CameraPermissionScreen({
   canAskAgain,
+  issue,
   onAllow,
   onOpenSettings,
   onPaste,
 }: {
   canAskAgain: boolean;
+  issue: ConnectionIssue | null;
   onAllow: () => void;
   onOpenSettings: () => void;
   onPaste: () => void;
 }) {
   const colors = useT3Theme();
   return (
-    <View style={[styles.centerScreen, { backgroundColor: colors.screen }]}>
+    <ScrollView
+      contentContainerStyle={styles.centerScreen}
+      showsVerticalScrollIndicator={false}
+      style={[styles.scrollScreen, { backgroundColor: colors.screen }]}
+    >
       <View style={[styles.largeIcon, { backgroundColor: colors.subtleStrong }]}>
         <SymbolView name="qrcode.viewfinder" size={34} tintColor={colors.foreground} />
       </View>
       <AppText style={styles.statusTitle}>Scan instead of typing</AppText>
       <AppText style={[styles.statusDetail, { color: colors.muted }]}>Camera access is only used to read the Brio QR code. Brio does not save the image.</AppText>
+      {issue ? <IssueCard issue={issue} /> : null}
       <View style={styles.fullWidthActions}>
         <Button onPress={canAskAgain ? onAllow : onOpenSettings}>{canAskAgain ? 'Allow camera access' : 'Open Settings'}</Button>
         <Button onPress={onPaste} tone="secondary">Paste code instead</Button>
       </View>
-    </View>
+    </ScrollView>
   );
 }
 
@@ -745,7 +824,11 @@ function ConnectionProgressScreen({ progress }: { progress: ProgressStage }) {
   const colors = useT3Theme();
   const activeIndex = progressIndex(progress);
   return (
-    <View style={[styles.progressScreen, { backgroundColor: colors.screen }]}>
+    <ScrollView
+      contentContainerStyle={styles.progressScreen}
+      showsVerticalScrollIndicator={false}
+      style={[styles.scrollScreen, { backgroundColor: colors.screen }]}
+    >
       <View style={[styles.largeIcon, { backgroundColor: colors.subtleStrong }]}><ActivityIndicator color={colors.foreground} size="large" /></View>
       <View style={styles.progressCopy}>
         <AppText style={styles.statusTitle}>Connecting your agent</AppText>
@@ -766,7 +849,7 @@ function ConnectionProgressScreen({ progress }: { progress: ProgressStage }) {
           );
         })}
       </Card>
-    </View>
+    </ScrollView>
   );
 }
 
@@ -807,7 +890,11 @@ function FailureScreen({
 function SuccessScreen({ connection, onContinue }: { connection: AgentConnection | null; onContinue: () => void }) {
   const colors = useT3Theme();
   return (
-    <View style={[styles.centerScreen, { backgroundColor: colors.screen }]}>
+    <ScrollView
+      contentContainerStyle={styles.centerScreen}
+      showsVerticalScrollIndicator={false}
+      style={[styles.scrollScreen, { backgroundColor: colors.screen }]}
+    >
       <View style={[styles.largeIcon, { backgroundColor: `${colors.success}1f` }]}><SymbolView name="checkmark" size={34} tintColor={colors.success} /></View>
       <AppText style={styles.statusTitle}>Your agent is ready</AppText>
       <AppText style={[styles.statusDetail, { color: colors.muted }]}>{connection?.name ? `${connection.name} is connected and ready to use in Brio.` : 'Your environment is connected and ready to use in Brio.'}</AppText>
@@ -817,7 +904,7 @@ function SuccessScreen({ connection, onContinue }: { connection: AgentConnection
         <SuccessRow icon="lock.fill" label="Credentials saved on this device" />
       </Card>
       <Button onPress={onContinue} style={styles.continueButton}>Open environment</Button>
-    </View>
+    </ScrollView>
   );
 }
 
@@ -862,6 +949,7 @@ function progressIndex(progress: ProgressStage) {
 
 const styles = StyleSheet.create({
   safe: { flex: 1 },
+  scrollScreen: { flex: 1 },
   content: { alignSelf: 'center', gap: T3Spacing.lg, maxWidth: 620, padding: T3Spacing.xl, paddingBottom: T3Spacing.huge, width: '100%' },
   headerAction: { alignItems: 'center', justifyContent: 'center', minHeight: 40, paddingHorizontal: T3Spacing.sm },
   headerIcon: { alignItems: 'center', height: 40, justifyContent: 'center', width: 40 },
@@ -878,6 +966,8 @@ const styles = StyleSheet.create({
   helpToggleLabel: { fontFamily: T3Typography.medium, fontSize: 13, lineHeight: 18 },
   helpBox: { borderRadius: T3Radius.medium, gap: T3Spacing.md, padding: T3Spacing.md },
   helpText: { fontSize: 12, lineHeight: 17 },
+  downloadLink: { alignItems: 'center', flexDirection: 'row', justifyContent: 'space-between', minHeight: 36 },
+  downloadLabel: { fontFamily: T3Typography.medium, fontSize: 12, lineHeight: 17 },
   agentHelpAction: { alignItems: 'center', flexDirection: 'row', gap: T3Spacing.sm, minHeight: 36 },
   agentHelpLabel: { fontFamily: T3Typography.medium, fontSize: 12, lineHeight: 17 },
   guideActions: { gap: T3Spacing.md },
@@ -894,7 +984,7 @@ const styles = StyleSheet.create({
   issueCopy: { flex: 1, gap: 2 },
   issueTitle: { fontFamily: T3Typography.bold, fontSize: 13, lineHeight: 18 },
   issueDetail: { fontSize: 13, lineHeight: 18 },
-  scannerScreen: { alignSelf: 'center', flex: 1, gap: T3Spacing.lg, maxWidth: 620, padding: T3Spacing.xl, width: '100%' },
+  scannerScreen: { alignSelf: 'center', flexGrow: 1, gap: T3Spacing.lg, maxWidth: 620, padding: T3Spacing.xl, width: '100%' },
   scannerCopy: { gap: T3Spacing.xs },
   scannerTitle: { fontFamily: T3Typography.bold, fontSize: 18, lineHeight: 24, textAlign: 'center' },
   scannerDetail: { fontSize: 13, lineHeight: 18, textAlign: 'center' },
@@ -903,12 +993,12 @@ const styles = StyleSheet.create({
   scanFrame: { alignItems: 'center', bottom: 0, justifyContent: 'center', left: 0, position: 'absolute', right: 0, top: 0 },
   scanTarget: { borderColor: '#ffffff', borderRadius: T3Radius.medium, borderWidth: 3, height: '62%', opacity: 0.92, width: '62%' },
   torchButton: { alignItems: 'center', backgroundColor: 'rgba(0,0,0,0.55)', borderRadius: T3Radius.pill, bottom: T3Spacing.lg, height: 44, justifyContent: 'center', position: 'absolute', right: T3Spacing.lg, width: 44 },
-  centerScreen: { alignItems: 'center', flex: 1, gap: T3Spacing.lg, justifyContent: 'center', padding: T3Spacing.huge },
+  centerScreen: { alignItems: 'center', flexGrow: 1, gap: T3Spacing.lg, justifyContent: 'center', padding: T3Spacing.huge },
   largeIcon: { alignItems: 'center', borderRadius: T3Radius.large, height: 70, justifyContent: 'center', width: 70 },
   statusTitle: { fontFamily: T3Typography.bold, fontSize: 23, letterSpacing: -0.4, lineHeight: 29, textAlign: 'center' },
   statusDetail: { fontSize: 14, lineHeight: 20, maxWidth: 430, textAlign: 'center' },
   fullWidthActions: { alignSelf: 'stretch', gap: T3Spacing.md, maxWidth: 430, width: '100%' },
-  progressScreen: { alignItems: 'center', flex: 1, gap: T3Spacing.xl, justifyContent: 'center', padding: T3Spacing.huge },
+  progressScreen: { alignItems: 'center', flexGrow: 1, gap: T3Spacing.xl, justifyContent: 'center', padding: T3Spacing.huge },
   progressCopy: { alignItems: 'center', gap: T3Spacing.xs },
   progressCard: { alignSelf: 'stretch', gap: T3Spacing.lg, maxWidth: 430, padding: T3Spacing.lg, width: '100%' },
   progressRow: { alignItems: 'center', flexDirection: 'row', gap: T3Spacing.md },

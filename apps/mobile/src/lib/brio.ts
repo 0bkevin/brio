@@ -10,11 +10,15 @@ export type AgentConnection = {
   relayToken?: string;
   agentId?: string;
   pairingCode?: string;
+  agentKind?: string;
+  agentName?: string;
 };
 
 export type HealthResponse = {
   ok: boolean;
   agent_ok?: boolean;
+  agent_kind?: string;
+  agent_name?: string;
   hermes_ok?: boolean;
   hermes_status?: number;
   hermes_home?: string;
@@ -603,17 +607,35 @@ export function normalizeConnectionURL(value: string) {
   const trimmed = value.trim().replace(/\/+$/, '');
   if (/^https?:\/\//i.test(trimmed)) return trimmed;
   const localHostname = /^(localhost|[^/:]+\.local)(?::\d+)?$/i.test(trimmed);
-  return `${isIPLiteral(trimmed) || localHostname ? 'http' : 'https'}://${trimmed}`;
+  return `${isPrivateNetworkLiteral(trimmed) || localHostname ? 'http' : 'https'}://${trimmed}`;
 }
 
-function isIPLiteral(host: string) {
+function isPrivateNetworkLiteral(host: string) {
   try {
     const hostname = new URL(`http://${host}`).hostname.replace(/^\[|\]$/g, '');
-    if (hostname.includes(':')) return true;
+    if (hostname.includes(':')) {
+      const normalized = hostname.toLowerCase();
+      return (
+        normalized === '::1' ||
+        /^f[cd]/.test(normalized) ||
+        /^fe[89ab]/.test(normalized)
+      );
+    }
     const octets = hostname.split('.');
+    if (
+      octets.length !== 4 ||
+      !octets.every((octet) => /^\d{1,3}$/.test(octet) && Number(octet) <= 255)
+    ) {
+      return false;
+    }
+    const [first, second] = octets.map(Number);
     return (
-      octets.length === 4 &&
-      octets.every((octet) => /^\d{1,3}$/.test(octet) && Number(octet) <= 255)
+      first === 10 ||
+      first === 127 ||
+      (first === 169 && second === 254) ||
+      (first === 172 && second >= 16 && second <= 31) ||
+      (first === 192 && second === 168) ||
+      (first === 100 && second >= 64 && second <= 127)
     );
   } catch {
     return false;
@@ -644,46 +666,35 @@ export async function finalizeConnection(
   onProgress?: (progress: ConnectionProgress) => void,
   signal?: AbortSignal,
 ) {
-  let nextConnection = connection;
-
   if (connection.transport === 'relay') {
-    onProgress?.('claiming');
-    const session = await createRelayDevice(connection.url, undefined, undefined, signal);
-    if (!connection.pairingCode) {
-      throw new Error('Relay pairing payload is missing a code');
-    }
-    const claim = await claimRelayPairing(
-      connection.url,
-      session.token,
-      connection.pairingCode,
-      signal,
-    );
-    nextConnection = {
-      ...connection,
-      id: claim.agent.id,
-      name: claim.agent.name,
-      status: claim.agent.status,
-      relayToken: session.token,
-      token: '',
-    };
+    throw new Error('Development Relay pairing must be completed from the Relay screen');
   }
 
   onProgress?.('checking_companion');
-  const health = await withTimeout(getHealth(nextConnection, signal));
+  const health = await withTimeout(getHealth(connection, signal));
   if (!health.ok) {
     throw new Error('Brio Companion did not report a healthy connection');
   }
   onProgress?.('checking_hermes');
+  const agentKind = health.agent_kind?.trim().toLowerCase() || 'hermes';
+  if (agentKind !== 'hermes') {
+    throw new Error(`${health.agent_name ?? agentKind} is not supported by this version of Brio`);
+  }
   if (!(health.agent_ok ?? health.hermes_ok)) {
     throw new Error('Brio Companion is online, but Hermes Agent is not reachable');
   }
   onProgress?.('ready');
-  return { ...nextConnection, status: 'online' as const };
+  return {
+    ...connection,
+    agentKind,
+    agentName: health.agent_name ?? 'Hermes Agent',
+    status: 'online' as const,
+  };
 }
 
 export async function createRelayDevice(
   relayURL: string,
-  email = 'dev@brio.local',
+  email: string,
   deviceName = 'Brio mobile',
   signal?: AbortSignal,
 ) {
