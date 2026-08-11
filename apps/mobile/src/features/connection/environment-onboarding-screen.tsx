@@ -3,8 +3,8 @@ import { SymbolView } from 'expo-symbols';
 import { Pressable, ScrollView, StyleSheet, View } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 
-import { AppText, Button, Card } from '@/components/t3-ui';
-import { T3Radius, T3Spacing, T3Typography } from '@/constants/t3-theme';
+import { AppText, Button } from '@/components/t3-ui';
+import { T3Spacing, T3Typography } from '@/constants/t3-theme';
 import { useT3Theme } from '@/hooks/use-t3-theme';
 
 export function EnvironmentOnboardingScreen() {
@@ -13,71 +13,63 @@ export function EnvironmentOnboardingScreen() {
 
   return (
     <SafeAreaView style={[styles.safe, { backgroundColor: colors.screen }]}>
-      <ScrollView contentContainerStyle={styles.content} showsVerticalScrollIndicator={false}>
-        <View style={styles.brandBlock}>
+      <ScrollView
+        contentContainerStyle={styles.content}
+        showsVerticalScrollIndicator={false}
+      >
+        <View style={styles.brandRow}>
           <View style={[styles.brandMark, { backgroundColor: colors.primary }]}>
-            <AppText style={[styles.brandLetter, { color: colors.primaryForeground }]}>B</AppText>
+            <AppText accessible={false} style={[styles.brandLetter, { color: colors.primaryForeground }]}>B</AppText>
           </View>
           <AppText style={styles.brand}>Brio</AppText>
-          <AppText style={[styles.tagline, { color: colors.muted }]}>
-            Hermes Agent, wherever you are.
-          </AppText>
         </View>
 
-        <Card style={styles.emptyCard}>
-          <View style={[styles.environmentIcon, { backgroundColor: colors.subtle }]}>
-            <SymbolView
-              name="point.3.connected.trianglepath.dotted"
-              size={23}
-              tintColor={colors.secondary}
-            />
+        <View style={styles.main}>
+          <View style={styles.heroCopy}>
+            <AppText style={styles.title}>Connect to Hermes</AppText>
+            <AppText style={[styles.detail, { color: colors.muted }]}>Connect the Hermes Agent running on your computer.</AppText>
           </View>
-          <AppText style={styles.emptyTitle}>Connect your first environment</AppText>
-          <AppText style={[styles.emptyDetail, { color: colors.muted }]}>
-            Scan one QR code to securely access the Hermes Agent running on your computer.
-          </AppText>
-          <Button onPress={() => router.push('/connect')} style={styles.primaryAction}>
-            Connect to Hermes
-          </Button>
-        </Card>
 
-        <View style={styles.instructions}>
-          <AppText style={[styles.sectionLabel, { color: colors.muted }]}>How it works</AppText>
-          <Instruction index="1" text="Run `brio companion pair` on your computer." />
-          <Instruction index="2" text="Scan the QR code shown in the terminal." />
-          <Instruction index="3" text="Brio verifies everything and opens your environment." />
+          <View style={styles.actions}>
+            <Button
+              accessibilityHint="Opens the camera to scan your Hermes connection code"
+              onPress={() => router.push({ pathname: '/connect', params: { mode: 'scan' } })}
+            >
+              Scan QR code
+            </Button>
+            <Button
+              accessibilityHint="Opens a field for an existing connection code"
+              onPress={() => router.push({ pathname: '/connect', params: { mode: 'paste' } })}
+              tone="secondary"
+            >
+              Paste connection code
+            </Button>
+          </View>
+
+          <Pressable
+            accessibilityHint="Shows the computer setup command"
+            accessibilityLabel="First time? Set up Hermes"
+            accessibilityRole="button"
+            onPress={() => router.push('/connect')}
+            style={({ pressed }) => [styles.setupLink, { opacity: pressed ? 0.55 : 1 }]}
+          >
+            <AppText style={[styles.setupLabel, { color: colors.secondary }]}>First time? Set up Hermes</AppText>
+            <AppText accessible={false} style={{ color: colors.tertiary }}>›</AppText>
+          </Pressable>
         </View>
 
         <Pressable
+          accessibilityHint="Connect through an existing Brio Relay"
+          accessibilityLabel="Use Brio Relay"
           accessibilityRole="button"
           onPress={() => router.push('/relay')}
-          style={({ pressed }) => [
-            styles.relayLink,
-            { borderColor: colors.border, opacity: pressed ? 0.6 : 1 },
-          ]}
+          style={({ pressed }) => [styles.relayLink, { opacity: pressed ? 0.55 : 1 }]}
         >
-          <View style={styles.relayCopy}>
-            <AppText style={styles.relayTitle}>Connect with Brio Relay</AppText>
-            <AppText style={[styles.relayDetail, { color: colors.muted }]}>
-              Reach persistent environments away from your local network.
-            </AppText>
-          </View>
-          <AppText style={{ color: colors.tertiary }}>›</AppText>
+          <SymbolView accessible={false} name="network" size={15} tintColor={colors.tertiary} />
+          <AppText style={[styles.relayLabel, { color: colors.tertiary }]}>Use Brio Relay</AppText>
         </Pressable>
       </ScrollView>
     </SafeAreaView>
-  );
-}
-
-function Instruction({ index, text }: { index: string; text: string }) {
-  const colors = useT3Theme();
-  return (
-    <View style={styles.instruction}>
-      <View style={[styles.step, { backgroundColor: colors.subtleStrong }]}>
-        <AppText style={styles.stepText}>{index}</AppText>
-      </View>
-      <AppText style={[styles.instructionText, { color: colors.secondary }]}>{text}</AppText>
-    </View>
   );
 }
 
@@ -85,83 +77,61 @@ const styles = StyleSheet.create({
   safe: { flex: 1 },
   content: {
     alignSelf: 'center',
-    gap: T3Spacing.xxl,
-    maxWidth: 560,
-    padding: T3Spacing.xl,
-    paddingBottom: T3Spacing.huge,
+    flexGrow: 1,
+    maxWidth: 520,
+    paddingBottom: T3Spacing.xl,
+    paddingHorizontal: T3Spacing.xl,
+    paddingTop: T3Spacing.xxl,
     width: '100%',
   },
-  brandBlock: {
+  brandRow: {
     alignItems: 'center',
-    gap: T3Spacing.xs,
-    paddingBottom: T3Spacing.sm,
-    paddingTop: T3Spacing.xxl,
+    flexDirection: 'row',
+    gap: T3Spacing.sm,
+    justifyContent: 'center',
   },
   brandMark: {
     alignItems: 'center',
-    borderRadius: T3Radius.medium,
-    height: 52,
+    borderRadius: 11,
+    height: 36,
     justifyContent: 'center',
-    marginBottom: T3Spacing.sm,
-    width: 52,
+    width: 36,
   },
-  brandLetter: { fontFamily: T3Typography.bold, fontSize: 24, lineHeight: 30 },
-  brand: { fontFamily: T3Typography.bold, fontSize: 30, lineHeight: 36 },
-  tagline: { fontSize: 14, lineHeight: 19 },
-  emptyCard: {
+  brandLetter: { fontFamily: T3Typography.bold, fontSize: 17, lineHeight: 22 },
+  brand: { fontFamily: T3Typography.bold, fontSize: 21, lineHeight: 27 },
+  main: {
     alignItems: 'center',
-    gap: T3Spacing.md,
-    padding: T3Spacing.xxl,
-  },
-  environmentIcon: {
-    alignItems: 'center',
-    borderRadius: T3Radius.medium,
-    height: 52,
+    flex: 1,
     justifyContent: 'center',
-    width: 52,
+    paddingBottom: T3Spacing.huge,
   },
-  emptyTitle: {
+  heroCopy: { alignItems: 'center', gap: T3Spacing.sm },
+  title: {
     fontFamily: T3Typography.bold,
-    fontSize: 18,
-    lineHeight: 23,
+    fontSize: 32,
+    letterSpacing: -0.9,
+    lineHeight: 38,
     textAlign: 'center',
   },
-  emptyDetail: {
-    fontSize: 14,
-    lineHeight: 20,
-    maxWidth: 380,
-    textAlign: 'center',
-  },
-  primaryAction: { marginTop: T3Spacing.xs, width: '100%' },
-  instructions: { gap: T3Spacing.md, paddingHorizontal: T3Spacing.xs },
-  sectionLabel: {
-    fontFamily: T3Typography.bold,
-    fontSize: 11,
-    letterSpacing: 0.8,
-    textTransform: 'uppercase',
-  },
-  instruction: {
+  detail: { fontSize: 15, lineHeight: 21, maxWidth: 320, textAlign: 'center' },
+  actions: { gap: T3Spacing.md, marginTop: T3Spacing.xxl, width: '100%' },
+  setupLink: {
     alignItems: 'center',
     flexDirection: 'row',
-    gap: T3Spacing.md,
-  },
-  step: {
-    alignItems: 'center',
-    borderRadius: T3Radius.pill,
-    height: 28,
+    gap: T3Spacing.sm,
     justifyContent: 'center',
-    width: 28,
+    marginTop: T3Spacing.lg,
+    minHeight: 44,
+    paddingHorizontal: T3Spacing.md,
   },
-  stepText: { fontFamily: T3Typography.bold, fontSize: 12 },
-  instructionText: { flex: 1, fontSize: 14, lineHeight: 19 },
+  setupLabel: { fontFamily: T3Typography.medium, fontSize: 13, lineHeight: 18 },
   relayLink: {
     alignItems: 'center',
-    borderTopWidth: StyleSheet.hairlineWidth,
+    alignSelf: 'center',
     flexDirection: 'row',
-    paddingHorizontal: T3Spacing.xs,
-    paddingTop: T3Spacing.lg,
+    gap: 7,
+    minHeight: 40,
+    paddingHorizontal: T3Spacing.lg,
   },
-  relayCopy: { flex: 1 },
-  relayTitle: { fontFamily: T3Typography.medium, fontSize: 14 },
-  relayDetail: { fontSize: 12, lineHeight: 17 },
+  relayLabel: { fontFamily: T3Typography.medium, fontSize: 12, lineHeight: 17 },
 });

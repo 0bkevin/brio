@@ -6,6 +6,8 @@ import {
   connectionFromPairingPayload,
   decodePairingPayload,
   extractPairingPayload,
+  finalizeConnection,
+  getHealth,
   normalizeConnectionURL,
 } from './brio.ts';
 import {
@@ -14,6 +16,11 @@ import {
   upsertStoredConnection,
   validStoredConnections,
 } from '../state/connection-store-model.ts';
+import {
+  explainConnectionError,
+  friendlyPayloadError,
+  validateManualConnection,
+} from '../features/connection/connection-experience.ts';
 
 const directPayload = {
   url: 'http://192.168.1.25:8787',
@@ -157,4 +164,63 @@ test('Relay sign-out removes matching Relay environments but preserves direct on
   );
   assert.deepEqual(stored.connections, [direct]);
   assert.equal(stored.activeConnectionId, direct.id);
+});
+
+test('manual onboarding validates both local and remote computer addresses', () => {
+  assert.equal(validateManualConnection('192.168.1.25:8787', 'secret'), null);
+  assert.equal(validateManualConnection('https://brio.example.com', 'secret'), null);
+  assert.match(validateManualConnection('not a host', 'secret')?.title ?? '', /address/i);
+  assert.match(validateManualConnection('', '')?.title ?? '', /information/i);
+});
+
+test('onboarding errors give specific, recoverable connection guidance', () => {
+  const offlineAgent = explainConnectionError(
+    new Error('Brio Companion is online, but Hermes Agent is not reachable'),
+  );
+  assert.match(offlineAgent.title, /Hermes is offline/);
+  assert.ok(offlineAgent.checklist?.some((item) => item.includes('restart Hermes')));
+
+  const unreachable = explainConnectionError(new Error('Network request timed out'));
+  assert.match(unreachable.title, /reach your computer/);
+  assert.ok(unreachable.checklist?.some((item) => item.includes('Wi-Fi')));
+});
+
+test('onboarding translates pairing parser errors without exposing implementation detail', () => {
+  assert.match(friendlyPayloadError('Pairing payload is empty'), /full code/);
+  assert.match(friendlyPayloadError('Malformed JSON'), /QR code or full connection code/);
+});
+
+test('connection verification accepts provider-neutral agent health', async () => {
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async () =>
+    new Response(JSON.stringify({ ok: true, agent_ok: true, hermes_ok: false }), {
+      headers: { 'Content-Type': 'application/json' },
+      status: 200,
+    });
+  try {
+    const connection = connectionFromPairingPayload(directPayload);
+    const connected = await finalizeConnection(connection);
+    assert.equal(connected.status, 'online');
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test('connection verification can be cancelled without waiting for timeout', async () => {
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (_input, init) =>
+    new Promise((_resolve, reject) => {
+      const signal = init?.signal;
+      const abort = () => reject(new Error('aborted by signal'));
+      if (signal?.aborted) abort();
+      else signal?.addEventListener('abort', abort, { once: true });
+    });
+  try {
+    const controller = new AbortController();
+    const health = getHealth(connectionFromPairingPayload(directPayload), controller.signal);
+    controller.abort();
+    await assert.rejects(health, /Connection cancelled/);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
 });

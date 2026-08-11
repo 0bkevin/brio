@@ -1,17 +1,15 @@
-import { useMutation } from '@tanstack/react-query';
 import * as Device from 'expo-device';
-import { useRouter } from 'expo-router';
-import { useState } from 'react';
-import { KeyboardAvoidingView, Platform, ScrollView, StyleSheet, View } from 'react-native';
+import { Stack, useRouter } from 'expo-router';
+import { SymbolView } from 'expo-symbols';
+import { useEffect, useRef, useState } from 'react';
+import { KeyboardAvoidingView, Platform, Pressable, ScrollView, StyleSheet, View } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 
 import { AppText, AppTextInput, Button, Card } from '@/components/t3-ui';
-import { T3Spacing, T3Typography } from '@/constants/t3-theme';
+import { T3Radius, T3Spacing, T3Typography } from '@/constants/t3-theme';
 import { useT3Theme } from '@/hooks/use-t3-theme';
 import { createRelayDevice } from '@/lib/brio';
 import { useRelaySessionStore } from '@/state/relay-session-store';
-
-type RelayDetails = { relayURL: string; email: string; deviceName: string };
 
 export function RelaySignInScreen() {
   const colors = useT3Theme();
@@ -21,25 +19,13 @@ export function RelaySignInScreen() {
   const [email, setEmail] = useState('');
   const [deviceName, setDeviceName] = useState(Device.deviceName ?? 'My phone');
   const [error, setError] = useState('');
+  const [connecting, setConnecting] = useState(false);
+  const abortController = useRef<AbortController | null>(null);
 
-  const signIn = useMutation({
-    mutationFn: (details: RelayDetails) =>
-      createRelayDevice(details.relayURL, details.email, details.deviceName),
-    onSuccess: async (session, details) => {
-      await saveSession({
-        relayURL: details.relayURL,
-        email: session.user.email,
-        deviceName: session.device.name,
-        token: session.token,
-        userID: session.user.id,
-        deviceID: session.device.id,
-      });
-      router.dismissTo('/');
-    },
-    onError: (reason) => setError(explainRelayError(reason)),
-  });
+  useEffect(() => () => abortController.current?.abort(), []);
 
-  const connect = () => {
+  const connect = async () => {
+    if (connecting) return;
     const validation = validateRelayDetails(relayURL, email, deviceName);
     if (validation) {
       setError(validation);
@@ -50,9 +36,39 @@ export function RelaySignInScreen() {
       email: email.trim(),
       deviceName: deviceName.trim(),
     };
+    const controller = new AbortController();
+    abortController.current = controller;
     setRelayURL(details.relayURL);
     setError('');
-    signIn.mutate(details);
+    setConnecting(true);
+    try {
+      const session = await createRelayDevice(
+        details.relayURL,
+        details.email,
+        details.deviceName,
+        controller.signal,
+      );
+      if (controller.signal.aborted) return;
+      await saveSession({
+        relayURL: details.relayURL,
+        email: session.user.email,
+        deviceName: session.device.name,
+        token: session.token,
+        userID: session.user.id,
+        deviceID: session.device.id,
+      });
+      router.dismissTo('/');
+    } catch (reason) {
+      if (!controller.signal.aborted) setError(explainRelayError(reason));
+    } finally {
+      if (!controller.signal.aborted) setConnecting(false);
+      abortController.current = null;
+    }
+  };
+
+  const close = () => {
+    abortController.current?.abort();
+    router.back();
   };
 
   return (
@@ -60,6 +76,23 @@ export function RelaySignInScreen() {
       edges={['bottom', 'left', 'right']}
       style={[styles.safe, { backgroundColor: colors.sheet }]}
     >
+      <Stack.Screen
+        options={{
+          gestureEnabled: !connecting,
+          headerBackVisible: false,
+          headerLeft: () => (
+            <Pressable
+              accessibilityLabel={connecting ? 'Cancel Relay connection' : 'Close Relay setup'}
+              accessibilityRole="button"
+              onPress={close}
+              style={({ pressed }) => [styles.headerIcon, { opacity: pressed ? 0.5 : 1 }]}
+            >
+              <SymbolView name="xmark" size={17} tintColor={colors.foreground} />
+            </Pressable>
+          ),
+          title: 'Connect Relay',
+        }}
+      />
       <KeyboardAvoidingView
         behavior={Platform.OS === 'ios' ? 'padding' : undefined}
         keyboardVerticalOffset={88}
@@ -71,20 +104,21 @@ export function RelaySignInScreen() {
           showsVerticalScrollIndicator={false}
         >
           <View style={styles.intro}>
-            <AppText style={styles.title}>Connect from anywhere</AppText>
-            <AppText style={[styles.detail, { color: colors.muted }]}>
-              Brio Relay keeps your environments available when your phone is away from their local
-              network.
-            </AppText>
+            <View style={[styles.heroIcon, { backgroundColor: colors.subtleStrong }]}>
+              <SymbolView name="network" size={25} tintColor={colors.foreground} />
+            </View>
+            <AppText style={styles.title}>Use an existing Brio Relay</AppText>
+            <AppText style={[styles.detail, { color: colors.muted }]}>Connect to environments available through a Relay you or your organization already operates.</AppText>
           </View>
 
           <Card style={styles.formCard}>
-            <FieldLabel>Relay URL</FieldLabel>
+            <FieldLabel>Relay address</FieldLabel>
             <AppTextInput
+              accessibilityHint="The address supplied by your Relay administrator"
               accessibilityLabel="Relay address"
               autoCapitalize="none"
               autoCorrect={false}
-              editable={!signIn.isPending}
+              editable={!connecting}
               inputMode="url"
               onChangeText={(value) => {
                 setRelayURL(value);
@@ -94,12 +128,12 @@ export function RelaySignInScreen() {
               value={relayURL}
             />
 
-            <FieldLabel>Email</FieldLabel>
+            <FieldLabel>Account email</FieldLabel>
             <AppTextInput
-              accessibilityLabel="Email"
+              accessibilityLabel="Relay account email"
               autoCapitalize="none"
               autoCorrect={false}
-              editable={!signIn.isPending}
+              editable={!connecting}
               inputMode="email"
               onChangeText={(value) => {
                 setEmail(value);
@@ -109,41 +143,45 @@ export function RelaySignInScreen() {
               value={email}
             />
 
-            <FieldLabel>Device name</FieldLabel>
+            <FieldLabel>This phone</FieldLabel>
             <AppTextInput
+              accessibilityHint="A recognizable name shown in the Relay"
               accessibilityLabel="Device name"
               autoCapitalize="words"
               autoCorrect={false}
-              editable={!signIn.isPending}
+              editable={!connecting}
               onChangeText={(value) => {
                 setDeviceName(value);
                 setError('');
               }}
-              onSubmitEditing={connect}
+              onSubmitEditing={() => void connect()}
               placeholder="My phone"
               returnKeyType="go"
               value={deviceName}
             />
 
             {error ? (
-              <View style={[styles.error, { backgroundColor: colors.dangerSurface }]}>
-                <AppText style={[styles.errorText, { color: colors.danger }]}>{error}</AppText>
+              <View accessibilityRole="alert" style={[styles.error, { backgroundColor: colors.dangerSurface }]}>
+                <AppText style={[styles.errorTitle, { color: colors.danger }]}>Could not connect to Relay</AppText>
+                <AppText style={[styles.errorText, { color: colors.secondary }]}>{error}</AppText>
               </View>
             ) : null}
 
             <Button
               disabled={!relayURL.trim() || !email.trim() || !deviceName.trim()}
-              loading={signIn.isPending}
-              onPress={connect}
+              loading={connecting}
+              onPress={() => void connect()}
             >
-              {signIn.isPending ? 'Connecting…' : 'Connect relay'}
+              {connecting ? 'Connecting…' : 'Continue to environments'}
             </Button>
           </Card>
 
-          <AppText style={[styles.note, { color: colors.muted }]}>
-            Use the Relay address provided by your administrator. Your device stays signed in
-            securely.
-          </AppText>
+          <View style={[styles.privacyNote, { backgroundColor: colors.subtle }]}>
+            <SymbolView name="info.circle" size={17} tintColor={colors.tertiary} />
+            <AppText style={[styles.note, { color: colors.muted }]}>Relay access rules depend on your deployment. Brio sends this address, email, and device name to the Relay you enter.</AppText>
+          </View>
+
+          <Button onPress={() => router.replace('/connect')} tone="plain">Connect directly instead</Button>
         </ScrollView>
       </KeyboardAvoidingView>
     </SafeAreaView>
@@ -184,47 +222,24 @@ function explainRelayError(reason: unknown) {
     normalized.includes('timed out') ||
     normalized.includes('abort')
   ) {
-    return 'Brio could not reach that Relay. Check the address and your internet connection, then try again.';
+    return 'Check the Relay address and your internet connection, then try again.';
   }
-  return message || 'Brio could not connect to that Relay. Check the details and try again.';
+  return message || 'Check the Relay details and try again.';
 }
 
 const styles = StyleSheet.create({
   safe: { flex: 1 },
-  content: {
-    alignSelf: 'center',
-    gap: T3Spacing.lg,
-    maxWidth: 620,
-    padding: T3Spacing.xl,
-    width: '100%',
-  },
+  headerIcon: { alignItems: 'center', height: 40, justifyContent: 'center', width: 40 },
+  content: { alignSelf: 'center', gap: T3Spacing.lg, maxWidth: 620, padding: T3Spacing.xl, paddingBottom: T3Spacing.huge, width: '100%' },
+  intro: { alignItems: 'center', gap: T3Spacing.sm, marginBottom: T3Spacing.sm, paddingHorizontal: T3Spacing.md },
+  heroIcon: { alignItems: 'center', borderRadius: T3Radius.medium, height: 52, justifyContent: 'center', marginBottom: T3Spacing.xs, width: 52 },
+  title: { fontFamily: T3Typography.bold, fontSize: 23, letterSpacing: -0.4, lineHeight: 29, textAlign: 'center' },
+  detail: { fontSize: 14, lineHeight: 20, maxWidth: 430, textAlign: 'center' },
   formCard: { gap: T3Spacing.md, padding: T3Spacing.lg },
-  intro: {
-    alignItems: 'center',
-    gap: T3Spacing.xs,
-    marginBottom: T3Spacing.sm,
-    paddingHorizontal: T3Spacing.md,
-  },
-  title: {
-    fontFamily: T3Typography.bold,
-    fontSize: 21,
-    lineHeight: 27,
-    textAlign: 'center',
-  },
-  detail: { fontSize: 14, lineHeight: 20, textAlign: 'center' },
-  fieldLabel: {
-    fontFamily: T3Typography.bold,
-    fontSize: 11,
-    letterSpacing: 0.8,
-    marginBottom: -4,
-    textTransform: 'uppercase',
-  },
-  error: { borderRadius: 10, padding: T3Spacing.md },
+  fieldLabel: { fontFamily: T3Typography.bold, fontSize: 11, letterSpacing: 0.8, marginBottom: -4, textTransform: 'uppercase' },
+  error: { borderRadius: T3Radius.small, gap: 2, padding: T3Spacing.md },
+  errorTitle: { fontFamily: T3Typography.bold, fontSize: 13, lineHeight: 18 },
   errorText: { fontSize: 13, lineHeight: 18 },
-  note: {
-    fontSize: 12,
-    lineHeight: 17,
-    paddingHorizontal: T3Spacing.xs,
-    textAlign: 'center',
-  },
+  privacyNote: { alignItems: 'flex-start', borderRadius: T3Radius.medium, flexDirection: 'row', gap: T3Spacing.sm, padding: T3Spacing.md },
+  note: { flex: 1, fontSize: 12, lineHeight: 17 },
 });

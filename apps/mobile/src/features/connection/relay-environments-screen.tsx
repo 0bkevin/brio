@@ -63,8 +63,8 @@ export function RelayEnvironmentsScreen({ session }: { session: RelaySession }) 
     };
     try {
       const health = await getHealth(connection);
-      if (!health.ok || !health.hermes_ok) {
-        throw new Error('Companion is online, but Hermes Agent is not ready yet.');
+      if (!health.ok || !(health.agent_ok ?? health.hermes_ok)) {
+        throw new Error('The Brio bridge is online, but the connected agent is not ready yet.');
       }
       await saveConnection({ ...connection, status: 'online' });
     } catch (reason) {

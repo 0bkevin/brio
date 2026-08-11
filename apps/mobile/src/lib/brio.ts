@@ -14,6 +14,7 @@ export type AgentConnection = {
 
 export type HealthResponse = {
   ok: boolean;
+  agent_ok?: boolean;
   hermes_ok?: boolean;
   hermes_status?: number;
   hermes_home?: string;
@@ -161,16 +162,24 @@ async function fetchWithTimeout(
   timeoutMilliseconds = 15_000,
 ) {
   const controller = new AbortController();
+  const callerSignal = init.signal;
+  const abortFromCaller = () => controller.abort();
+  if (callerSignal?.aborted) controller.abort();
+  callerSignal?.addEventListener('abort', abortFromCaller, { once: true });
   const timeout = setTimeout(() => controller.abort(), timeoutMilliseconds);
   try {
     return await fetch(input, { ...init, signal: controller.signal });
   } catch (reason) {
+    if (callerSignal?.aborted) {
+      throw new Error('Connection cancelled');
+    }
     if (controller.signal.aborted) {
       throw new Error('Connection timed out');
     }
     throw reason;
   } finally {
     clearTimeout(timeout);
+    callerSignal?.removeEventListener('abort', abortFromCaller);
   }
 }
 
@@ -194,7 +203,7 @@ export async function brioFetch<T>(
   if (connection.transport === 'relay') {
     return relayFetch<T>(connection, path, init);
   }
-  const response = await fetch(`${normalizeBaseURL(connection.url)}${path}`, {
+  const response = await fetchWithTimeout(`${normalizeBaseURL(connection.url)}${path}`, {
     ...init,
     headers: {
       Accept: 'application/json',
@@ -212,8 +221,11 @@ export async function brioFetch<T>(
   return body as T;
 }
 
-export function getHealth(connection: Pick<AgentConnection, 'url' | 'token'> & Partial<AgentConnection>) {
-  return brioFetch<HealthResponse>(connection, '/health');
+export function getHealth(
+  connection: Pick<AgentConnection, 'url' | 'token'> & Partial<AgentConnection>,
+  signal?: AbortSignal,
+) {
+  return brioFetch<HealthResponse>(connection, '/health', { signal });
 }
 
 export function getCapabilities(
@@ -630,16 +642,22 @@ export type ConnectionProgress = 'claiming' | 'checking_companion' | 'checking_h
 export async function finalizeConnection(
   connection: AgentConnection,
   onProgress?: (progress: ConnectionProgress) => void,
+  signal?: AbortSignal,
 ) {
   let nextConnection = connection;
 
   if (connection.transport === 'relay') {
     onProgress?.('claiming');
-    const session = await createRelayDevice(connection.url);
+    const session = await createRelayDevice(connection.url, undefined, undefined, signal);
     if (!connection.pairingCode) {
       throw new Error('Relay pairing payload is missing a code');
     }
-    const claim = await claimRelayPairing(connection.url, session.token, connection.pairingCode);
+    const claim = await claimRelayPairing(
+      connection.url,
+      session.token,
+      connection.pairingCode,
+      signal,
+    );
     nextConnection = {
       ...connection,
       id: claim.agent.id,
@@ -651,12 +669,12 @@ export async function finalizeConnection(
   }
 
   onProgress?.('checking_companion');
-  const health = await withTimeout(getHealth(nextConnection));
+  const health = await withTimeout(getHealth(nextConnection, signal));
   if (!health.ok) {
     throw new Error('Brio Companion did not report a healthy connection');
   }
   onProgress?.('checking_hermes');
-  if (!health.hermes_ok) {
+  if (!(health.agent_ok ?? health.hermes_ok)) {
     throw new Error('Brio Companion is online, but Hermes Agent is not reachable');
   }
   onProgress?.('ready');
@@ -667,6 +685,7 @@ export async function createRelayDevice(
   relayURL: string,
   email = 'dev@brio.local',
   deviceName = 'Brio mobile',
+  signal?: AbortSignal,
 ) {
   const response = await fetchWithTimeout(`${normalizeBaseURL(relayURL)}/auth/devices`, {
     method: 'POST',
@@ -675,6 +694,7 @@ export async function createRelayDevice(
       'Content-Type': 'application/json',
     },
     body: JSON.stringify({ email, device_name: deviceName }),
+    signal,
   });
   const body = await response.json();
   if (!response.ok) {
@@ -687,6 +707,7 @@ export async function claimRelayPairing(
   relayURL: string,
   relayToken: string,
   pairingCode: string,
+  signal?: AbortSignal,
 ) {
   const response = await fetchWithTimeout(
     `${normalizeBaseURL(relayURL)}/pairings/${encodeURIComponent(pairingCode)}/claim`,
@@ -696,6 +717,7 @@ export async function claimRelayPairing(
         Accept: 'application/json',
         Authorization: `Bearer ${relayToken}`,
       },
+      signal,
     },
   );
   const body = await response.json();
@@ -807,27 +829,40 @@ function relayFetch<T>(
 
   return new Promise<T>((resolve, reject) => {
     const socket = new WebSocket(wsURL);
-    const timeout = setTimeout(() => {
+    let settled = false;
+    const finish = (callback: () => void) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timeout);
+      init.signal?.removeEventListener('abort', abortRequest);
       socket.close();
-      reject(new Error('Relay request timed out'));
+      callback();
+    };
+    const abortRequest = () => finish(() => reject(new Error('Connection cancelled')));
+    const timeout = setTimeout(() => {
+      finish(() => reject(new Error('Relay request timed out')));
     }, 30000);
 
+    if (init.signal?.aborted) {
+      abortRequest();
+      return;
+    }
+    init.signal?.addEventListener('abort', abortRequest, { once: true });
+
     socket.onopen = () => {
+      if (settled) return;
       socket.send(JSON.stringify(requestFrame));
     };
     socket.onerror = () => {
-      clearTimeout(timeout);
-      reject(new Error('Relay connection failed'));
+      finish(() => reject(new Error('Relay connection failed')));
     };
     socket.onmessage = (event) => {
       const frame = JSON.parse(String(event.data)) as RelayFrame;
       if (frame.id !== frameId) {
         return;
       }
-      clearTimeout(timeout);
-      socket.close();
       if (frame.type === 'error') {
-        reject(new Error(frame.message ?? frame.code ?? 'Relay request failed'));
+        finish(() => reject(new Error(frame.message ?? frame.code ?? 'Relay request failed')));
         return;
       }
       if ((frame.status ?? 500) >= 400) {
@@ -835,10 +870,10 @@ function relayFetch<T>(
           typeof frame.body === 'object' && frame.body && 'error' in frame.body
             ? String((frame.body as { error?: unknown }).error)
             : `Request failed: ${frame.status}`;
-        reject(new Error(message));
+        finish(() => reject(new Error(message)));
         return;
       }
-      resolve(frame.body as T);
+      finish(() => resolve(frame.body as T));
     };
   });
 }
