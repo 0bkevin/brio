@@ -87,6 +87,11 @@ export function HermesHomeScreen({ connection }: { connection: AgentConnection }
           </Pressable>
           <View style={styles.headerActions}>
             <HeaderButton
+              accessibilityLabel="Open Command Center"
+              icon="square.grid.2x2"
+              onPress={() => router.push('/command-center')}
+            />
+            <HeaderButton
               accessibilityLabel="Browse files"
               icon="folder"
               onPress={() => router.push('/files')}
@@ -171,7 +176,7 @@ function HeaderButton({
   onPress,
 }: {
   accessibilityLabel: string;
-  icon: 'folder' | 'gearshape';
+  icon: 'folder' | 'gearshape' | 'square.grid.2x2';
   onPress: () => void;
 }) {
   const colors = useT3Theme();

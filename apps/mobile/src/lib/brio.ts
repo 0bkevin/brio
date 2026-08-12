@@ -22,6 +22,7 @@ export type HealthResponse = {
   hermes_ok?: boolean;
   hermes_status?: number;
   hermes_home?: string;
+  hermes_control_configured?: boolean;
   service?: string;
   hermes?: unknown;
   allowed_roots?: string[];
@@ -110,6 +111,98 @@ export type HermesJob = Record<string, unknown> & {
   enabled?: boolean;
   paused?: boolean;
   schedule?: string;
+};
+
+export type HermesControlSession = {
+  id: string;
+  title?: string;
+  preview?: string;
+  started_at?: number;
+  message_count?: number;
+  source?: string;
+};
+
+export type HermesGoalStatus = {
+  status: 'active' | 'paused' | 'waiting' | 'done';
+  objective: string;
+  turnsUsed?: number;
+  maxTurns?: number;
+  subgoalCount: number;
+  subgoals: string[];
+  gateCount: number;
+  hasContract: boolean;
+  detail: string;
+};
+
+export type HermesHeartbeatStatus = {
+  status: 'active' | 'paused';
+  prompt: string;
+  interval: string;
+  nextInSeconds?: number;
+  fireCount: number;
+  detail: string;
+};
+
+export type HermesSubagent = Record<string, unknown> & {
+  subagent_id: string;
+  owner_session_id?: string;
+  parent_id?: string | null;
+  child_session_id?: string;
+  depth?: number;
+  goal?: string;
+  model?: string;
+  status?: string;
+  started_at?: number;
+  tool_count?: number;
+  input_tokens?: number;
+  output_tokens?: number;
+  cost_usd?: number;
+  files_read?: string[];
+  files_written?: string[];
+  summary?: string;
+};
+
+export type HermesBackgroundProcess = Record<string, unknown> & {
+  session_id?: string;
+  process_id?: string;
+  pid?: number;
+  command?: string;
+  status?: string;
+  running?: boolean;
+  exit_code?: number | null;
+  output_tail?: string;
+};
+
+export type HermesBackgroundTask = {
+  task_id: string;
+  session_id: string;
+  prompt: string;
+  status: 'running' | 'completed' | 'failed';
+  started_at: number;
+  finished_at?: number;
+  output?: string;
+};
+
+export type HermesControlEvent = {
+  sequence: number;
+  type: string;
+  session_id?: string;
+  payload?: Record<string, unknown>;
+};
+
+export type HermesCommandCenterSnapshot = {
+  runtimeSessionId: string;
+  goal: HermesGoalStatus | null;
+  heartbeat: HermesHeartbeatStatus | null;
+  agents: HermesSubagent[];
+  spawningPaused: boolean;
+  maxSpawnDepth?: number;
+  maxConcurrentChildren?: number;
+  processes: HermesBackgroundProcess[];
+  backgroundTasks: HermesBackgroundTask[];
+  sessionInfo?: Record<string, unknown>;
+  events: HermesControlEvent[];
+  latestEvent: number;
 };
 
 export type RelayDeviceSession = {
@@ -428,6 +521,191 @@ export function deleteJob(connection: AgentConnection, jobId: string) {
     connection,
     `/jobs/${encodeURIComponent(jobId)}`,
     { method: 'DELETE' },
+  );
+}
+
+export function controlRPC<T>(
+  connection: AgentConnection,
+  method: string,
+  params: Record<string, unknown> = {},
+  confirm = false,
+) {
+  return brioFetch<T>(connection, '/control/rpc', {
+    method: 'POST',
+    body: JSON.stringify({ method, params, ...(confirm ? { confirm: true } : {}) }),
+  });
+}
+
+export function listControlSessions(connection: AgentConnection, limit = 100) {
+  return controlRPC<{ sessions: HermesControlSession[] }>(connection, 'session.list', { limit });
+}
+
+export function executeControlCommand(
+  connection: AgentConnection,
+  sessionId: string,
+  command: string,
+) {
+  return brioFetch<{
+    result: { output?: string; notice?: string; type?: string };
+    kickoff?: Record<string, unknown>;
+  }>(connection, '/control/command', {
+    method: 'POST',
+    body: JSON.stringify({ session_id: sessionId, command }),
+  });
+}
+
+export function startBackgroundTask(
+  connection: AgentConnection,
+  sessionId: string,
+  text: string,
+) {
+  return brioFetch<{ task_id: string }>(connection, '/control/background', {
+    method: 'POST',
+    body: JSON.stringify({ session_id: sessionId, text }),
+  });
+}
+
+export function listControlEvents(connection: AgentConnection, after = 0) {
+  return brioFetch<{
+    events: HermesControlEvent[];
+    latest: number;
+    background_tasks?: HermesBackgroundTask[];
+  }>(
+    connection,
+    `/control/events?after=${Math.max(0, Math.floor(after))}`,
+  );
+}
+
+export async function getCommandCenterSnapshot(
+  connection: AgentConnection,
+  sessionId: string,
+): Promise<HermesCommandCenterSnapshot> {
+  const resumed = await controlRPC<{ session_id?: string }>(connection, 'session.resume', {
+    session_id: sessionId,
+    omit_messages: true,
+  });
+  const runtimeSessionId = resumed.session_id?.trim() || sessionId;
+  // Hermes owns one slash worker per live session. Keep its commands ordered;
+  // typed read-only RPCs can still fan out after the worker is hydrated.
+  const goalResult = await controlRPC<{ output?: string }>(connection, 'slash.exec', {
+    session_id: runtimeSessionId,
+    command: 'goal status',
+  });
+  const subgoalResult = await controlRPC<{ output?: string }>(connection, 'slash.exec', {
+    session_id: runtimeSessionId,
+    command: 'subgoal',
+  });
+  const heartbeatResult = await controlRPC<{ output?: string }>(connection, 'slash.exec', {
+    session_id: runtimeSessionId,
+    command: 'heartbeat status',
+  });
+  const [delegation, processes, sessionStatus, eventResult] = await Promise.all([
+      controlRPC<{
+        active?: HermesSubagent[];
+        paused?: boolean;
+        max_spawn_depth?: number;
+        max_concurrent_children?: number;
+      }>(connection, 'delegation.status'),
+      controlRPC<{ processes?: HermesBackgroundProcess[] }>(connection, 'process.list', {
+        session_id: runtimeSessionId,
+      }),
+      controlRPC<{ output?: string }>(connection, 'session.status', {
+        session_id: runtimeSessionId,
+      }),
+      listControlEvents(connection),
+  ]);
+
+  return {
+    runtimeSessionId,
+    goal: withSubgoals(parseGoalStatus(goalResult.output ?? ''), subgoalResult.output ?? ''),
+    heartbeat: parseHeartbeatStatus(heartbeatResult.output ?? ''),
+    agents: delegation.active ?? [],
+    spawningPaused: Boolean(delegation.paused),
+    maxSpawnDepth: delegation.max_spawn_depth,
+    maxConcurrentChildren: delegation.max_concurrent_children,
+    processes: processes.processes ?? [],
+    backgroundTasks: eventResult.background_tasks ?? [],
+    sessionInfo: sessionStatus,
+    events: eventResult.events,
+    latestEvent: eventResult.latest,
+  };
+}
+
+export function parseGoalStatus(value: string): HermesGoalStatus | null {
+  const detail = value.replace(/\r/g, '').trim().split('\n')[0]?.trim() ?? '';
+  if (!detail || /^No (?:active )?goal\b/i.test(detail)) return null;
+  let status: HermesGoalStatus['status'] | null = null;
+  if (/^⊙ Goal\b/.test(detail)) status = 'active';
+  else if (/^⏸ Goal\b/.test(detail)) status = 'paused';
+  else if (/^⏳ Goal\b/.test(detail)) status = 'waiting';
+  else if (/^✓ Goal done\b/.test(detail)) status = 'done';
+  if (!status) return null;
+
+  const marker = detail.lastIndexOf('): ');
+  const objective = marker >= 0 ? detail.slice(marker + 3).trim() : detail.replace(/^\S+\s+Goal(?:\s+\w+)?\s*:?\s*/i, '').trim();
+  const turns = detail.match(/(\d+)\s*\/\s*(\d+)\s+turns?/i);
+  const subgoals = detail.match(/(\d+)\s+subgoals?/i);
+  const gates = detail.match(/(\d+)\s+gates?/i);
+  return {
+    status,
+    objective,
+    turnsUsed: turns ? Number(turns[1]) : undefined,
+    maxTurns: turns ? Number(turns[2]) : undefined,
+    subgoalCount: subgoals ? Number(subgoals[1]) : 0,
+    subgoals: [],
+    gateCount: gates ? Number(gates[1]) : 0,
+    hasContract: /(?:^|[,\s])contract(?:[,\s]|$)/i.test(detail),
+    detail,
+  };
+}
+
+function withSubgoals(goal: HermesGoalStatus | null, output: string) {
+  if (!goal) return null;
+  const subgoals = output
+    .replace(/\r/g, '')
+    .split('\n')
+    .map((line) => line.trim().match(/^-\s*\d+\.\s+(.+)$/)?.[1]?.trim() ?? '')
+    .filter(Boolean);
+  return { ...goal, subgoalCount: Math.max(goal.subgoalCount, subgoals.length), subgoals };
+}
+
+export function parseHeartbeatStatus(value: string): HermesHeartbeatStatus | null {
+  const detail = value.replace(/\r/g, '').trim().split('\n')[0]?.trim() ?? '';
+  if (!detail || /^No heartbeat\b/i.test(detail)) return null;
+  const active = detail.match(/^♥ Heartbeat \(every ([^,\)]+)(?:, next in ~?(\d+)s)?(?:, fired (\d+)[×x])?\): (.+)$/i);
+  const paused = detail.match(/^⏸ Heartbeat \(paused, every ([^,\)]+)(?:, fired (\d+)[×x])?\): (.+)$/i);
+  if (active) {
+    return {
+      status: 'active',
+      interval: active[1],
+      nextInSeconds: active[2] ? Number(active[2]) : undefined,
+      fireCount: active[3] ? Number(active[3]) : 0,
+      prompt: active[4],
+      detail,
+    };
+  }
+  if (paused) {
+    return {
+      status: 'paused',
+      interval: paused[1],
+      fireCount: paused[2] ? Number(paused[2]) : 0,
+      prompt: paused[3],
+      detail,
+    };
+  }
+  return null;
+}
+
+export function aggregateRootAgentUsage(agents: readonly HermesSubagent[]) {
+  const ids = new Set(agents.map((agent) => agent.subagent_id));
+  const roots = agents.filter((agent) => !agent.parent_id || !ids.has(agent.parent_id));
+  return roots.reduce(
+    (total, agent) => ({
+      inputTokens: total.inputTokens + (agent.input_tokens ?? 0),
+      outputTokens: total.outputTokens + (agent.output_tokens ?? 0),
+      costUsd: total.costUsd + (agent.cost_usd ?? 0),
+    }),
+    { inputTokens: 0, outputTokens: 0, costUsd: 0 },
   );
 }
 

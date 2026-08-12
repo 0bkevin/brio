@@ -21,6 +21,7 @@ The preferred UX is:
 - Go `1.26.1`.
 - Node.js and npm.
 - Hermes Agent running at `http://127.0.0.1:8642` for a fully healthy companion connection.
+- `hermes serve` running on loopback for Command Center controls. Brio uses its official JSON-RPC/WebSocket surface and requires the same session token.
 
 Postgres is optional. The relay uses in-memory development storage when `BRIO_DATABASE_URL` is unset.
 
@@ -36,6 +37,21 @@ Start the companion:
 ```bash
 make dev-companion
 ```
+
+For goals, heartbeats, background tasks, and agent controls, start the Hermes
+control plane with a shared local token before Companion:
+
+```bash
+HERMES_DASHBOARD_SESSION_TOKEN=replace-with-a-random-local-token \
+  hermes serve --host 127.0.0.1 --port 9119
+
+HERMES_CONTROL_TOKEN=replace-with-a-random-local-token \
+  make dev-companion
+```
+
+The Hermes control server stays loopback-only. The phone authenticates to Brio
+Companion; Companion keeps one persistent gateway connection so background
+completion events and exact agent ownership survive mobile app reconnects.
 
 Start the mobile app in another terminal:
 
@@ -148,6 +164,8 @@ Common values:
 - `BRIO_ADDR` - companion bind address, default `0.0.0.0:8787` so phones on the local network can connect.
 - `BRIO_PUBLIC_URL` - optional explicit address advertised in pairing payloads; by default Brio discovers the active LAN address.
 - `HERMES_API_BASE` - Hermes API base URL, default `http://127.0.0.1:8642`.
+- `HERMES_CONTROL_BASE` - `hermes serve` base URL, default `http://127.0.0.1:9119`.
+- `HERMES_CONTROL_TOKEN` - session token shared with `hermes serve` through `HERMES_DASHBOARD_SESSION_TOKEN`.
 - `BRIO_RELAY_ADDR` - relay bind address, default `127.0.0.1:8082`.
 - `BRIO_RELAY_URL` - relay URL used by the companion, default `http://127.0.0.1:8082`.
 - `BRIO_RELAY_TOKEN` - existing relay companion token used to recover relay mode if local pairing state is lost.

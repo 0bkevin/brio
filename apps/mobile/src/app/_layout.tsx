@@ -85,6 +85,7 @@ export default function RootLayout() {
             <Stack.Screen name="environments" options={{ presentation: 'modal', title: 'Environments' }} />
             <Stack.Screen name="thread/[id]" options={{ title: 'Hermes' }} />
             <Stack.Screen name="files" options={{ title: 'Files' }} />
+            <Stack.Screen name="command-center" options={{ title: 'Command Center' }} />
             <Stack.Screen name="settings" options={{ presentation: 'modal', title: 'Settings' }} />
             <Stack.Screen name="explore" options={{ title: 'Diagnostics' }} />
           </Stack>

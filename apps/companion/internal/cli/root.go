@@ -41,12 +41,14 @@ type companionRunOptions struct {
 func defaultCompanionRunOptions() companionRunOptions {
 	return companionRunOptions{
 		cfg: server.Config{
-			Addr:          configDefault("BRIO_ADDR", "0.0.0.0:8787"),
-			Token:         configDefault("BRIO_TOKEN", ""),
-			HermesBaseURL: configDefault("HERMES_API_BASE", "http://127.0.0.1:8642"),
-			HermesAPIKey:  configDefault("HERMES_API_KEY", ""),
-			HermesHome:    configDefault("HERMES_HOME", ""),
-			AllowedRoots:  configList("BRIO_ALLOWED_ROOTS"),
+			Addr:               configDefault("BRIO_ADDR", "0.0.0.0:8787"),
+			Token:              configDefault("BRIO_TOKEN", ""),
+			HermesBaseURL:      configDefault("HERMES_API_BASE", "http://127.0.0.1:8642"),
+			HermesAPIKey:       configDefault("HERMES_API_KEY", ""),
+			HermesControlURL:   configDefault("HERMES_CONTROL_BASE", "http://127.0.0.1:9119"),
+			HermesControlToken: configDefault("HERMES_CONTROL_TOKEN", configDefault("HERMES_DASHBOARD_SESSION_TOKEN", "")),
+			HermesHome:         configDefault("HERMES_HOME", ""),
+			AllowedRoots:       configList("BRIO_ALLOWED_ROOTS"),
 		},
 		publicURL:  configDefault("BRIO_PUBLIC_URL", ""),
 		relayURL:   configDefault("BRIO_RELAY_URL", ""),
@@ -75,6 +77,8 @@ func addCompanionRunFlags(cmd *cobra.Command, opts *companionRunOptions) {
 	cmd.Flags().StringVar(&opts.cfg.Token, "token", opts.cfg.Token, "Bearer token for mobile requests")
 	cmd.Flags().StringVar(&opts.cfg.HermesBaseURL, "hermes-url", opts.cfg.HermesBaseURL, "Hermes API server base URL")
 	cmd.Flags().StringVar(&opts.cfg.HermesAPIKey, "hermes-api-key", opts.cfg.HermesAPIKey, "Hermes API server bearer key")
+	cmd.Flags().StringVar(&opts.cfg.HermesControlURL, "hermes-control-url", opts.cfg.HermesControlURL, "Hermes serve JSON-RPC base URL")
+	cmd.Flags().StringVar(&opts.cfg.HermesControlToken, "hermes-control-token", opts.cfg.HermesControlToken, "Hermes serve session token")
 	cmd.Flags().StringVar(&opts.cfg.HermesHome, "hermes-home", opts.cfg.HermesHome, "Hermes home directory")
 	cmd.Flags().StringSliceVar(&opts.cfg.AllowedRoots, "allowed-root", opts.cfg.AllowedRoots, "allowed file root; repeatable")
 	cmd.Flags().StringVar(&opts.relayURL, "relay-url", opts.relayURL, "Brio relay URL for remote access")

@@ -6,12 +6,14 @@ import (
 )
 
 type Config struct {
-	Addr          string
-	Token         string
-	HermesBaseURL string
-	HermesAPIKey  string
-	HermesHome    string
-	AllowedRoots  []string
+	Addr               string
+	Token              string
+	HermesBaseURL      string
+	HermesAPIKey       string
+	HermesControlURL   string
+	HermesControlToken string
+	HermesHome         string
+	AllowedRoots       []string
 }
 
 func (c Config) normalizedRoots() []string {

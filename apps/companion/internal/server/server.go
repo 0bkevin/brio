@@ -23,9 +23,10 @@ import (
 )
 
 type app struct {
-	cfg   Config
-	roots []string
-	http  *http.Client
+	cfg     Config
+	roots   []string
+	http    *http.Client
+	control controlCaller
 }
 
 func Run(ctx context.Context, cfg Config) error {
@@ -34,6 +35,8 @@ func Run(ctx context.Context, cfg Config) error {
 		roots: cfg.normalizedRoots(),
 		http:  &http.Client{Timeout: 20 * time.Second},
 	}
+	a.control = newControlClient(cfg, a.http)
+	defer a.control.Close()
 
 	router := chi.NewRouter()
 	router.Use(middleware.RequestID)
@@ -74,6 +77,10 @@ func Run(ctx context.Context, cfg Config) error {
 	router.Get("/logs", a.logs)
 	router.Get("/gateway/status", a.gatewayStatus)
 	router.Post("/gateway/restart", a.gatewayRestart)
+	router.Post("/control/rpc", a.controlRPC)
+	router.Post("/control/command", a.controlCommand)
+	router.Post("/control/background", a.controlBackground)
+	router.Get("/control/events", a.controlEvents)
 	router.Get("/files", a.fileList)
 	router.Get("/files/read", a.fileRead)
 	router.Put("/files/write", a.fileWrite)
@@ -91,7 +98,7 @@ func Run(ctx context.Context, cfg Config) error {
 		_ = srv.Shutdown(shutdownCtx)
 	}()
 
-	slog.Info("brio companion listening", "addr", cfg.Addr, "hermes_home", cfg.HermesHome, "hermes_api", cfg.HermesBaseURL)
+	slog.Info("brio companion listening", "addr", cfg.Addr, "hermes_home", cfg.HermesHome, "hermes_api", cfg.HermesBaseURL, "hermes_control", cfg.HermesControlURL)
 	err := srv.ListenAndServe()
 	if errors.Is(err, http.ErrServerClosed) {
 		return nil
@@ -135,13 +142,14 @@ func (a *app) auth(next http.Handler) http.Handler {
 func (a *app) health(w http.ResponseWriter, r *http.Request) {
 	hermesStatus, hermesBody := a.hermesGET(r.Context(), "/health")
 	writeJSON(w, http.StatusOK, map[string]any{
-		"service":       "brio-companion",
-		"ok":            true,
-		"hermes_ok":     hermesStatus == http.StatusOK,
-		"hermes_status": hermesStatus,
-		"hermes":        hermesBody,
-		"hermes_home":   a.cfg.HermesHome,
-		"allowed_roots": a.roots,
+		"service":                   "brio-companion",
+		"ok":                        true,
+		"hermes_ok":                 hermesStatus == http.StatusOK,
+		"hermes_status":             hermesStatus,
+		"hermes":                    hermesBody,
+		"hermes_home":               a.cfg.HermesHome,
+		"hermes_control_configured": strings.TrimSpace(a.cfg.HermesControlURL) != "" && strings.TrimSpace(a.cfg.HermesControlToken) != "",
+		"allowed_roots":             a.roots,
 	})
 }
 
@@ -149,12 +157,13 @@ func (a *app) capabilities(w http.ResponseWriter, r *http.Request) {
 	_, hermesBody := a.hermesGET(r.Context(), "/v1/capabilities")
 	writeJSON(w, http.StatusOK, map[string]any{
 		"companion": map[string]any{
-			"files":    true,
-			"config":   true,
-			"memory":   true,
-			"sessions": true,
-			"logs":     true,
-			"gateway":  true,
+			"files":          true,
+			"config":         true,
+			"memory":         true,
+			"sessions":       true,
+			"logs":           true,
+			"gateway":        true,
+			"command_center": strings.TrimSpace(a.cfg.HermesControlURL) != "" && strings.TrimSpace(a.cfg.HermesControlToken) != "",
 		},
 		"hermes": hermesBody,
 	})

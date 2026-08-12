@@ -8,6 +8,7 @@ BRIO_RELAY_ADDR ?= 127.0.0.1:8082
 BRIO_RELAY_URL ?= http://127.0.0.1:8082
 BRIO_AGENT_ID ?= local-brio
 HERMES_API_BASE ?= http://127.0.0.1:8642
+HERMES_CONTROL_BASE ?= http://127.0.0.1:9119
 WEB_EXPORT_DIR ?= /tmp/brio-web-export
 
 GO_PACKAGES := ./apps/companion/... ./apps/relay/...
