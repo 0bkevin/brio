@@ -123,7 +123,7 @@ export type HermesControlSession = {
 };
 
 export type HermesGoalStatus = {
-  status: 'active' | 'paused' | 'waiting' | 'done';
+  status: 'active' | 'paused' | 'blocked' | 'waiting' | 'done';
   objective: string;
   turnsUsed?: number;
   maxTurns?: number;
@@ -131,6 +131,7 @@ export type HermesGoalStatus = {
   subgoals: string[];
   gateCount: number;
   hasContract: boolean;
+  pausedReason?: string;
   detail: string;
 };
 
@@ -141,6 +142,7 @@ export type HermesHeartbeatStatus = {
   nextInSeconds?: number;
   fireCount: number;
   detail: string;
+  lastError?: string;
 };
 
 export type HermesSubagent = Record<string, unknown> & {
@@ -160,6 +162,7 @@ export type HermesSubagent = Record<string, unknown> & {
   files_read?: string[];
   files_written?: string[];
   summary?: string;
+  last_event?: string;
 };
 
 export type HermesBackgroundProcess = Record<string, unknown> & {
@@ -177,7 +180,7 @@ export type HermesBackgroundTask = {
   task_id: string;
   session_id: string;
   prompt: string;
-  status: 'running' | 'completed' | 'failed';
+  status: 'running' | 'completed' | 'failed' | 'unknown';
   started_at: number;
   finished_at?: number;
   output?: string;
@@ -300,15 +303,19 @@ export async function brioFetch<T>(
   if (connection.transport === 'relay') {
     return relayFetch<T>(connection, path, init);
   }
-  const response = await fetchWithTimeout(`${normalizeBaseURL(connection.url)}${path}`, {
-    ...init,
-    headers: {
-      Accept: 'application/json',
-      'Content-Type': 'application/json',
-      Authorization: `Bearer ${connection.token}`,
-      ...(init.headers ?? {}),
+  const response = await fetchWithTimeout(
+    `${normalizeBaseURL(connection.url)}${path}`,
+    {
+      ...init,
+      headers: {
+        Accept: 'application/json',
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${connection.token}`,
+        ...(init.headers ?? {}),
+      },
     },
-  });
+    requestTimeoutForPath(path),
+  );
   const text = await response.text();
   const body = text ? JSON.parse(text) : null;
   if (!response.ok) {
@@ -316,6 +323,10 @@ export async function brioFetch<T>(
     throw new Error(message);
   }
   return body as T;
+}
+
+function requestTimeoutForPath(path: string) {
+  return path.startsWith('/control/') ? 60_000 : 15_000;
 }
 
 export function getHealth(
@@ -529,10 +540,16 @@ export function controlRPC<T>(
   method: string,
   params: Record<string, unknown> = {},
   confirm = false,
+  runtimeSessionId?: string,
 ) {
   return brioFetch<T>(connection, '/control/rpc', {
     method: 'POST',
-    body: JSON.stringify({ method, params, ...(confirm ? { confirm: true } : {}) }),
+    body: JSON.stringify({
+      method,
+      params,
+      ...(confirm ? { confirm: true } : {}),
+      ...(runtimeSessionId ? { runtime_session_id: runtimeSessionId } : {}),
+    }),
   });
 }
 
@@ -544,13 +561,16 @@ export function executeControlCommand(
   connection: AgentConnection,
   sessionId: string,
   command: string,
+  confirm = false,
 ) {
   return brioFetch<{
     result: { output?: string; notice?: string; type?: string };
     kickoff?: Record<string, unknown>;
+    runtime_session_id?: string;
+    heartbeat?: HermesHeartbeatStatus | null;
   }>(connection, '/control/command', {
     method: 'POST',
-    body: JSON.stringify({ session_id: sessionId, command }),
+    body: JSON.stringify({ session_id: sessionId, command, ...(confirm ? { confirm: true } : {}) }),
   });
 }
 
@@ -565,14 +585,21 @@ export function startBackgroundTask(
   });
 }
 
-export function listControlEvents(connection: AgentConnection, after = 0) {
+export function listControlEvents(
+  connection: AgentConnection,
+  after = 0,
+  session?: { storedSessionId: string; runtimeSessionId: string },
+) {
+  const sessionQuery = session
+    ? `&stored_session_id=${encodeURIComponent(session.storedSessionId)}&runtime_session_id=${encodeURIComponent(session.runtimeSessionId)}`
+    : '';
   return brioFetch<{
     events: HermesControlEvent[];
     latest: number;
     background_tasks?: HermesBackgroundTask[];
   }>(
     connection,
-    `/control/events?after=${Math.max(0, Math.floor(after))}`,
+    `/control/events?after=${Math.max(0, Math.floor(after))}${sessionQuery}`,
   );
 }
 
@@ -580,11 +607,12 @@ export async function getCommandCenterSnapshot(
   connection: AgentConnection,
   sessionId: string,
 ): Promise<HermesCommandCenterSnapshot> {
-  const resumed = await controlRPC<{ session_id?: string }>(connection, 'session.resume', {
-    session_id: sessionId,
-    omit_messages: true,
-  });
-  const runtimeSessionId = resumed.session_id?.trim() || sessionId;
+  const heartbeatCommand = await executeControlCommand(
+    connection,
+    sessionId,
+    'heartbeat status',
+  );
+  const runtimeSessionId = heartbeatCommand.runtime_session_id?.trim() || sessionId;
   // Hermes owns one slash worker per live session. Keep its commands ordered;
   // typed read-only RPCs can still fan out after the worker is hydrated.
   const goalResult = await controlRPC<{ output?: string }>(connection, 'slash.exec', {
@@ -595,31 +623,38 @@ export async function getCommandCenterSnapshot(
     session_id: runtimeSessionId,
     command: 'subgoal',
   });
-  const heartbeatResult = await controlRPC<{ output?: string }>(connection, 'slash.exec', {
-    session_id: runtimeSessionId,
-    command: 'heartbeat status',
-  });
   const [delegation, processes, sessionStatus, eventResult] = await Promise.all([
       controlRPC<{
         active?: HermesSubagent[];
         paused?: boolean;
         max_spawn_depth?: number;
         max_concurrent_children?: number;
-      }>(connection, 'delegation.status'),
+      }>(connection, 'delegation.status', {}, false, runtimeSessionId),
       controlRPC<{ processes?: HermesBackgroundProcess[] }>(connection, 'process.list', {
         session_id: runtimeSessionId,
       }),
       controlRPC<{ output?: string }>(connection, 'session.status', {
         session_id: runtimeSessionId,
       }),
-      listControlEvents(connection),
+      listControlEvents(connection, 0, {
+        storedSessionId: sessionId,
+        runtimeSessionId,
+      }),
   ]);
+
+  const scopedAgents = filterAgentsForControlSession(
+    delegation.active ?? [],
+    eventResult.events,
+    runtimeSessionId,
+  );
 
   return {
     runtimeSessionId,
     goal: withSubgoals(parseGoalStatus(goalResult.output ?? ''), subgoalResult.output ?? ''),
-    heartbeat: parseHeartbeatStatus(heartbeatResult.output ?? ''),
-    agents: delegation.active ?? [],
+    heartbeat:
+      heartbeatCommand.heartbeat ??
+      parseHeartbeatStatus(heartbeatCommand.result.output ?? ''),
+    agents: scopedAgents,
     spawningPaused: Boolean(delegation.paused),
     maxSpawnDepth: delegation.max_spawn_depth,
     maxConcurrentChildren: delegation.max_concurrent_children,
@@ -631,21 +666,57 @@ export async function getCommandCenterSnapshot(
   };
 }
 
+export function filterAgentsForControlSession(
+  agents: readonly HermesSubagent[],
+  events: readonly HermesControlEvent[],
+  runtimeSessionId: string,
+) {
+  const observed = new Set(
+    events
+      .filter((event) => event.session_id === runtimeSessionId)
+      .map((event) =>
+        typeof event.payload?.subagent_id === 'string' ? event.payload.subagent_id : '',
+      )
+      .filter(Boolean),
+  );
+  return agents
+    .filter((agent) =>
+      agent.owner_session_id
+        ? agent.owner_session_id === runtimeSessionId
+        : observed.has(agent.subagent_id),
+    )
+    .map((agent) => ({ ...agent, owner_session_id: runtimeSessionId }));
+}
+
 export function parseGoalStatus(value: string): HermesGoalStatus | null {
-  const detail = value.replace(/\r/g, '').trim().split('\n')[0]?.trim() ?? '';
-  if (!detail || /^No (?:active )?goal\b/i.test(detail)) return null;
+  const detail = value.replace(/\r/g, '').trim();
+  const statusLine = detail.split('\n')[0]?.trim() ?? '';
+  if (!statusLine || /^No (?:active )?goal\b/i.test(statusLine)) return null;
   let status: HermesGoalStatus['status'] | null = null;
-  if (/^⊙ Goal\b/.test(detail)) status = 'active';
-  else if (/^⏸ Goal\b/.test(detail)) status = 'paused';
-  else if (/^⏳ Goal\b/.test(detail)) status = 'waiting';
-  else if (/^✓ Goal done\b/.test(detail)) status = 'done';
+  if (/^⊙ Goal\b/.test(statusLine)) status = 'active';
+  else if (/^⏸ Goal\b/.test(statusLine)) status = 'paused';
+  else if (/^⏳ Goal\b/.test(statusLine)) status = 'waiting';
+  else if (/^✓ Goal done\b/.test(statusLine)) status = 'done';
   if (!status) return null;
 
-  const marker = detail.lastIndexOf('): ');
-  const objective = marker >= 0 ? detail.slice(marker + 3).trim() : detail.replace(/^\S+\s+Goal(?:\s+\w+)?\s*:?\s*/i, '').trim();
-  const turns = detail.match(/(\d+)\s*\/\s*(\d+)\s+turns?/i);
-  const subgoals = detail.match(/(\d+)\s+subgoals?/i);
-  const gates = detail.match(/(\d+)\s+gates?/i);
+  const marker = statusLine.indexOf('): ');
+  const metadataStart = statusLine.indexOf('(');
+  const metadata =
+    metadataStart >= 0 && marker > metadataStart
+      ? statusLine.slice(metadataStart + 1, marker)
+      : '';
+  const pausedReason = status === 'paused'
+    ? metadata.match(/\s—\s(.+)$/)?.[1]?.trim()
+    : undefined;
+  if (status === 'paused' && pausedReason && pausedReason.toLowerCase() !== 'user-paused') {
+    status = 'blocked';
+  }
+  const objective = marker >= 0
+    ? detail.slice(marker + 3).trim()
+    : detail.replace(/^\S+\s+Goal(?:\s+\w+)?\s*:?\s*/i, '').trim();
+  const turns = metadata.match(/(\d+)\s*\/\s*(\d+)\s+turns?/i);
+  const subgoals = metadata.match(/(\d+)\s+subgoals?/i);
+  const gates = metadata.match(/(\d+)\s+gates?/i);
   return {
     status,
     objective,
@@ -654,7 +725,8 @@ export function parseGoalStatus(value: string): HermesGoalStatus | null {
     subgoalCount: subgoals ? Number(subgoals[1]) : 0,
     subgoals: [],
     gateCount: gates ? Number(gates[1]) : 0,
-    hasContract: /(?:^|[,\s])contract(?:[,\s]|$)/i.test(detail),
+    hasContract: /(?:^|[,\s])contract(?:[,\s]|$)/i.test(metadata),
+    ...(pausedReason ? { pausedReason } : {}),
     detail,
   };
 }
@@ -697,8 +769,9 @@ export function parseHeartbeatStatus(value: string): HermesHeartbeatStatus | nul
 }
 
 export function aggregateRootAgentUsage(agents: readonly HermesSubagent[]) {
-  const ids = new Set(agents.map((agent) => agent.subagent_id));
-  const roots = agents.filter((agent) => !agent.parent_id || !ids.has(agent.parent_id));
+  // A missing parent row usually means the bounded event window rolled it
+  // off. Treating that orphan as a root double-counts a descendant rollup.
+  const roots = agents.filter((agent) => !agent.parent_id);
   return roots.reduce(
     (total, agent) => ({
       inputTokens: total.inputTokens + (agent.input_tokens ?? 0),
@@ -1130,7 +1203,7 @@ function relayFetch<T>(
     const abortRequest = () => finish(() => reject(new Error('Connection cancelled')));
     const timeout = setTimeout(() => {
       finish(() => reject(new Error('Relay request timed out')));
-    }, 30000);
+    }, requestTimeoutForPath(path));
 
     if (init.signal?.aborted) {
       abortRequest();

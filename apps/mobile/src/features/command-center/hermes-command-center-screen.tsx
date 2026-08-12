@@ -68,7 +68,8 @@ export function HermesCommandCenterScreen({ connection }: { connection: AgentCon
   };
 
   const command = useMutation({
-    mutationFn: (value: string) => executeControlCommand(activeConnection, sessionId, value),
+    mutationFn: (value: { command: string; confirm?: boolean }) =>
+      executeControlCommand(activeConnection, sessionId, value.command, value.confirm),
     onSuccess: invalidate,
   });
   const rpc = useMutation({
@@ -206,11 +207,19 @@ export function HermesCommandCenterScreen({ connection }: { connection: AgentCon
                   <AppText style={[styles.caption, { color: colors.muted }]}>
                     {snapshot.data.goal.hasContract ? 'Completion contract attached' : 'No structured contract reported'} · {snapshot.data.goal.subgoalCount} subgoals · {snapshot.data.goal.gateCount} gates
                   </AppText>
+                  {snapshot.data.goal.hasContract || snapshot.data.goal.gateCount ? (
+                    <AppText style={[styles.caption, { color: colors.muted }]}>Hermes enforces the contract and gates; this control contract reports their presence and count.</AppText>
+                  ) : null}
+                  {snapshot.data.goal.pausedReason ? (
+                    <AppText style={[styles.caption, { color: snapshot.data.goal.status === 'blocked' ? colors.danger : colors.muted }]}>
+                      {snapshot.data.goal.status === 'blocked' ? 'Blocked' : 'Paused'}: {snapshot.data.goal.pausedReason}
+                    </AppText>
+                  ) : null}
                   {snapshot.data.goal.subgoals.map((subgoal, index) => (
                     <View style={styles.listRow} key={`${index}-${subgoal}`}>
                       <AppText style={[styles.caption, { color: colors.muted }]}>{index + 1}</AppText>
                       <AppText style={styles.flex}>{subgoal}</AppText>
-                      <Button loading={command.isPending} onPress={() => command.mutate(`subgoal remove ${index + 1}`)} tone="plain">Remove</Button>
+                      <Button loading={command.isPending} onPress={() => command.mutate({ command: `subgoal remove ${index + 1}` })} tone="plain">Remove</Button>
                     </View>
                   ))}
                   <View style={styles.inlineInputs}>
@@ -225,24 +234,27 @@ export function HermesCommandCenterScreen({ connection }: { connection: AgentCon
                       disabled={!subgoalText.trim()}
                       loading={command.isPending}
                       onPress={() => {
-                        command.mutate(`subgoal ${subgoalText.trim()}`);
+                        command.mutate({ command: `subgoal ${subgoalText.trim()}` });
                         setSubgoalText('');
                       }}>
                       Add
                     </Button>
                   </View>
                   <View style={styles.actions}>
-                    {snapshot.data.goal.status === 'paused' ? (
-                      <Button loading={command.isPending} onPress={() => command.mutate('goal resume')} tone="secondary">Resume</Button>
+                    {snapshot.data.goal.status === 'paused' || snapshot.data.goal.status === 'blocked' ? (
+                      <Button loading={command.isPending} onPress={() => command.mutate({ command: 'goal resume' })} tone="secondary">Resume</Button>
                     ) : (
-                      <Button loading={command.isPending} onPress={() => command.mutate('goal pause')} tone="secondary">Pause</Button>
+                      <Button loading={command.isPending} onPress={() => command.mutate({ command: 'goal pause' })} tone="secondary">Pause</Button>
                     )}
                     <Button
                       loading={command.isPending}
-                      onPress={() => confirmAction('Clear standing goal?', snapshot.data?.goal?.objective ?? '', () => command.mutate('goal clear'))}
+                      onPress={() => confirmAction('Clear standing goal?', snapshot.data?.goal?.objective ?? '', () => command.mutate({ command: 'goal clear', confirm: true }))}
                       tone="danger">Clear</Button>
                     {snapshot.data.goal.subgoalCount ? (
-                      <Button loading={command.isPending} onPress={() => command.mutate('subgoal clear')} tone="plain">Clear criteria</Button>
+                      <Button
+                        loading={command.isPending}
+                        onPress={() => confirmAction('Clear all completion criteria?', snapshot.data?.goal?.objective ?? '', () => command.mutate({ command: 'subgoal clear', confirm: true }))}
+                        tone="plain">Clear criteria</Button>
                     ) : null}
                   </View>
                 </>
@@ -260,14 +272,24 @@ export function HermesCommandCenterScreen({ connection }: { connection: AgentCon
                 disabled={!goalText.trim()}
                 loading={command.isPending}
                 onPress={() => {
-                  command.mutate(`goal ${goalText.trim()}`);
-                  setGoalText('');
+                  const submit = () => {
+                    command.mutate({
+                      command: `goal ${goalText.trim()}`,
+                      confirm: Boolean(snapshot.data?.goal),
+                    });
+                    setGoalText('');
+                  };
+                  if (snapshot.data?.goal) {
+                    confirmAction('Replace the standing goal?', snapshot.data.goal.objective, submit);
+                  } else {
+                    submit();
+                  }
                 }}>
-                Set goal
+                {snapshot.data.goal ? 'Replace goal' : 'Set goal'}
               </Button>
             </Panel>
 
-            <Panel title="Heartbeat" detail="Per-session recurring prompt">
+            <Panel title="Heartbeat" detail="Per-session recurring prompt driven by Companion while it is running">
               {snapshot.data.heartbeat ? (
                 <>
                   <View style={styles.statusRow}>
@@ -278,14 +300,22 @@ export function HermesCommandCenterScreen({ connection }: { connection: AgentCon
                     ) : null}
                   </View>
                   <AppText>{snapshot.data.heartbeat.prompt}</AppText>
+                  {snapshot.data.heartbeat.lastError ? (
+                    <AppText style={[styles.caption, { color: colors.danger }]}>
+                      Last delivery attempt: {snapshot.data.heartbeat.lastError}
+                    </AppText>
+                  ) : null}
                   <View style={styles.actions}>
                     <Button
                       loading={command.isPending}
-                      onPress={() => command.mutate(`heartbeat ${snapshot.data?.heartbeat?.status === 'paused' ? 'resume' : 'pause'}`)}
+                      onPress={() => command.mutate({ command: `heartbeat ${snapshot.data?.heartbeat?.status === 'paused' ? 'resume' : 'pause'}` })}
                       tone="secondary">
                       {snapshot.data.heartbeat.status === 'paused' ? 'Resume' : 'Pause'}
                     </Button>
-                    <Button loading={command.isPending} onPress={() => command.mutate('heartbeat clear')} tone="danger">Clear</Button>
+                    <Button
+                      loading={command.isPending}
+                      onPress={() => confirmAction('Clear this heartbeat?', snapshot.data?.heartbeat?.prompt ?? '', () => command.mutate({ command: 'heartbeat clear', confirm: true }))}
+                      tone="danger">Clear</Button>
                   </View>
                 </>
               ) : null}
@@ -310,10 +340,20 @@ export function HermesCommandCenterScreen({ connection }: { connection: AgentCon
                 disabled={!heartbeatInterval.trim() || !heartbeatPrompt.trim()}
                 loading={command.isPending}
                 onPress={() => {
-                  command.mutate(`heartbeat every ${heartbeatInterval.trim()} ${heartbeatPrompt.trim()}`);
-                  setHeartbeatPrompt('');
+                  const submit = () => {
+                    command.mutate({
+                      command: `heartbeat every ${heartbeatInterval.trim()} ${heartbeatPrompt.trim()}`,
+                      confirm: Boolean(snapshot.data?.heartbeat),
+                    });
+                    setHeartbeatPrompt('');
+                  };
+                  if (snapshot.data?.heartbeat) {
+                    confirmAction('Replace this heartbeat?', snapshot.data.heartbeat.prompt, submit);
+                  } else {
+                    submit();
+                  }
                 }}>
-                Set heartbeat
+                {snapshot.data.heartbeat ? 'Replace heartbeat' : 'Set heartbeat'}
               </Button>
             </Panel>
 
@@ -355,7 +395,7 @@ export function HermesCommandCenterScreen({ connection }: { connection: AgentCon
               )}
             </Panel>
 
-            <Panel title="Agents" detail="Exact live Hermes delegation tree">
+            <Panel title="Agents" detail="Session-owned tree · Hermes-wide spawn policy">
               <View style={styles.statusRow}>
                 <StatusPill label={snapshot.data.spawningPaused ? 'spawning paused' : 'spawning enabled'} />
                 <AppText style={[styles.caption, { color: colors.muted }]}>
@@ -376,7 +416,7 @@ export function HermesCommandCenterScreen({ connection }: { connection: AgentCon
                     onJump={(childSessionId) => router.push(`/thread/${encodeURIComponent(childSessionId)}`)}
                     onStop={(target) =>
                       confirmAction('Stop this agent?', `${target.goal || 'Agent'} · ${target.subagent_id}`, () =>
-                        rpc.mutate({ method: 'subagent.interrupt', params: { session_id: target.owner_session_id ?? snapshot.data?.runtimeSessionId, subagent_id: target.subagent_id } }),
+                        rpc.mutate({ method: 'subagent.interrupt', params: { session_id: target.owner_session_id ?? snapshot.data?.runtimeSessionId, subagent_id: target.subagent_id }, confirm: true }),
                       )
                     }
                     onSteer={(target) => setSteerTarget(target.subagent_id)}
@@ -495,6 +535,12 @@ function AgentRow({ agent, onJump, onSteer, onStop }: {
               {agent.files_written?.length ? ` · ${agent.files_written.length} written` : ''}
             </AppText>
           ) : null}
+          {agent.summary ? (
+            <AppText numberOfLines={3} style={[styles.caption, { color: colors.muted }]}>{agent.summary}</AppText>
+          ) : null}
+          {agent.last_event ? (
+            <AppText style={[styles.caption, { color: colors.tertiary }]}>Last event: {agent.last_event.replaceAll('.', ' ')}</AppText>
+          ) : null}
         </View>
         <AppText style={[styles.caption, { color: colors.tertiary }]}>{shortID(agent.subagent_id)}</AppText>
       </View>
@@ -529,7 +575,7 @@ function BackgroundTaskRow({ task }: { task: HermesBackgroundTask }) {
   const colors = useT3Theme();
   return (
     <View style={styles.listRow}>
-      <StatusDot status={task.status === 'running' ? 'busy' : task.status === 'failed' ? 'error' : 'online'} />
+      <StatusDot status={task.status === 'running' ? 'busy' : task.status === 'failed' ? 'error' : task.status === 'unknown' ? 'offline' : 'online'} />
       <View style={styles.flex}>
         <AppText numberOfLines={2} style={styles.rowTitle}>{task.prompt}</AppText>
         <AppText style={[styles.caption, { color: colors.muted }]}>{task.status} · {shortID(task.task_id)}</AppText>
@@ -566,6 +612,7 @@ function mergeAgents(snapshot?: HermesCommandCenterSnapshot): HermesSubagent[] {
       ...previous,
       ...event.payload,
       subagent_id: id,
+      last_event: event.type,
       ...(event.session_id ? { owner_session_id: event.session_id } : {}),
     } as HermesSubagent;
     if (event.type === 'subagent.complete' && !next.status) next.status = 'completed';

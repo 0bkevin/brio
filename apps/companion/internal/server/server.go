@@ -148,7 +148,7 @@ func (a *app) health(w http.ResponseWriter, r *http.Request) {
 		"hermes_status":             hermesStatus,
 		"hermes":                    hermesBody,
 		"hermes_home":               a.cfg.HermesHome,
-		"hermes_control_configured": strings.TrimSpace(a.cfg.HermesControlURL) != "" && strings.TrimSpace(a.cfg.HermesControlToken) != "",
+		"hermes_control_configured": a.hermesControlConfigured(),
 		"allowed_roots":             a.roots,
 	})
 }
@@ -163,10 +163,18 @@ func (a *app) capabilities(w http.ResponseWriter, r *http.Request) {
 			"sessions":       true,
 			"logs":           true,
 			"gateway":        true,
-			"command_center": strings.TrimSpace(a.cfg.HermesControlURL) != "" && strings.TrimSpace(a.cfg.HermesControlToken) != "",
+			"command_center": a.hermesControlConfigured(),
 		},
 		"hermes": hermesBody,
 	})
+}
+
+func (a *app) hermesControlConfigured() bool {
+	if strings.TrimSpace(a.cfg.HermesControlToken) == "" {
+		return false
+	}
+	_, err := controlWebSocketURL(a.cfg.HermesControlURL, a.cfg.HermesControlToken)
+	return err == nil
 }
 
 func (a *app) proxyHermes(path string) http.HandlerFunc {

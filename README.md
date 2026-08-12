@@ -51,7 +51,9 @@ HERMES_CONTROL_TOKEN=replace-with-a-random-local-token \
 
 The Hermes control server stays loopback-only. The phone authenticates to Brio
 Companion; Companion keeps one persistent gateway connection so background
-completion events and exact agent ownership survive mobile app reconnects.
+completion events and exact agent ownership survive mobile app reconnects. It
+also drives due session heartbeats through Hermes' official pause, resume, and
+queued prompt contracts, so the phone does not need to remain open.
 
 Start the mobile app in another terminal:
 
