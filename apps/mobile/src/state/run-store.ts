@@ -8,8 +8,8 @@ type RunState = {
   activeRuns: Record<string, string>;
   hydrated: boolean;
   hydrate: () => Promise<void>;
-  setActiveRun: (runKey: string, runId: string) => void;
-  clearActiveRun: (runKey: string) => void;
+  setActiveRun: (runKey: string, runId: string) => Promise<void>;
+  clearActiveRun: (runKey: string) => Promise<void>;
 };
 
 async function getStoredRuns() {
@@ -48,15 +48,15 @@ export const useRunStore = create<RunState>((set, get) => ({
       set({ activeRuns: {}, hydrated: true });
     }
   },
-  setActiveRun: (runKey, runId) => {
+  setActiveRun: async (runKey, runId) => {
     const activeRuns = { ...get().activeRuns, [runKey]: runId };
     set({ activeRuns });
-    void setStoredRuns(activeRuns);
+    await setStoredRuns(activeRuns);
   },
-  clearActiveRun: (runKey) => {
+  clearActiveRun: async (runKey) => {
     const activeRuns = { ...get().activeRuns };
     delete activeRuns[runKey];
     set({ activeRuns });
-    void setStoredRuns(activeRuns);
+    await setStoredRuns(activeRuns);
   },
 }));

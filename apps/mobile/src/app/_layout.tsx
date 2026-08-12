@@ -11,6 +11,7 @@ import { GestureHandlerRootView } from 'react-native-gesture-handler';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 
 import { T3Palette, T3Typography } from '@/constants/t3-theme';
+import { useComposerStore } from '@/state/composer-store';
 import { useConnectionStore } from '@/state/connection-store';
 import { useRelaySessionStore } from '@/state/relay-session-store';
 import { useRunStore } from '@/state/run-store';
@@ -36,20 +37,23 @@ export default function RootLayout() {
   const relayHydrated = useRelaySessionStore((state) => state.hydrated);
   const hydrateRuns = useRunStore((state) => state.hydrate);
   const runsHydrated = useRunStore((state) => state.hydrated);
+  const hydrateComposer = useComposerStore((state) => state.hydrate);
+  const composerHydrated = useComposerStore((state) => state.hydrated);
   const hydrateUI = useUIStore((state) => state.hydrate);
 
   useEffect(() => {
     void hydrate();
     void hydrateRelaySession();
     void hydrateRuns();
+    void hydrateComposer();
     void hydrateUI();
-  }, [hydrate, hydrateRelaySession, hydrateRuns, hydrateUI]);
+  }, [hydrate, hydrateComposer, hydrateRelaySession, hydrateRuns, hydrateUI]);
 
   useEffect(() => {
-    if (fontsLoaded && connectionHydrated && relayHydrated && runsHydrated) {
+    if (fontsLoaded && connectionHydrated && relayHydrated && runsHydrated && composerHydrated) {
       void SplashScreen.hideAsync();
     }
-  }, [connectionHydrated, fontsLoaded, relayHydrated, runsHydrated]);
+  }, [composerHydrated, connectionHydrated, fontsLoaded, relayHydrated, runsHydrated]);
 
   if (!fontsLoaded) return null;
 

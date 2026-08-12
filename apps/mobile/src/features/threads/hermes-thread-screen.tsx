@@ -7,6 +7,7 @@ import {
   KeyboardAvoidingView,
   Platform,
   Pressable,
+  ScrollView,
   StyleSheet,
   View,
 } from 'react-native';
@@ -24,6 +25,8 @@ import {
   type AgentConnection,
   type HermesMessage,
 } from '@/lib/brio';
+import { EMPTY_PROMPT_QUEUE, type QueuedPrompt } from '@/state/composer-store-model';
+import { useComposerStore } from '@/state/composer-store';
 import { useRunStore } from '@/state/run-store';
 
 type FeedItem = HermesMessage & { id: string };
@@ -42,9 +45,25 @@ export function HermesThreadScreen({
   const generatedSessionId = `brio_new_${useId().replace(/[^a-z0-9_-]/gi, '')}`;
   const sessionId = routeSessionId === 'new' ? generatedSessionId : routeSessionId;
   const runKey = `${connection.id}:${sessionId}`;
-  const [draft, setDraft] = useState('');
+  const composerKey = `${connection.id}:${routeSessionId}`;
   const runId = useRunStore((state) => state.activeRuns[runKey] ?? null);
   const setActiveRun = useRunStore((state) => state.setActiveRun);
+  const composerHydrated = useComposerStore((state) => state.hydrated);
+  const draft = useComposerStore((state) => state.drafts[composerKey] ?? '');
+  const queue = useComposerStore(
+    (state) => state.queues[composerKey] ?? EMPTY_PROMPT_QUEUE,
+  );
+  const queuePaused = useComposerStore((state) => Boolean(state.paused[composerKey]));
+  const setDraft = useComposerStore((state) => state.setDraft);
+  const enqueueDraft = useComposerStore((state) => state.enqueueDraft);
+  const claimNext = useComposerStore((state) => state.claimNext);
+  const acknowledgePrompt = useComposerStore((state) => state.acknowledge);
+  const failPrompt = useComposerStore((state) => state.fail);
+  const retryPrompt = useComposerStore((state) => state.retry);
+  const removePrompt = useComposerStore((state) => state.remove);
+  const movePrompt = useComposerStore((state) => state.move);
+  const setQueuePaused = useComposerStore((state) => state.setPaused);
+  const moveComposerThread = useComposerStore((state) => state.moveThread);
   const [optimisticPrompt, setOptimisticPrompt] = useState<{
     content: string;
     timestamp: number;
@@ -65,6 +84,7 @@ export function HermesThreadScreen({
     },
   });
   const terminal = run.data && ['completed', 'failed', 'cancelled'].includes(run.data.status);
+  const active = Boolean(runId && !terminal);
 
   useEffect(() => {
     if (!terminal) return;
@@ -75,26 +95,33 @@ export function HermesThreadScreen({
   }, [connection.id, connection.url, queryClient, sessionId, terminal]);
 
   const submit = useMutation({
-    mutationFn: (input: string) =>
-      startRun(connection, input, {
+    mutationFn: async (prompt: QueuedPrompt) => {
+      const currentMessages = await getSessionMessages(connection, sessionId);
+      const result = await startRun(connection, prompt.text, {
         sessionId,
-        conversationHistory: (messages.data?.messages ?? [])
+        conversationHistory: currentMessages.messages
           .filter((message) =>
             (message.role === 'user' || message.role === 'assistant') && Boolean(message.content),
           )
           .map((message) => ({ role: message.role, content: message.content })),
-      }),
-    onMutate: (input) => {
-      setOptimisticPrompt({ content: input, timestamp: Date.now() / 1000 });
-      setDraft('');
+      });
+      return result;
     },
-    onSuccess: (result) => {
-      setActiveRun(runKey, result.run_id);
-      if (routeSessionId === 'new') router.replace(`/thread/${encodeURIComponent(sessionId)}`);
+    onMutate: (prompt) => {
+      setOptimisticPrompt({ content: prompt.text, timestamp: Date.now() / 1000 });
     },
-    onError: (_reason, input) => {
+    onSuccess: async (result, prompt) => {
+      await setActiveRun(runKey, result.run_id);
+      await acknowledgePrompt(composerKey, prompt.id);
+      if (routeSessionId === 'new') {
+        await moveComposerThread(composerKey, runKey);
+        router.replace(`/thread/${encodeURIComponent(sessionId)}`);
+      }
+    },
+    onError: async (reason, prompt) => {
       setOptimisticPrompt(null);
-      setDraft(input);
+      const message = reason instanceof Error ? reason.message : 'Delivery was not confirmed';
+      await failPrompt(composerKey, prompt.id, message);
     },
   });
   const approval = useMutation({
@@ -102,6 +129,13 @@ export function HermesThreadScreen({
       approveRun(connection, runId!, choice),
     onSuccess: () => void run.refetch(),
   });
+
+  useEffect(() => {
+    if (!composerHydrated || active || submit.isPending || queuePaused) return;
+    void claimNext(composerKey).then((prompt) => {
+      if (prompt) submit.mutate(prompt);
+    });
+  }, [active, claimNext, composerHydrated, composerKey, queue, queuePaused, submit]);
   const stop = useMutation({
     mutationFn: () => stopRun(connection, runId!),
     onSuccess: () => void run.refetch(),
@@ -129,11 +163,15 @@ export function HermesThreadScreen({
     });
   }
 
-  const active = Boolean(runId && !terminal);
   const send = () => {
-    const input = draft.trim();
-    if (!input || active || submit.isPending) return;
-    submit.mutate(input);
+    if (!draft.trim() || !composerHydrated) return;
+    void enqueueDraft(composerKey, draft);
+  };
+
+  const editQueuedPrompt = (prompt: QueuedPrompt) => {
+    if (draft.trim()) return;
+    setDraft(composerKey, prompt.text);
+    void removePrompt(composerKey, prompt.id);
   };
 
   return (
@@ -191,27 +229,44 @@ export function HermesThreadScreen({
           </View>
         ) : null}
 
-        <View style={[styles.composerShell, { backgroundColor: colors.sheet, borderTopColor: colors.border }]}>
+        {queue.length > 0 ? (
+          <PromptQueue
+            activePromptId={submit.isPending ? submit.variables?.id : undefined}
+            draftOccupied={Boolean(draft.trim())}
+            onEdit={editQueuedPrompt}
+            onMove={(promptId, offset) => void movePrompt(composerKey, promptId, offset)}
+            onPause={() => void setQueuePaused(composerKey, !queuePaused)}
+            onRemove={(promptId) => void removePrompt(composerKey, promptId)}
+            onRetry={(promptId) => void retryPrompt(composerKey, promptId)}
+            paused={queuePaused}
+            prompts={queue}
+          />
+        ) : null}
+
+        <View
+          style={[
+            styles.composerShell,
+            { backgroundColor: colors.sheet, borderTopColor: colors.border },
+          ]}>
           <View style={styles.composer}>
             <AppTextInput
               accessibilityLabel="Message Hermes"
-              editable={!active}
               multiline
-              onChangeText={setDraft}
+              onChangeText={(text) => setDraft(composerKey, text)}
               onSubmitEditing={send}
-              placeholder={active ? 'Hermes is working…' : 'Message Hermes'}
+              placeholder={active ? 'Queue a follow-up' : 'Message Hermes'}
               style={styles.composerInput}
               value={draft}
             />
             <Pressable
               accessibilityLabel="Send message"
-              disabled={!draft.trim() || active || submit.isPending}
+              disabled={!draft.trim() || !composerHydrated}
               onPress={send}
               style={({ pressed }) => [
                 styles.send,
                 {
                   backgroundColor: colors.primary,
-                  opacity: !draft.trim() || active ? 0.3 : pressed ? 0.65 : 1,
+                  opacity: !draft.trim() || !composerHydrated ? 0.3 : pressed ? 0.65 : 1,
                 },
               ]}>
               <SymbolView name="arrow.up" size={18} tintColor={colors.primaryForeground} />
@@ -220,6 +275,133 @@ export function HermesThreadScreen({
         </View>
       </KeyboardAvoidingView>
     </SafeAreaView>
+  );
+}
+
+function PromptQueue({
+  activePromptId,
+  draftOccupied,
+  onEdit,
+  onMove,
+  onPause,
+  onRemove,
+  onRetry,
+  paused,
+  prompts,
+}: {
+  activePromptId?: string;
+  draftOccupied: boolean;
+  onEdit: (prompt: QueuedPrompt) => void;
+  onMove: (promptId: string, offset: -1 | 1) => void;
+  onPause: () => void;
+  onRemove: (promptId: string) => void;
+  onRetry: (promptId: string) => void;
+  paused: boolean;
+  prompts: QueuedPrompt[];
+}) {
+  const colors = useT3Theme();
+  return (
+    <View
+      style={[
+        styles.queueShell,
+        { backgroundColor: colors.sheet, borderTopColor: colors.border },
+      ]}>
+      <View style={styles.queueHeader}>
+        <AppText style={styles.queueTitle}>
+          {prompts.length} queued {prompts.length === 1 ? 'prompt' : 'prompts'}
+        </AppText>
+        <Pressable accessibilityRole="button" onPress={onPause}>
+          <AppText style={[styles.queueHeaderAction, { color: colors.primary }]}>
+            {paused ? 'Resume' : 'Pause'}
+          </AppText>
+        </Pressable>
+      </View>
+      <ScrollView style={styles.queueList}>
+        {prompts.map((prompt, index) => {
+          const sending = activePromptId === prompt.id;
+          const uncertain = prompt.state === 'sending' && !sending;
+          const canEdit = prompt.state !== 'sending' && !draftOccupied;
+          const status = sending
+            ? 'Sending…'
+            : uncertain
+              ? 'Delivery unconfirmed — check the transcript before retrying.'
+              : prompt.state === 'failed'
+                ? `Not confirmed${prompt.error ? `: ${prompt.error}` : ''}`
+                : paused
+                  ? 'Paused'
+                  : `Queued ${index + 1}`;
+          return (
+            <View
+              key={prompt.id}
+              style={[styles.queueItem, { borderTopColor: colors.separator }]}>
+              <View style={styles.queueCopy}>
+                <AppText numberOfLines={2} style={styles.queuePromptText}>
+                  {prompt.text}
+                </AppText>
+                <AppText
+                  numberOfLines={2}
+                  style={[styles.queueStatus, { color: colors.muted }]}>
+                  {status}
+                </AppText>
+              </View>
+              {!sending ? (
+                <View style={styles.queueActions}>
+                  {prompt.state !== 'pending' ? (
+                    <QueueAction label="Retry" onPress={() => onRetry(prompt.id)} />
+                  ) : (
+                    <>
+                      <QueueAction
+                        disabled={index === 0}
+                        label="↑"
+                        onPress={() => onMove(prompt.id, -1)}
+                      />
+                      <QueueAction
+                        disabled={index === prompts.length - 1}
+                        label="↓"
+                        onPress={() => onMove(prompt.id, 1)}
+                      />
+                    </>
+                  )}
+                  {prompt.state !== 'sending' ? (
+                    <QueueAction
+                      disabled={!canEdit}
+                      label="Edit"
+                      onPress={() => onEdit(prompt)}
+                    />
+                  ) : null}
+                  <QueueAction label="Delete" onPress={() => onRemove(prompt.id)} tone="danger" />
+                </View>
+              ) : null}
+            </View>
+          );
+        })}
+      </ScrollView>
+    </View>
+  );
+}
+
+function QueueAction({
+  disabled,
+  label,
+  onPress,
+  tone = 'normal',
+}: {
+  disabled?: boolean;
+  label: string;
+  onPress: () => void;
+  tone?: 'normal' | 'danger';
+}) {
+  const colors = useT3Theme();
+  return (
+    <Pressable accessibilityRole="button" disabled={disabled} onPress={onPress}>
+      <AppText
+        style={[
+          styles.queueAction,
+          { color: tone === 'danger' ? colors.danger : colors.primary, opacity: disabled ? 0.3 : 1 },
+        ]}>
+        {label}
+      </AppText>
+    </Pressable>
   );
 }
 
@@ -312,6 +494,43 @@ const styles = StyleSheet.create({
   userBubble: { borderBottomRightRadius: 5, paddingHorizontal: 14, paddingVertical: 10 },
   messageText: { fontSize: 15, lineHeight: 23 },
   toolName: { fontFamily: T3Typography.bold, fontSize: 11, lineHeight: 15, textTransform: 'uppercase' },
+  queueShell: {
+    alignSelf: 'center',
+    borderTopWidth: StyleSheet.hairlineWidth,
+    maxWidth: CHAT_CONTENT_MAX_WIDTH,
+    paddingHorizontal: T3Spacing.lg,
+    paddingTop: T3Spacing.sm,
+    width: '100%',
+  },
+  queueHeader: {
+    alignItems: 'center',
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    paddingBottom: T3Spacing.xs,
+  },
+  queueTitle: { fontFamily: T3Typography.bold, fontSize: 13, lineHeight: 18 },
+  queueHeaderAction: { fontFamily: T3Typography.bold, fontSize: 13, lineHeight: 18 },
+  queueList: { maxHeight: 210 },
+  queueItem: {
+    alignItems: 'center',
+    borderTopWidth: StyleSheet.hairlineWidth,
+    flexDirection: 'row',
+    gap: T3Spacing.md,
+    minHeight: 58,
+    paddingVertical: T3Spacing.sm,
+  },
+  queueCopy: { flex: 1 },
+  queuePromptText: { fontSize: 13, lineHeight: 18 },
+  queueStatus: { fontSize: 11, lineHeight: 15 },
+  queueActions: {
+    alignItems: 'center',
+    flexDirection: 'row',
+    flexWrap: 'wrap',
+    gap: T3Spacing.sm,
+    justifyContent: 'flex-end',
+    maxWidth: 150,
+  },
+  queueAction: { fontFamily: T3Typography.bold, fontSize: 12, lineHeight: 17 },
   composerShell: { borderTopWidth: StyleSheet.hairlineWidth, padding: T3Spacing.md },
   composer: {
     alignItems: 'flex-end',

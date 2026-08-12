@@ -6,7 +6,7 @@ The interface follows the native T3 Code mobile work model, adapted to the
 Hermes/Brio protocol:
 
 - searchable Hermes session list and persistent run state
-- conversation history, long-running tasks, cancellation, and approvals
+- conversation history, persistent drafts and queued follow-ups, cancellation, and approvals
 - direct and relay-backed environments
 - saved multi-environment switching, reconnect, editing, and removal
 - workspace file browser and editor
