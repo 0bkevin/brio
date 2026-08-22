@@ -29,6 +29,9 @@ func runConnect(ctx context.Context, opts runOptions) error {
 		// Fall back to the key written into the Hermes .env by setup.
 		opts.hermesAPIKey = readHermesAPIKey(opts.hermesHome)
 	}
+	if opts.controlToken == "" {
+		opts.controlToken = readHermesControlToken(opts.hermesHome)
+	}
 	if opts.relayURL == "" {
 		return fmt.Errorf("relay URL is required; run `brio setup` first or pass --relay-url")
 	}
@@ -39,15 +42,19 @@ func runConnect(ctx context.Context, opts runOptions) error {
 		return fmt.Errorf("relay token is required; run `brio setup` or `brio recover` first")
 	}
 	client := &hermes.Client{
-		BaseURL: opts.hermesURL,
-		APIKey:  opts.hermesAPIKey,
-		Home:    opts.hermesHome,
+		BaseURL:        opts.hermesURL,
+		APIKey:         opts.hermesAPIKey,
+		Home:           opts.hermesHome,
+		ControlBaseURL: opts.controlURL,
+		ControlToken:   opts.controlToken,
 	}
+	defer client.Close()
 	slog.Info("brio connector starting",
 		"relay_url", opts.relayURL,
 		"agent_id", opts.agentID,
 		"hermes_api", opts.hermesURL,
 		"hermes_home", opts.hermesHome,
+		"hermes_control", opts.controlURL,
 	)
 	return tunnel.Run(ctx, tunnel.Config{
 		AgentID:    opts.agentID,

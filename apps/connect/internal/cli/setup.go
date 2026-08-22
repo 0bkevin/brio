@@ -200,6 +200,20 @@ func readHermesAPIKey(hermesHome string) string {
 	return values["API_SERVER_KEY"]
 }
 
+func readHermesControlToken(hermesHome string) string {
+	if hermesHome == "" {
+		hermesHome = defaultHermesHome()
+	}
+	values, err := readDotEnvValues(filepath.Join(hermesHome, ".env"))
+	if err != nil {
+		return ""
+	}
+	if token := strings.TrimSpace(values["HERMES_CONTROL_TOKEN"]); token != "" {
+		return token
+	}
+	return strings.TrimSpace(values["HERMES_DASHBOARD_SESSION_TOKEN"])
+}
+
 func hermesHostPort(baseURL string) (string, string, error) {
 	parsed, err := url.Parse(strings.TrimSpace(baseURL))
 	if err != nil {

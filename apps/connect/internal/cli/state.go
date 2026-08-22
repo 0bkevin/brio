@@ -12,11 +12,13 @@ const stateFileName = "connect.env"
 
 // stateKeys are the keys persisted under ~/.brio/connect.env.
 const (
-	stateKeyRelayURL   = "BRIO_RELAY_URL"
-	stateKeyRelayToken = "BRIO_RELAY_TOKEN"
-	stateKeyAgentID    = "BRIO_AGENT_ID"
-	stateKeyHermesBase = "HERMES_API_BASE"
-	stateKeyHermesKey  = "HERMES_API_KEY"
+	stateKeyRelayURL     = "BRIO_RELAY_URL"
+	stateKeyRelayToken   = "BRIO_RELAY_TOKEN"
+	stateKeyAgentID      = "BRIO_AGENT_ID"
+	stateKeyHermesBase   = "HERMES_API_BASE"
+	stateKeyHermesKey    = "HERMES_API_KEY"
+	stateKeyControlURL   = "HERMES_CONTROL_BASE"
+	stateKeyControlToken = "HERMES_CONTROL_TOKEN"
 )
 
 func brioHomeDir() (string, error) {
@@ -122,10 +124,12 @@ func writePrivateFile(path string, data []byte) error {
 // stateValuesFromOptions maps connector options onto state file keys.
 func stateValuesFromOptions(opts runOptions) map[string]string {
 	return map[string]string{
-		stateKeyRelayURL:   opts.relayURL,
-		stateKeyRelayToken: opts.relayToken,
-		stateKeyAgentID:    opts.agentID,
-		stateKeyHermesBase: opts.hermesURL,
-		stateKeyHermesKey:  opts.hermesAPIKey,
+		stateKeyRelayURL:     opts.relayURL,
+		stateKeyRelayToken:   opts.relayToken,
+		stateKeyAgentID:      opts.agentID,
+		stateKeyHermesBase:   opts.hermesURL,
+		stateKeyHermesKey:    opts.hermesAPIKey,
+		stateKeyControlURL:   opts.controlURL,
+		stateKeyControlToken: opts.controlToken,
 	}
 }

@@ -29,6 +29,7 @@ a fixed set of request paths to Hermes' local API server
 - Go `1.26.1` (relay and connector).
 - Node.js and npm (mobile app).
 - Hermes Agent on the target machine (stock; no fork needed).
+- `hermes serve` on loopback for optional Command Center controls.
 
 Postgres is optional. The relay uses in-memory development storage when
 `BRIO_DATABASE_URL` is unset.
@@ -70,6 +71,19 @@ code, writes its state to `~/.brio/connect.env`, and installs/starts the
 background service. Restart Hermes if it was already running so the API
 server picks up the new settings.
 
+For goals, heartbeats, background tasks, and agent controls, start the Hermes
+control plane with a shared local token. The connector also accepts the token
+from `HERMES_DASHBOARD_SESSION_TOKEN` in `~/.hermes/.env`:
+
+```bash
+HERMES_DASHBOARD_SESSION_TOKEN=replace-with-a-random-local-token \
+  hermes serve --host 127.0.0.1 --port 9119
+```
+
+The control server stays loopback-only. The connector keeps one persistent
+JSON-RPC/WebSocket connection so background completion events, agent ownership,
+and scheduled heartbeats survive mobile app reconnects.
+
 On the Hermes machine you can also manage the connector directly:
 
 ```bash
@@ -102,6 +116,11 @@ Everything rides the relay tunnel. Per request frame:
 - Served locally by brio from `~/.hermes`:
   `/v1/memory` GET/PUT (legacy `/memory`) with atomic 0600 writes to
   `memories/MEMORY.md` and `USER.md`. `HERMES_HOME` is respected.
+- Served by brio through the official `hermes serve` control connection:
+  `/control/rpc`, `/control/command`, `/control/background`, and
+  `/control/events`. These require `HERMES_CONTROL_TOKEN` (or
+  `HERMES_DASHBOARD_SESSION_TOKEN`) and default to
+  `HERMES_CONTROL_BASE=http://127.0.0.1:9119`.
 - Everything else returns a 404-style error frame. The old file/config/
   gateway/skills/tools/logs endpoints are intentionally gone.
 
@@ -128,6 +147,8 @@ Common values:
 - `BRIO_DATABASE_URL` - optional Postgres URL for relay persistence.
 - `BRIO_RELAY_ALLOWED_ORIGINS` - optional comma-separated browser origins allowed for relay CORS and WebSocket upgrades. If unset, development mode allows all origins.
 - `BRIO_DEVICE_REGISTRATION_KEY` - optional secret required on `POST /auth/devices` through `Authorization: Bearer ...` or `X-Brio-Registration-Key`. Use this only as a deployment guard until the hosted account-auth flow replaces development device registration.
+- `HERMES_CONTROL_BASE` - `hermes serve` base URL, default `http://127.0.0.1:9119`.
+- `HERMES_CONTROL_TOKEN` - session token shared with `hermes serve` through `HERMES_DASHBOARD_SESSION_TOKEN`.
 
 ## Validation
 

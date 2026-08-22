@@ -12,7 +12,7 @@ import (
 
 // serveLocal handles the endpoints that read the Hermes home directory
 // directly instead of going through the Hermes API server.
-func (c *Client) serveLocal(_ context.Context, frame tunnel.Frame, method string, route Route, _ string, emit func(tunnel.Frame) error) error {
+func (c *Client) serveLocal(ctx context.Context, frame tunnel.Frame, method string, route Route, _ string, emit func(tunnel.Frame) error) error {
 	switch route.Name {
 	case "memory":
 		switch method {
@@ -27,6 +27,8 @@ func (c *Client) serveLocal(_ context.Context, frame tunnel.Frame, method string
 		default:
 			return emit(methodNotAllowed(frame.ID, method, frame.Path))
 		}
+	case "control-rpc", "control-command", "control-background", "control-events":
+		return c.serveControl(ctx, frame, method, route, emit)
 	default:
 		return emit(errorFrame(frame.ID, "NOT_FOUND", "no route for "+method+" "+frame.Path))
 	}

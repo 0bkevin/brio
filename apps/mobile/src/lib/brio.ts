@@ -1,12 +1,24 @@
 import { fetch as expoFetch } from 'expo/fetch';
 
 import {
+  filterAgentsForControlSession,
+  parseGoalStatus,
+  parseHeartbeatStatus,
+} from './control-model';
+import {
   normalizeHermesSessionMessages,
   normalizeHermesSessions,
   type HermesSession,
   type HermesSessionMessage,
 } from './hermes-api';
 import { ResponsesSSEParser, type HermesResponse } from './responses-sse';
+
+export {
+  aggregateRootAgentUsage,
+  filterAgentsForControlSession,
+  parseGoalStatus,
+  parseHeartbeatStatus,
+} from './control-model';
 
 export type { HermesResponse } from './responses-sse';
 export type { HermesSession, HermesSessionMessage } from './hermes-api';
@@ -31,6 +43,7 @@ export type HealthResponse = {
   hermes_ok?: boolean;
   hermes_status?: number;
   hermes_home?: string;
+  hermes_control_configured?: boolean;
   service?: string;
   hermes?: unknown;
   allowed_roots?: string[];
@@ -56,6 +69,100 @@ export type CapabilitiesResponse = {
   endpoints?: Record<string, { method?: string; path?: string }>;
 };
 
+export type HermesControlSession = {
+  id: string;
+  title?: string;
+  preview?: string;
+  started_at?: number;
+  message_count?: number;
+  source?: string;
+};
+
+export type HermesGoalStatus = {
+  status: 'active' | 'paused' | 'blocked' | 'waiting' | 'done';
+  objective: string;
+  turnsUsed?: number;
+  maxTurns?: number;
+  subgoalCount: number;
+  subgoals: string[];
+  gateCount: number;
+  hasContract: boolean;
+  pausedReason?: string;
+  detail: string;
+};
+
+export type HermesHeartbeatStatus = {
+  status: 'active' | 'paused';
+  prompt: string;
+  interval: string;
+  nextInSeconds?: number;
+  fireCount: number;
+  detail: string;
+  lastError?: string;
+};
+
+export type HermesSubagent = Record<string, unknown> & {
+  subagent_id: string;
+  owner_session_id?: string;
+  parent_id?: string | null;
+  child_session_id?: string;
+  depth?: number;
+  goal?: string;
+  model?: string;
+  status?: string;
+  started_at?: number;
+  tool_count?: number;
+  input_tokens?: number;
+  output_tokens?: number;
+  cost_usd?: number;
+  files_read?: string[];
+  files_written?: string[];
+  summary?: string;
+  last_event?: string;
+};
+
+export type HermesBackgroundProcess = Record<string, unknown> & {
+  session_id?: string;
+  process_id?: string;
+  pid?: number;
+  command?: string;
+  status?: string;
+  running?: boolean;
+  exit_code?: number | null;
+  output_tail?: string;
+};
+
+export type HermesBackgroundTask = {
+  task_id: string;
+  session_id: string;
+  prompt: string;
+  status: 'running' | 'completed' | 'failed' | 'unknown';
+  started_at: number;
+  finished_at?: number;
+  output?: string;
+};
+
+export type HermesControlEvent = {
+  sequence: number;
+  type: string;
+  session_id?: string;
+  payload?: Record<string, unknown>;
+};
+
+export type HermesCommandCenterSnapshot = {
+  runtimeSessionId: string;
+  goal: HermesGoalStatus | null;
+  heartbeat: HermesHeartbeatStatus | null;
+  agents: HermesSubagent[];
+  spawningPaused: boolean;
+  maxSpawnDepth?: number;
+  maxConcurrentChildren?: number;
+  processes: HermesBackgroundProcess[];
+  backgroundTasks: HermesBackgroundTask[];
+  sessionInfo?: Record<string, unknown>;
+  events: HermesControlEvent[];
+  latestEvent: number;
+};
 export type RelayDeviceSession = {
   user: { id: string; email: string };
   device: { id: string; user_id: string; name: string };
@@ -146,6 +253,147 @@ export function getCapabilities(
   connection: Pick<AgentConnection, 'url' | 'token'> & Partial<AgentConnection>,
 ) {
   return brioFetch<CapabilitiesResponse>(connection, '/v1/capabilities');
+}
+
+export function controlRPC<T>(
+  connection: AgentConnection,
+  method: string,
+  params: Record<string, unknown> = {},
+  confirm = false,
+  runtimeSessionId?: string,
+) {
+  return brioFetch<T>(connection, '/control/rpc', {
+    method: 'POST',
+    body: JSON.stringify({
+      method,
+      params,
+      ...(confirm ? { confirm: true } : {}),
+      ...(runtimeSessionId ? { runtime_session_id: runtimeSessionId } : {}),
+    }),
+  });
+}
+
+export function listControlSessions(connection: AgentConnection, limit = 100) {
+  return controlRPC<{ sessions: HermesControlSession[] }>(connection, 'session.list', { limit });
+}
+
+export function executeControlCommand(
+  connection: AgentConnection,
+  sessionId: string,
+  command: string,
+  confirm = false,
+) {
+  return brioFetch<{
+    result: { output?: string; notice?: string; type?: string };
+    kickoff?: Record<string, unknown>;
+    runtime_session_id?: string;
+    heartbeat?: HermesHeartbeatStatus | null;
+  }>(connection, '/control/command', {
+    method: 'POST',
+    body: JSON.stringify({ session_id: sessionId, command, ...(confirm ? { confirm: true } : {}) }),
+  });
+}
+
+export function startBackgroundTask(
+  connection: AgentConnection,
+  sessionId: string,
+  text: string,
+) {
+  return brioFetch<{ task_id: string }>(connection, '/control/background', {
+    method: 'POST',
+    body: JSON.stringify({ session_id: sessionId, text }),
+  });
+}
+
+export function listControlEvents(
+  connection: AgentConnection,
+  after = 0,
+  session?: { storedSessionId: string; runtimeSessionId: string },
+) {
+  const sessionQuery = session
+    ? `&stored_session_id=${encodeURIComponent(session.storedSessionId)}&runtime_session_id=${encodeURIComponent(session.runtimeSessionId)}`
+    : '';
+  return brioFetch<{
+    events: HermesControlEvent[];
+    latest: number;
+    background_tasks?: HermesBackgroundTask[];
+  }>(
+    connection,
+    `/control/events?after=${Math.max(0, Math.floor(after))}${sessionQuery}`,
+  );
+}
+
+export async function getCommandCenterSnapshot(
+  connection: AgentConnection,
+  sessionId: string,
+): Promise<HermesCommandCenterSnapshot> {
+  const heartbeatCommand = await executeControlCommand(
+    connection,
+    sessionId,
+    'heartbeat status',
+  );
+  const runtimeSessionId = heartbeatCommand.runtime_session_id?.trim() || sessionId;
+  // Hermes owns one slash worker per live session. Keep its commands ordered;
+  // typed read-only RPCs can still fan out after the worker is hydrated.
+  const goalResult = await controlRPC<{ output?: string }>(connection, 'slash.exec', {
+    session_id: runtimeSessionId,
+    command: 'goal status',
+  });
+  const subgoalResult = await controlRPC<{ output?: string }>(connection, 'slash.exec', {
+    session_id: runtimeSessionId,
+    command: 'subgoal',
+  });
+  const [delegation, processes, sessionStatus, eventResult] = await Promise.all([
+      controlRPC<{
+        active?: HermesSubagent[];
+        paused?: boolean;
+        max_spawn_depth?: number;
+        max_concurrent_children?: number;
+      }>(connection, 'delegation.status', {}, false, runtimeSessionId),
+      controlRPC<{ processes?: HermesBackgroundProcess[] }>(connection, 'process.list', {
+        session_id: runtimeSessionId,
+      }),
+      controlRPC<{ output?: string }>(connection, 'session.status', {
+        session_id: runtimeSessionId,
+      }),
+      listControlEvents(connection, 0, {
+        storedSessionId: sessionId,
+        runtimeSessionId,
+      }),
+  ]);
+
+  const scopedAgents = filterAgentsForControlSession(
+    delegation.active ?? [],
+    eventResult.events,
+    runtimeSessionId,
+  );
+
+  return {
+    runtimeSessionId,
+    goal: withSubgoals(parseGoalStatus(goalResult.output ?? ''), subgoalResult.output ?? ''),
+    heartbeat:
+      heartbeatCommand.heartbeat ??
+      parseHeartbeatStatus(heartbeatCommand.result.output ?? ''),
+    agents: scopedAgents,
+    spawningPaused: Boolean(delegation.paused),
+    maxSpawnDepth: delegation.max_spawn_depth,
+    maxConcurrentChildren: delegation.max_concurrent_children,
+    processes: processes.processes ?? [],
+    backgroundTasks: eventResult.background_tasks ?? [],
+    sessionInfo: sessionStatus,
+    events: eventResult.events,
+    latestEvent: eventResult.latest,
+  };
+}
+
+function withSubgoals(goal: HermesGoalStatus | null, output: string) {
+  if (!goal) return null;
+  const subgoals = output
+    .replace(/\r/g, '')
+    .split('\n')
+    .map((line) => line.trim().match(/^-\s*\d+\.\s+(.+)$/)?.[1]?.trim() ?? '')
+    .filter(Boolean);
+  return { ...goal, subgoalCount: Math.max(goal.subgoalCount, subgoals.length), subgoals };
 }
 
 export async function sendResponse(
@@ -495,11 +743,14 @@ type PendingRelayRequest = {
 const relayClients = new Map<string, RelaySocketClient>();
 
 class RelaySocketClient {
+  private readonly wsURL: string;
   private socket: WebSocket | null = null;
   private opening: Promise<void> | null = null;
   private pending = new Map<string, PendingRelayRequest>();
 
-  constructor(private readonly wsURL: string) {}
+  constructor(wsURL: string) {
+    this.wsURL = wsURL;
+  }
 
   request<T>(frame: RelayFrame, timeoutMs = 5 * 60 * 1000, onChunk?: (chunk: string) => void): Promise<T> {
     return this.connect().then(

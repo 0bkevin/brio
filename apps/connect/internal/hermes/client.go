@@ -11,6 +11,7 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/brio/brio/apps/connect/internal/tunnel"
@@ -25,8 +26,15 @@ type Client struct {
 	APIKey string
 	// Home is the Hermes home directory (~/.hermes).
 	Home string
+	// ControlBaseURL is the Hermes serve JSON-RPC endpoint.
+	ControlBaseURL string
+	// ControlToken authenticates the Hermes serve WebSocket session.
+	ControlToken string
 
 	HTTP *http.Client
+
+	controlOnce sync.Once
+	controlApp  *app
 }
 
 const (
@@ -68,6 +76,14 @@ func RoutePath(path string) Route {
 		return Route{Kind: RouteForward, Path: "/v1/responses"}
 	case "/v1/memory", "/memory":
 		return Route{Kind: RouteLocal, Name: "memory"}
+	case "/control/rpc":
+		return Route{Kind: RouteLocal, Name: "control-rpc"}
+	case "/control/command":
+		return Route{Kind: RouteLocal, Name: "control-command"}
+	case "/control/background":
+		return Route{Kind: RouteLocal, Name: "control-background"}
+	case "/control/events":
+		return Route{Kind: RouteLocal, Name: "control-events"}
 	case "/api/sessions":
 		return Route{Kind: RouteForward, Path: path}
 	}
@@ -95,6 +111,23 @@ func (c *Client) httpClient() *http.Client {
 		return c.HTTP
 	}
 	return &http.Client{Timeout: forwardTimeout}
+}
+
+func (c *Client) commandCenter() *app {
+	c.controlOnce.Do(func() {
+		c.controlApp = &app{control: newControlClient(Config{
+			HermesControlURL:   c.ControlBaseURL,
+			HermesControlToken: c.ControlToken,
+		}, c.httpClient())}
+	})
+	return c.controlApp
+}
+
+// Close stops the persistent Hermes control connection and heartbeat worker.
+func (c *Client) Close() {
+	if c.controlApp != nil {
+		c.controlApp.control.Close()
+	}
 }
 
 // Serve handles one tunnel request frame and emits response, stream, or

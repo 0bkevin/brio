@@ -34,6 +34,9 @@ export default function AppTabs() {
           <TabTrigger name="manage" href="/explore" asChild>
             <SidebarButton icon="gearshape" label="Manage" />
           </TabTrigger>
+          <TabTrigger name="control" href="/command-center" asChild>
+            <SidebarButton icon="square.grid.2x2" label="Control" />
+          </TabTrigger>
         </SidebarNav>
       </TabList>
     </Tabs>

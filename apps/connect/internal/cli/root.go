@@ -50,6 +50,8 @@ type runOptions struct {
 	hermesURL    string
 	hermesAPIKey string
 	hermesHome   string
+	controlURL   string
+	controlToken string
 }
 
 func defaultRunOptions() runOptions {
@@ -60,6 +62,8 @@ func defaultRunOptions() runOptions {
 		hermesURL:    configDefault("HERMES_API_BASE", "http://127.0.0.1:8642"),
 		hermesAPIKey: configDefault("HERMES_API_KEY", ""),
 		hermesHome:   configDefault("HERMES_HOME", ""),
+		controlURL:   configDefault("HERMES_CONTROL_BASE", "http://127.0.0.1:9119"),
+		controlToken: configDefault("HERMES_CONTROL_TOKEN", configDefault("HERMES_DASHBOARD_SESSION_TOKEN", "")),
 	}
 }
 
@@ -70,6 +74,8 @@ func addRunFlags(cmd *cobra.Command, opts *runOptions) {
 	cmd.Flags().StringVar(&opts.hermesURL, "hermes-url", opts.hermesURL, "Hermes API server base URL")
 	cmd.Flags().StringVar(&opts.hermesAPIKey, "hermes-api-key", opts.hermesAPIKey, "Hermes API server bearer key (API_SERVER_KEY)")
 	cmd.Flags().StringVar(&opts.hermesHome, "hermes-home", opts.hermesHome, "Hermes home directory")
+	cmd.Flags().StringVar(&opts.controlURL, "hermes-control-url", opts.controlURL, "Hermes serve JSON-RPC base URL")
+	cmd.Flags().StringVar(&opts.controlToken, "hermes-control-token", opts.controlToken, "Hermes serve session token")
 }
 
 func (o *runOptions) applyDefaults() {
@@ -81,6 +87,8 @@ func (o *runOptions) applyDefaults() {
 		o.hermesURL = "http://127.0.0.1:8642"
 	}
 	o.hermesAPIKey = strings.TrimSpace(o.hermesAPIKey)
+	o.controlURL = strings.TrimRight(strings.TrimSpace(o.controlURL), "/")
+	o.controlToken = strings.TrimSpace(o.controlToken)
 	o.hermesHome = strings.TrimSpace(o.hermesHome)
 	if o.hermesHome == "" {
 		o.hermesHome = defaultHermesHome()
