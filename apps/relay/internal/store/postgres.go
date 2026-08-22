@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"errors"
+	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -81,6 +82,7 @@ ALTER TABLE agents ADD COLUMN IF NOT EXISTS companion_token_hash TEXT;
 }
 
 func (s *PostgresStore) CreateDeviceToken(ctx context.Context, email string, deviceName string) (User, Device, string, error) {
+	email = strings.ToLower(strings.TrimSpace(email))
 	if email == "" {
 		email = "dev@brio.local"
 	}
@@ -89,7 +91,7 @@ func (s *PostgresStore) CreateDeviceToken(ctx context.Context, email string, dev
 	}
 	userID := "usr_" + RandomCode(24)
 	deviceID := "dev_" + RandomCode(24)
-	token := "brio_" + RandomCode(48)
+	token := "brio_dev_" + RandomCode(48)
 	tokenHash := HashSecret(token)
 
 	tx, err := s.pool.Begin(ctx)
@@ -188,6 +190,9 @@ RETURNING id, user_id, name, created_at, revoked_at
 }
 
 func (s *PostgresStore) AuthenticateCompanion(ctx context.Context, agentID string, token string) error {
+	if token == "" {
+		return ErrUnauthorized
+	}
 	var ok bool
 	err := s.pool.QueryRow(ctx, `
 SELECT EXISTS(
@@ -252,6 +257,7 @@ RETURNING user_id, name, expires_at, used_at, created_at
 }
 
 func (s *PostgresStore) ClaimEnrollment(ctx context.Context, code string, agentID string, name string) (Agent, string, error) {
+	code = strings.ToUpper(strings.TrimSpace(code))
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return Agent{}, "", err
@@ -302,19 +308,16 @@ FOR UPDATE
 	}
 
 	token := "brio_agent_" + RandomCode(48)
-	now := time.Now().UTC()
 	var agent Agent
 	err = tx.QueryRow(ctx, `
 INSERT INTO agents (id, owner_user_id, name, companion_token_hash, mode, status, last_seen_at)
-VALUES ($1, $2, $3, $4, 'self_hosted', 'online', $5)
+VALUES ($1, $2, $3, $4, 'self_hosted', 'offline', NULL)
 ON CONFLICT (id) DO UPDATE
 SET owner_user_id = EXCLUDED.owner_user_id,
     name = EXCLUDED.name,
-    companion_token_hash = EXCLUDED.companion_token_hash,
-    status = 'online',
-    last_seen_at = EXCLUDED.last_seen_at
+    companion_token_hash = EXCLUDED.companion_token_hash
 RETURNING id, owner_user_id, name, mode, status, last_seen_at, created_at
-`, agentID, enrollment.UserID, name, HashSecret(token), now).Scan(
+`, agentID, enrollment.UserID, name, HashSecret(token)).Scan(
 		&agent.ID,
 		&agent.OwnerUserID,
 		&agent.Name,
@@ -368,7 +371,7 @@ VALUES ($1, $2, 'online', now())
 	} else if err != nil {
 		return Pairing{}, err
 	} else {
-		if ownerUserID != nil && (companionToken == "" || currentTokenHash == nil || *currentTokenHash != HashSecret(companionToken)) {
+		if companionToken == "" || currentTokenHash == nil || *currentTokenHash != HashSecret(companionToken) {
 			return Pairing{}, ErrUnauthorized
 		}
 		_, err = tx.Exec(ctx, `
@@ -437,7 +440,7 @@ FOR UPDATE
 	var p Pairing
 	_, err = tx.Exec(ctx, `
 UPDATE agents
-SET name = $3, status = 'online', last_seen_at = now(), companion_token_hash = $4
+SET name = $3, companion_token_hash = $4
 WHERE id = $1 AND owner_user_id = $2
 `, agentID, userID, name, HashSecret(agentToken))
 	if err != nil {
@@ -460,6 +463,7 @@ RETURNING agent_id, name, expires_at, used_at, created_at
 }
 
 func (s *PostgresStore) GetPairing(ctx context.Context, code string) (Pairing, error) {
+	code = strings.ToUpper(strings.TrimSpace(code))
 	var p Pairing
 	err := s.pool.QueryRow(ctx, `
 SELECT agent_id, name, expires_at, used_at, created_at
@@ -483,6 +487,7 @@ WHERE code_hash = $1
 }
 
 func (s *PostgresStore) ClaimPairing(ctx context.Context, code string, userID string) (Agent, error) {
+	code = strings.ToUpper(strings.TrimSpace(code))
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return Agent{}, err

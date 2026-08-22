@@ -41,6 +41,36 @@ func TestMemoryStoreCreatePairingRequiresExistingCompanionTokenForClaimedAgent(t
 	}
 }
 
+func TestMemoryStoreUpsertAgentMatchesPersistentOnlineState(t *testing.T) {
+	s := NewMemoryStore()
+	agent, err := s.UpsertAgent(context.Background(), "agent-1", "Studio Hermes")
+	if err != nil {
+		t.Fatalf("upsert agent: %v", err)
+	}
+	if agent.Status != "online" || agent.LastSeenAt == nil {
+		t.Fatalf("unexpected upserted agent state: %+v", agent)
+	}
+}
+
+func TestMemoryStoreCreatePairingRequiresTokenForExistingUnclaimedAgent(t *testing.T) {
+	ctx := context.Background()
+	s := NewMemoryStore()
+
+	first, err := s.CreatePairing(ctx, "agent-1", "Hermes", time.Minute, "")
+	if err != nil {
+		t.Fatalf("first pairing: %v", err)
+	}
+	if _, err := s.CreatePairing(ctx, "agent-1", "Hermes", time.Minute, ""); err != ErrUnauthorized {
+		t.Fatalf("expected unauthorized tokenless rotation, got %v", err)
+	}
+	if _, err := s.CreatePairing(ctx, "agent-1", "Hermes", time.Minute, "wrong-token"); err != ErrUnauthorized {
+		t.Fatalf("expected unauthorized rotation with wrong token, got %v", err)
+	}
+	if _, err := s.CreatePairing(ctx, "agent-1", "Hermes", time.Minute, first.AgentToken); err != nil {
+		t.Fatalf("rotate pairing with current token: %v", err)
+	}
+}
+
 func TestMemoryStoreListAndRevokeDevices(t *testing.T) {
 	ctx := context.Background()
 	s := NewMemoryStore()
@@ -106,6 +136,76 @@ func TestMemoryStoreRecoverPairingRequiresOwner(t *testing.T) {
 	}
 }
 
+func TestMemoryStoreClaimPairingDoesNotTransferOwnedAgent(t *testing.T) {
+	ctx := context.Background()
+	s := NewMemoryStore()
+
+	initialPairing, err := s.CreatePairing(ctx, "agent-1", "Hermes", time.Minute, "")
+	if err != nil {
+		t.Fatalf("initial pairing: %v", err)
+	}
+	owner, _, _, err := s.CreateDeviceToken(ctx, "owner@example.com", "Phone")
+	if err != nil {
+		t.Fatalf("create owner device: %v", err)
+	}
+	if _, err := s.ClaimPairing(ctx, initialPairing.Code, owner.ID); err != nil {
+		t.Fatalf("claim initial pairing: %v", err)
+	}
+
+	nextPairing, err := s.CreatePairing(ctx, "agent-1", "Hermes", time.Minute, initialPairing.AgentToken)
+	if err != nil {
+		t.Fatalf("create pairing with companion token: %v", err)
+	}
+	other, _, _, err := s.CreateDeviceToken(ctx, "other@example.com", "Tablet")
+	if err != nil {
+		t.Fatalf("create other device: %v", err)
+	}
+
+	if _, err := s.ClaimPairing(ctx, nextPairing.Code, other.ID); err != ErrUnauthorized {
+		t.Fatalf("expected unauthorized claim by non-owner, got %v", err)
+	}
+	if _, err := s.ClaimPairing(ctx, nextPairing.Code, owner.ID); err != nil {
+		t.Fatalf("owner should still be able to claim pairing after unauthorized attempt: %v", err)
+	}
+}
+
+func TestMemoryStoreRecoverPairingDoesNotMarkAgentOnline(t *testing.T) {
+	ctx := context.Background()
+	s := NewMemoryStore()
+
+	initialPairing, err := s.CreatePairing(ctx, "agent-1", "Hermes", time.Minute, "")
+	if err != nil {
+		t.Fatalf("initial pairing: %v", err)
+	}
+	owner, _, _, err := s.CreateDeviceToken(ctx, "owner@example.com", "Phone")
+	if err != nil {
+		t.Fatalf("create owner device: %v", err)
+	}
+	if _, err := s.ClaimPairing(ctx, initialPairing.Code, owner.ID); err != nil {
+		t.Fatalf("claim initial pairing: %v", err)
+	}
+	if err := s.TouchAgent(ctx, "agent-1", "offline"); err != nil {
+		t.Fatalf("touch offline: %v", err)
+	}
+
+	if _, err := s.RecoverPairing(ctx, owner.ID, "agent-1", "Recovered Hermes", time.Minute); err != nil {
+		t.Fatalf("recover pairing: %v", err)
+	}
+	agents, err := s.ListAgents(ctx, owner.ID)
+	if err != nil {
+		t.Fatalf("list agents: %v", err)
+	}
+	if len(agents) != 1 {
+		t.Fatalf("expected 1 agent, got %d", len(agents))
+	}
+	if agents[0].Status != "offline" {
+		t.Fatalf("status after recovery = %q, want offline", agents[0].Status)
+	}
+	if agents[0].Name != "Recovered Hermes" {
+		t.Fatalf("name after recovery = %q, want Recovered Hermes", agents[0].Name)
+	}
+}
+
 func TestMemoryStoreEnrollmentLifecycle(t *testing.T) {
 	ctx := context.Background()
 	s := NewMemoryStore()
@@ -129,6 +229,12 @@ func TestMemoryStoreEnrollmentLifecycle(t *testing.T) {
 	}
 	if agent.Name != "Studio Hermes" {
 		t.Fatalf("agent name = %q", agent.Name)
+	}
+	if agent.Status != "offline" {
+		t.Fatalf("agent status = %q, want offline until companion tunnel connects", agent.Status)
+	}
+	if agent.LastSeenAt != nil {
+		t.Fatalf("last_seen_at = %v, want nil until companion tunnel connects", agent.LastSeenAt)
 	}
 	if agent.OwnerUserID == nil || *agent.OwnerUserID != user.ID {
 		t.Fatalf("unexpected owner: %+v", agent.OwnerUserID)

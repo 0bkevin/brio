@@ -2,11 +2,14 @@ package server
 
 import (
 	"context"
+	"crypto/subtle"
 	"encoding/json"
 	"errors"
 	"io"
 	"log/slog"
 	"net/http"
+	"net/url"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -17,26 +20,47 @@ import (
 	"nhooyr.io/websocket"
 )
 
+const pendingRequestTTL = 6 * time.Minute
+
 type Config struct {
-	Addr        string
-	DatabaseURL string
+	Addr                  string
+	DatabaseURL           string
+	AllowedOrigins        []string
+	DeviceRegistrationKey string
 }
 
 type hub struct {
-	mu     sync.Mutex
-	agents map[string]map[*peer]bool
+	mu      sync.Mutex
+	agents  map[string]map[*peer]bool
+	pending map[string]map[string]pendingRequest
+}
+
+type pendingRequest struct {
+	requester *peer
+	companion *peer
+	createdAt time.Time
 }
 
 type peer struct {
+	id      string
 	agentID string
 	role    string
 	conn    *websocket.Conn
 	send    chan []byte
+	joined  time.Time
 }
 
 type app struct {
+	cfg   Config
 	hub   *hub
 	store store.Store
+}
+
+type tunnelFrame struct {
+	Type    string `json:"type"`
+	ID      string `json:"id"`
+	Code    string `json:"code,omitempty"`
+	Message string `json:"message,omitempty"`
 }
 
 func Run(ctx context.Context, cfg Config) error {
@@ -45,13 +69,14 @@ func Run(ctx context.Context, cfg Config) error {
 		return err
 	}
 	defer st.Close()
-	a := &app{hub: &hub{agents: map[string]map[*peer]bool{}}, store: st}
+	a := &app{cfg: cfg, hub: newHub(), store: st}
+	go a.hub.pruneLoop(ctx)
 	router := chi.NewRouter()
 	router.Use(middleware.RequestID)
 	router.Use(middleware.RealIP)
-	router.Use(middleware.Logger)
+	router.Use(requestLogger)
 	router.Use(middleware.Recoverer)
-	router.Use(cors)
+	router.Use(a.cors)
 	router.Get("/health", a.health)
 	router.Post("/auth/devices", a.createDevice)
 	router.Group(func(r chi.Router) {
@@ -89,15 +114,48 @@ func Run(ctx context.Context, cfg Config) error {
 	return err
 }
 
-func cors(next http.Handler) http.Handler {
+func newHub() *hub {
+	return &hub{
+		agents:  map[string]map[*peer]bool{},
+		pending: map[string]map[string]pendingRequest{},
+	}
+}
+
+func requestLogger(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		wrapped := middleware.NewWrapResponseWriter(w, r.ProtoMajor)
+		started := time.Now()
+		next.ServeHTTP(wrapped, r)
+		slog.Info("relay request",
+			"request_id", middleware.GetReqID(r.Context()),
+			"method", r.Method,
+			"path", r.URL.EscapedPath(),
+			"status", wrapped.Status(),
+			"bytes", wrapped.BytesWritten(),
+			"duration", time.Since(started),
+		)
+	})
+}
+
+func (a *app) cors(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		origin := r.Header.Get("Origin")
-		if origin == "" {
-			origin = "*"
+		if origin == "" || originAllowed(origin, a.cfg.AllowedOrigins) {
+			if origin != "" {
+				w.Header().Set("Access-Control-Allow-Origin", origin)
+			} else {
+				w.Header().Set("Access-Control-Allow-Origin", "*")
+			}
+		} else {
+			writeJSON(w, http.StatusForbidden, map[string]any{"error": "origin is not allowed"})
+			return
 		}
-		w.Header().Set("Access-Control-Allow-Origin", origin)
+		if len(a.cfg.AllowedOrigins) == 0 {
+			origin = "*"
+			w.Header().Set("Access-Control-Allow-Origin", origin)
+		}
 		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, PATCH, DELETE, OPTIONS")
-		w.Header().Set("Access-Control-Allow-Headers", "Accept, Authorization, Content-Type")
+		w.Header().Set("Access-Control-Allow-Headers", "Accept, Authorization, Content-Type, X-Brio-Registration-Key")
 		w.Header().Set("Vary", "Origin")
 		if r.Method == http.MethodOptions {
 			w.WriteHeader(http.StatusNoContent)
@@ -111,19 +169,28 @@ func (a *app) health(w http.ResponseWriter, r *http.Request) {
 	a.hub.mu.Lock()
 	agents := len(a.hub.agents)
 	peers := 0
+	pending := 0
 	for _, set := range a.hub.agents {
 		peers += len(set)
 	}
+	for _, requests := range a.hub.pending {
+		pending += len(requests)
+	}
 	a.hub.mu.Unlock()
 	writeJSON(w, http.StatusOK, map[string]any{
-		"service": "brio-relay",
-		"ok":      true,
-		"agents":  agents,
-		"peers":   peers,
+		"service":          "brio-relay",
+		"ok":               true,
+		"agents":           agents,
+		"peers":            peers,
+		"pending_requests": pending,
 	})
 }
 
 func (a *app) createDevice(w http.ResponseWriter, r *http.Request) {
+	if a.cfg.DeviceRegistrationKey != "" && !secretEqual(deviceRegistrationKey(r), a.cfg.DeviceRegistrationKey) {
+		writeJSON(w, http.StatusUnauthorized, map[string]any{"error": "device registration is not authorized"})
+		return
+	}
 	var body struct {
 		Email      string `json:"email"`
 		DeviceName string `json:"device_name"`
@@ -332,26 +399,21 @@ func (a *app) tunnel(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	conn, err := websocket.Accept(w, r, &websocket.AcceptOptions{
-		OriginPatterns: []string{"*"},
-	})
+	conn, err := websocket.Accept(w, r, websocketAcceptOptions(a.cfg.AllowedOrigins))
 	if err != nil {
 		return
 	}
+	conn.SetReadLimit(12 * 1024 * 1024)
 	p := &peer{
+		id:      role + "_" + store.RandomCode(24),
 		agentID: agentID,
 		role:    role,
 		conn:    conn,
 		send:    make(chan []byte, 64),
+		joined:  time.Now().UTC(),
 	}
-	a.hub.add(p)
-	_ = a.store.TouchAgent(r.Context(), agentID, "online")
-	defer a.hub.remove(p)
-	defer func() {
-		if role == "companion" {
-			_ = a.store.TouchAgent(context.Background(), agentID, "offline")
-		}
-	}()
+	a.addPeer(r.Context(), p)
+	defer a.removePeer(p)
 
 	ctx := r.Context()
 	go p.writeLoop(ctx)
@@ -363,7 +425,21 @@ func (a *app) tunnel(w http.ResponseWriter, r *http.Request) {
 		if typ != websocket.MessageText && typ != websocket.MessageBinary {
 			continue
 		}
-		a.hub.broadcast(p, data)
+		a.hub.route(p, data)
+	}
+}
+
+func (a *app) addPeer(ctx context.Context, p *peer) {
+	a.hub.add(p)
+	if p.role == "companion" {
+		_ = a.store.TouchAgent(ctx, p.agentID, "online")
+	}
+}
+
+func (a *app) removePeer(p *peer) {
+	a.hub.remove(p)
+	if p.role == "companion" && !a.hub.hasCompanion(p.agentID) {
+		_ = a.store.TouchAgent(context.Background(), p.agentID, "offline")
 	}
 }
 
@@ -380,26 +456,177 @@ func (h *hub) remove(p *peer) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	if peers := h.agents[p.agentID]; peers != nil {
-		delete(peers, p)
-		close(p.send)
+		if _, ok := peers[p]; ok {
+			delete(peers, p)
+			close(p.send)
+		}
 		if len(peers) == 0 {
 			delete(h.agents, p.agentID)
 		}
 	}
-	_ = p.conn.Close(websocket.StatusNormalClosure, "bye")
+	if requests := h.pending[p.agentID]; requests != nil {
+		for id, req := range requests {
+			switch {
+			case req.requester == p:
+				delete(requests, id)
+			case req.companion == p:
+				delete(requests, id)
+				h.enqueueLocked(req.requester, errorFrame(id, "COMPANION_DISCONNECTED", "companion disconnected before responding"))
+			}
+		}
+		if len(requests) == 0 {
+			delete(h.pending, p.agentID)
+		}
+	}
+	if p.conn != nil {
+		_ = p.conn.Close(websocket.StatusNormalClosure, "bye")
+	}
 }
 
-func (h *hub) broadcast(from *peer, data []byte) {
+func (h *hub) hasCompanion(agentID string) bool {
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	for p := range h.agents[from.agentID] {
-		if p == from || p.role == from.role {
+	for p := range h.agents[agentID] {
+		if p.role == "companion" {
+			return true
+		}
+	}
+	return false
+}
+
+func (h *hub) route(from *peer, data []byte) {
+	var frame tunnelFrame
+	if err := json.Unmarshal(data, &frame); err != nil {
+		h.enqueue(from, errorFrame("", "BAD_FRAME", "frame must be valid JSON"))
+		return
+	}
+	if frame.Type == "" {
+		h.enqueue(from, errorFrame(frame.ID, "BAD_FRAME", "frame type is required"))
+		return
+	}
+	if frame.Type == "ping" {
+		h.enqueue(from, mustJSON(tunnelFrame{Type: "pong", ID: frame.ID}))
+		return
+	}
+	if frame.Type == "pong" {
+		return
+	}
+	if frame.ID == "" {
+		h.enqueue(from, errorFrame("", "BAD_FRAME", "frame id is required"))
+		return
+	}
+
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	now := time.Now().UTC()
+	h.pruneLocked(now)
+
+	switch from.role {
+	case "mobile":
+		if frame.Type != "request" {
+			h.enqueueLocked(from, errorFrame(frame.ID, "BAD_FRAME", "mobile clients may only send request frames"))
+			return
+		}
+		companion := h.selectCompanionLocked(from.agentID)
+		if companion == nil {
+			h.enqueueLocked(from, errorFrame(frame.ID, "AGENT_OFFLINE", "no companion is connected for this agent"))
+			return
+		}
+		if h.pending[from.agentID] == nil {
+			h.pending[from.agentID] = map[string]pendingRequest{}
+		}
+		if _, exists := h.pending[from.agentID][frame.ID]; exists {
+			h.enqueueLocked(from, errorFrame(frame.ID, "DUPLICATE_REQUEST_ID", "a relay request with this frame id is already pending"))
+			return
+		}
+		h.pending[from.agentID][frame.ID] = pendingRequest{requester: from, companion: companion, createdAt: now}
+		if !h.enqueueLocked(companion, data) {
+			delete(h.pending[from.agentID], frame.ID)
+			if len(h.pending[from.agentID]) == 0 {
+				delete(h.pending, from.agentID)
+			}
+			h.enqueueLocked(from, errorFrame(frame.ID, "COMPANION_BACKPRESSURE", "companion is not accepting relay frames"))
+		}
+	case "companion":
+		if !isCompanionResponseFrame(frame.Type) {
+			h.enqueueLocked(from, errorFrame(frame.ID, "BAD_FRAME", "companion clients may only send response, stream, or error frames"))
+			return
+		}
+		requests := h.pending[from.agentID]
+		req, ok := requests[frame.ID]
+		if !ok {
+			return
+		}
+		if req.companion != from {
+			return
+		}
+		if !h.enqueueLocked(req.requester, data) || isTerminalFrame(frame.Type) {
+			delete(requests, frame.ID)
+			if len(requests) == 0 {
+				delete(h.pending, from.agentID)
+			}
+		}
+	}
+}
+
+func (h *hub) pruneLoop(ctx context.Context) {
+	ticker := time.NewTicker(time.Minute)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case now := <-ticker.C:
+			h.mu.Lock()
+			h.pruneLocked(now.UTC())
+			h.mu.Unlock()
+		}
+	}
+}
+
+func (h *hub) pruneLocked(now time.Time) {
+	for agentID, requests := range h.pending {
+		for id, req := range requests {
+			if now.Sub(req.createdAt) <= pendingRequestTTL {
+				continue
+			}
+			delete(requests, id)
+			h.enqueueLocked(req.requester, errorFrame(id, "REQUEST_EXPIRED", "relay request expired before the companion responded"))
+		}
+		if len(requests) == 0 {
+			delete(h.pending, agentID)
+		}
+	}
+}
+
+func (h *hub) selectCompanionLocked(agentID string) *peer {
+	var selected *peer
+	for p := range h.agents[agentID] {
+		if p.role != "companion" {
 			continue
 		}
-		select {
-		case p.send <- data:
-		default:
+		if selected == nil || p.joined.After(selected.joined) {
+			selected = p
 		}
+	}
+	return selected
+}
+
+func (h *hub) enqueue(p *peer, data []byte) bool {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.enqueueLocked(p, data)
+}
+
+func (h *hub) enqueueLocked(p *peer, data []byte) bool {
+	if p == nil {
+		return false
+	}
+	select {
+	case p.send <- data:
+		return true
+	default:
+		return false
 	}
 }
 
@@ -409,9 +636,121 @@ func (p *peer) writeLoop(ctx context.Context) {
 		err := p.conn.Write(writeCtx, websocket.MessageText, data)
 		cancel()
 		if err != nil {
+			_ = p.conn.Close(websocket.StatusPolicyViolation, "write failed")
 			return
 		}
 	}
+}
+
+func isCompanionResponseFrame(frameType string) bool {
+	return frameType == "response" || frameType == "stream_chunk" || frameType == "stream_end" || frameType == "error"
+}
+
+func isTerminalFrame(frameType string) bool {
+	return frameType == "response" || frameType == "stream_end" || frameType == "error"
+}
+
+func errorFrame(id string, code string, message string) []byte {
+	return mustJSON(tunnelFrame{Type: "error", ID: id, Code: code, Message: message})
+}
+
+func mustJSON(v any) []byte {
+	data, _ := json.Marshal(v)
+	return data
+}
+
+func originAllowed(origin string, allowed []string) bool {
+	if len(allowed) == 0 {
+		return true
+	}
+	normalizedOrigin := normalizeOrigin(origin)
+	originHost := originHostPattern(origin)
+	for _, item := range allowed {
+		item = strings.TrimSpace(item)
+		if item == "*" {
+			return true
+		}
+		if strings.Contains(item, "://") {
+			if normalizeOrigin(item) == normalizedOrigin {
+				return true
+			}
+			continue
+		}
+		if hostPatternMatches(item, originHost) {
+			return true
+		}
+	}
+	return false
+}
+
+func websocketAcceptOptions(allowed []string) *websocket.AcceptOptions {
+	if len(allowed) == 0 || containsWildcardOrigin(allowed) {
+		return &websocket.AcceptOptions{InsecureSkipVerify: true}
+	}
+	return &websocket.AcceptOptions{OriginPatterns: websocketOriginPatterns(allowed)}
+}
+
+func websocketOriginPatterns(allowed []string) []string {
+	out := make([]string, 0, len(allowed))
+	for _, origin := range allowed {
+		value := strings.TrimSpace(origin)
+		if value == "" || value == "*" {
+			continue
+		}
+		if pattern := originHostPattern(value); pattern != "" {
+			out = append(out, pattern)
+		}
+	}
+	return out
+}
+
+func containsWildcardOrigin(allowed []string) bool {
+	for _, origin := range allowed {
+		if strings.TrimSpace(origin) == "*" {
+			return true
+		}
+	}
+	return false
+}
+
+func normalizeOrigin(origin string) string {
+	value := strings.TrimRight(strings.TrimSpace(origin), "/")
+	u, err := url.Parse(value)
+	if err == nil && u.Scheme != "" && u.Host != "" {
+		return strings.ToLower(u.Scheme) + "://" + strings.ToLower(u.Host)
+	}
+	return value
+}
+
+func originHostPattern(origin string) string {
+	value := strings.TrimRight(strings.TrimSpace(origin), "/")
+	u, err := url.Parse(value)
+	if err == nil && u.Host != "" {
+		return strings.ToLower(u.Host)
+	}
+	return strings.ToLower(value)
+}
+
+func hostPatternMatches(pattern string, host string) bool {
+	if pattern == "" || host == "" {
+		return false
+	}
+	matched, err := filepath.Match(strings.ToLower(pattern), strings.ToLower(host))
+	return err == nil && matched
+}
+
+func deviceRegistrationKey(r *http.Request) string {
+	if key := strings.TrimSpace(r.Header.Get("X-Brio-Registration-Key")); key != "" {
+		return key
+	}
+	return bearerToken(r)
+}
+
+func secretEqual(got string, want string) bool {
+	if got == "" || want == "" {
+		return false
+	}
+	return subtle.ConstantTimeCompare([]byte(got), []byte(want)) == 1
 }
 
 func writeJSON(w http.ResponseWriter, status int, payload any) {

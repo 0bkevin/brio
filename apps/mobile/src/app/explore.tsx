@@ -3,7 +3,7 @@ import { ActivityIndicator, Pressable, ScrollView, StyleSheet, View } from 'reac
 import { SafeAreaView } from 'react-native-safe-area-context';
 
 import { DashboardCard, SectionLabel, StatusBadge } from '@/components/dashboard';
-import { brioFetch, getCapabilities, getHealth } from '@/lib/brio';
+import { brioFetch, getCapabilities, getHealth, isAgentHealthy } from '@/lib/brio';
 import { ThemedText } from '@/components/themed-text';
 import { ThemedView } from '@/components/themed-view';
 import { BottomTabInset, MaxContentWidth, Spacing } from '@/constants/theme';
@@ -26,12 +26,12 @@ export default function ManageScreen() {
   });
   const sessions = useQuery({
     queryKey: ['sessions', connection?.url],
-    queryFn: () => brioFetch<{ sessions: unknown[] }>(connection!, '/sessions?limit=5'),
+    queryFn: () => brioFetch<{ sessions: unknown[] }>(connection!, '/v1/sessions?limit=5'),
     enabled: Boolean(connection),
   });
   const memory = useQuery({
     queryKey: ['memory', connection?.url],
-    queryFn: () => brioFetch<{ memory: string; user: string }>(connection!, '/memory'),
+    queryFn: () => brioFetch<{ memory: string; user: string }>(connection!, '/v1/memory'),
     enabled: Boolean(connection),
   });
 
@@ -56,8 +56,8 @@ export default function ManageScreen() {
           title="Health"
           loading={health.isLoading}
           rows={[
-            ['Companion', health.data?.ok ? 'online' : 'unknown'],
-            ['Hermes', health.data?.hermes_ok ? 'online' : 'not reachable'],
+            ['Service', isAgentHealthy(health.data) ? 'online' : 'unknown'],
+            ['Agent runtime', isAgentHealthy(health.data) ? 'online' : 'not reachable'],
             ['Home', health.data?.hermes_home ?? 'unknown'],
           ]}
           onRefresh={() => void health.refetch()}

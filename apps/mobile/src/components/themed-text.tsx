@@ -44,31 +44,26 @@ export function ThemedText({ style, type = 'default', themeColor, ...rest }: The
 
 const styles = StyleSheet.create({
   small: {
-    fontFamily: 'DMSans_500Medium',
     fontSize: 14,
     lineHeight: 20,
     fontWeight: 500,
   },
   smallBold: {
-    fontFamily: 'DMSans_700Bold',
     fontSize: 14,
     lineHeight: 20,
     fontWeight: 700,
   },
   default: {
-    fontFamily: 'DMSans_500Medium',
     fontSize: 16,
     lineHeight: 24,
     fontWeight: 500,
   },
   title: {
-    fontFamily: 'DMSans_700Bold',
     fontSize: 44,
     fontWeight: 600,
     lineHeight: 48,
   },
   subtitle: {
-    fontFamily: 'DMSans_700Bold',
     fontSize: 28,
     lineHeight: 36,
     fontWeight: 600,
