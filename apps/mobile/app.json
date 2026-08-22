@@ -6,32 +6,13 @@
     "orientation": "portrait",
     "icon": "./assets/images/icon.png",
     "scheme": "brio",
-    "jsEngine": "hermes",
     "userInterfaceStyle": "automatic",
     "ios": {
-      "icon": "./assets/expo.icon",
-      "supportsTablet": true,
-      "infoPlist": {
-        "NSAppTransportSecurity": {
-          "NSAllowsArbitraryLoads": true
-        },
-        "NSLocalNetworkUsageDescription": "Allow Brio to connect to Hermes Agent on your local network or tailnet.",
-        "ITSAppUsesNonExemptEncryption": false
-      },
+      "icon": "./assets/images/icon.png",
       "bundleIdentifier": "com.anonymous.brio"
     },
     "android": {
-      "adaptiveIcon": {
-        "backgroundColor": "#041C1C",
-        "foregroundImage": "./assets/images/android-icon-foreground.png",
-        "backgroundImage": "./assets/images/android-icon-background.png",
-        "monochromeImage": "./assets/images/android-icon-monochrome.png"
-      },
-      "usesCleartextTraffic": true,
-      "predictiveBackGestureEnabled": true,
-      "permissions": [
-        "android.permission.CAMERA"
-      ]
+      "predictiveBackGestureEnabled": false
     },
     "web": {
       "output": "static",
@@ -42,25 +23,13 @@
       [
         "expo-splash-screen",
         {
-          "backgroundColor": "#041C1C",
-          "android": {
-            "image": "./assets/images/splash-icon.png",
-            "imageWidth": 76
-          }
+          "backgroundColor": "#07111F",
+          "image": "./assets/images/brio-mark.png",
+          "imageWidth": 96,
+          "resizeMode": "contain"
         }
       ],
-      "expo-secure-store",
-      [
-        "expo-camera",
-        {
-          "cameraPermission": "Allow Brio to scan environment pairing QR codes.",
-          "microphonePermission": false,
-          "barcodeScannerEnabled": true,
-          "recordAudioAndroid": false
-        }
-      ],
-      "expo-image",
-      "expo-web-browser"
+      "expo-secure-store"
     ],
     "experiments": {
       "typedRoutes": true,
