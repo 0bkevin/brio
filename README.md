@@ -5,24 +5,35 @@ Brio is a mobile control plane for Hermes Agent.
 The preferred UX is:
 
 1. Open the mobile app.
-2. Use the `Ask your agent` card to copy a ready-made prompt into Hermes.
-3. Paste Hermes's reply back into the app to connect directly.
-4. Use relay enrollment only when you want persistent owned agents across devices.
+2. Sign in to the Brio relay.
+3. Generate a setup command.
+4. Run that command on the Hermes machine.
+5. It installs Hermes (when missing), enrolls the machine with the relay, and
+   installs/starts the gateway service — the agent appears in the app.
+
+There is no separate companion binary. Hermes runs the Brio relay tunnel
+itself (`hermes brio` in the hermes-agent CLI), so one install covers
+everything.
 
 ## What Is Here
 
 - `apps/mobile` - Expo React Native app.
-- `apps/companion` - Go companion server that runs beside Hermes.
 - `apps/relay` - Go relay/control-plane service for remote connections.
 - `packages/protocol` - Shared JSON protocol schemas.
 
+The Hermes-side connector lives in the
+[hermes-agent](https://github.com/0bkevin/hermes-agent) repo
+(`gateway/platforms/brio_connector.py`, `hermes brio` CLI).
+
 ## Prerequisites
 
-- Go `1.26.1`.
-- Node.js and npm.
-- Hermes Agent running at `http://127.0.0.1:8642` for a fully healthy companion connection.
+- Go `1.26.1` (relay only).
+- Node.js and npm (mobile app).
+- Hermes Agent on the target machine — with the `hermes brio` connector — for
+  enrollment.
 
-Postgres is optional. The relay uses in-memory development storage when `BRIO_DATABASE_URL` is unset.
+Postgres is optional. The relay uses in-memory development storage when
+`BRIO_DATABASE_URL` is unset.
 
 ## Quick Start
 
@@ -31,105 +42,50 @@ make setup
 make check
 ```
 
-Start the companion:
-
-```bash
-make dev-companion
-```
-
-Start the mobile app in another terminal:
-
-```bash
-make dev-mobile
-```
-
-In the app, use `Ask your agent` and paste the prompt into Hermes. Hermes can
-look up the current companion pairing details by running `brio companion pair`.
-Paste Hermes's reply back into Brio to connect.
-
-## Recommended Enrollment Flow
-
-If you want persistent remote ownership instead of the simple direct handoff,
-use the relay enrollment flow below.
-
-Start the relay:
+Start the relay and mobile app:
 
 ```bash
 make dev-relay
-```
-
-Start the mobile app:
-
-```bash
 make dev-mobile
 ```
 
-In the app:
+In the app, sign in to the relay and generate a setup command. Run that command
+on the Hermes machine.
 
-1. Sign in to the relay.
-2. Generate an enrollment code.
+## Enrollment Flow
 
 On the Hermes machine:
 
 ```bash
-brio companion enroll --relay-url http://127.0.0.1:8082 --code ABCD1234 --run
+curl -fsSL https://github.com/0bkevin/brio/raw/main/scripts/install.sh \
+  | BRIO_RELAY_URL="http://127.0.0.1:8082" \
+    BRIO_ENROLL_CODE="ABCD1234" \
+    BRIO_AGENT_NAME="Hermes" \
+    sh
 ```
 
-After enrollment, the agent is owned by that relay user and can be opened from
-the app without manual pairing payloads.
+The installer installs Hermes when missing (from the fork that carries the
+Brio connector), claims the enrollment code, writes `BRIO_RELAY_URL`,
+`BRIO_RELAY_TOKEN`, and `BRIO_AGENT_ID` into `~/.hermes/.env`, enables the
+Hermes API server, and installs/starts the gateway service. The gateway runs
+the relay tunnel automatically whenever the BRIO credentials are present.
 
-## Companion Service
-
-For an end-user machine, Brio Companion can install itself as a background service:
+On the Hermes machine you can also manage everything directly:
 
 ```bash
-brio companion install
-brio companion status
-brio companion pair
+hermes brio enroll --relay-url <relay-url> --code <code>   # enroll/re-enroll
+hermes brio status                                        # tunnel + relay status
+hermes brio recover --relay-url <url> --agent-id <id> \
+  --device-token <owner-device-token>                     # recover credentials
+hermes gateway install / start / restart / stop            # service lifecycle
 ```
 
-This writes local configuration to `~/.brio/companion.env`, starts the companion at login, and keeps it running in the background.
+## Direct Connections
 
-Supported service managers:
-
-- macOS: user LaunchAgent.
-- Linux: user `systemd` service.
-- Windows: login task through Task Scheduler.
-
-Useful commands:
-
-```bash
-brio companion install     # install and start background service
-brio companion start       # start installed background service
-brio companion restart     # restart installed background service
-brio companion status      # service and /health status
-brio companion pair        # print current mobile pairing payload
-brio companion enroll      # enroll this machine into the control plane
-brio companion recover     # recover relay credentials for a claimed agent
-brio companion stop        # stop background service
-brio companion uninstall   # remove background service
-brio companion run         # foreground server for debugging
-```
-
-## Optional Relay Mode
-
-Start the relay:
-
-```bash
-make dev-relay
-```
-
-Start the companion through the relay:
-
-```bash
-make dev-companion-relay
-```
-
-Start the mobile app:
-
-```bash
-make dev-mobile
-```
+The app can also reach a Hermes API server directly on a LAN or private
+network (for example over Tailscale): point it at the machine's
+`http://<host>:8642` with the `API_SERVER_KEY` from `~/.hermes/.env`.
+Internet-facing endpoints must terminate HTTPS before the API server.
 
 ## Configuration
 
@@ -141,38 +97,16 @@ cp .env.example .env
 
 Common values:
 
-- `BRIO_ADDR` - companion bind address, default `127.0.0.1:8787`.
-- `HERMES_API_BASE` - Hermes API base URL, default `http://127.0.0.1:8642`.
 - `BRIO_RELAY_ADDR` - relay bind address, default `127.0.0.1:8082`.
-- `BRIO_RELAY_URL` - relay URL used by the companion, default `http://127.0.0.1:8082`.
-- `BRIO_RELAY_TOKEN` - existing relay companion token used to recover relay mode if local pairing state is lost.
 - `BRIO_DATABASE_URL` - optional Postgres URL for relay persistence.
-
-## Direct Commands
-
-If you do not want to use `make`, these are the equivalent commands.
-
-```bash
-cd apps/companion
-go run . companion run --addr 127.0.0.1:8787
-```
-
-```bash
-cd apps/mobile
-npm ci
-npm run web
-```
-
-```bash
-cd apps/relay
-go run . serve --addr 127.0.0.1:8082
-```
+- `BRIO_RELAY_ALLOWED_ORIGINS` - optional comma-separated browser origins allowed for relay CORS and WebSocket upgrades. If unset, development mode allows all origins.
+- `BRIO_DEVICE_REGISTRATION_KEY` - optional secret required on `POST /auth/devices` through `Authorization: Bearer ...` or `X-Brio-Registration-Key`. Use this only as a deployment guard until the hosted account-auth flow replaces development device registration.
 
 ## Validation
 
 `make check` runs:
 
-- `go test ./apps/companion/... ./apps/relay/...`
+- `go test ./apps/relay/...`
 - `npm run lint`
 - `npm run typecheck`
 - `npm run export:web`
@@ -192,24 +126,26 @@ The web export is written to `/tmp/brio-web-export` by default.
 - `POST /pairings` - create a short-lived pairing record.
 - `GET /pairings/{code}` - inspect a pairing record.
 - `POST /pairings/{code}/claim` - claim a pairing once with a device token.
-- `GET /tunnel/companion/{agentID}?token=...` - authenticated companion WebSocket tunnel.
+- `GET /tunnel/companion/{agentID}?token=...` - authenticated Hermes-connector WebSocket tunnel.
 - `GET /tunnel/mobile/{agentID}?token=...` - authenticated mobile WebSocket tunnel.
 
-For claimed agents, `POST /pairings` accepts the current companion token through
-`Authorization: Bearer ...` so the companion can refresh relay pairing safely
-after a restart.
+The relay routes request frames to one connected Hermes connector and records
+the requesting mobile peer by frame ID. Response, error, and stream frames
+from the connector are delivered only to that requesting peer. Pending relay
+requests expire after six minutes if the connector does not finish.
 
-If `~/.brio/pairing.json` is lost, recover the agent through the relay and then
-restart the companion with the returned token:
+Chat requests use Hermes' Responses API SSE stream. The connector preserves
+the SSE bytes in `stream_chunk` frames and finishes with `stream_end`. The
+mobile app renders `response.output_text.delta` events incrementally and
+falls back to ordinary JSON responses for older Hermes installations.
 
-```bash
-brio companion recover \
-  --relay-url "$BRIO_RELAY_URL" \
-  --agent-id "$BRIO_AGENT_ID" \
-  --device-token "$BRIO_DEVICE_TOKEN" \
-  --restart
-```
+If a Hermes machine loses its `~/.hermes/.env` BRIO credentials, recover the
+agent through the relay and restart the gateway with the returned token (see
+`hermes brio recover` above). The mobile app includes the same recovery flow.
 
-The mobile app includes the same recovery flow. It can request the recovered
-relay token and code, but the companion still must restart with that token
-before a fresh pairing payload can be used to reconnect.
+## Deployment
+
+The relay ships as a Docker image (`apps/relay/Dockerfile`) and is currently
+deployed on AWS Lightsail; an AWS Copilot manifest lives under `copilot/`. Set
+`BRIO_DATABASE_URL` (Postgres) and `BRIO_DEVICE_REGISTRATION_KEY` as secrets
+in any deployed environment.

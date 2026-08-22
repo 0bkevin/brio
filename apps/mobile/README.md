@@ -34,21 +34,25 @@ npm run check
 
 `npm run check` runs Expo linting, TypeScript, and a static web export.
 
-## Connect Locally
+## Connect A Hermes Machine
 
-Start the companion in a separate terminal:
-
-```bash
-make dev-companion
-```
-
-In the mobile app, use `Ask your agent`, paste the generated message into
-Hermes, then paste Hermes's reply back into the app. Hermes can look up the
-pairing details with `brio companion pair`.
-
-For an installed companion binary on an end-user machine:
+Start the relay for local development:
 
 ```bash
-brio companion install
-brio companion pair
+make dev-relay
 ```
+
+In the mobile app, sign in to the relay and generate a setup command. Run that
+command on the Hermes machine. It installs Hermes when missing, enrolls the
+machine with the relay, and installs/starts the gateway service, which runs
+the Brio relay tunnel automatically.
+
+For local CLI development without the installer:
+
+```bash
+hermes brio enroll --relay-url http://127.0.0.1:8082 --code ABCD1234
+hermes gateway restart
+```
+
+Direct connections to a Hermes API server on the LAN are still available in
+the app under Advanced.

@@ -1,7 +1,7 @@
 import { useMutation, useQuery } from '@tanstack/react-query';
 import * as Clipboard from 'expo-clipboard';
 import type { ReactNode } from 'react';
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import {
   ActivityIndicator,
   Pressable,
@@ -13,6 +13,7 @@ import {
 import { SafeAreaView } from 'react-native-safe-area-context';
 
 import { DashboardCard, SectionLabel, StatusBadge } from '@/components/dashboard';
+import { ChatWorkspace } from '@/components/chat-workspace';
 import { Collapsible } from '@/components/ui/collapsible';
 import {
   claimRelayPairing,
@@ -21,9 +22,9 @@ import {
   createRelayEnrollment,
   extractPairingPayload,
   getHealth,
+  isAgentHealthy,
   listRelayAgents,
   recoverRelayAgent,
-  sendResponse,
   type AgentConnection,
   type RelayAgent,
   type RelayEnrollmentResponse,
@@ -35,28 +36,75 @@ import { useTheme } from '@/hooks/use-theme';
 import { useConnectionStore } from '@/state/connection-store';
 import { useRelaySessionStore, type RelaySession } from '@/state/relay-session-store';
 
-const HERMES_CONNECT_PROMPT = `I want to connect the Brio app to this Hermes machine.
+const HERMES_CONNECT_PROMPT = `I want to connect the Brio app to this machine directly.
 
-Please look up this machine's Brio Companion connection details.
-1. First try: brio companion pair
-2. If that fails, try: brio companion status
+Read the Hermes API server settings from ~/.hermes/.env and reply with only:
 
-Reply with only one of these:
-- the pairing payload from brio companion pair
-- or:
-URL: <url>
-Token: <token>
+URL: http://<this-machine-host>:<API_SERVER_PORT>
+Token: <API_SERVER_KEY>
 
-If Brio Companion is not ready, reply:
+If the API server is not enabled (API_SERVER_ENABLED is not true), reply:
 NOT READY: <one short reason>
 
 Do not add markdown fences or extra explanation.`;
+
+const DEFAULT_RELAY_URL = 'https://brio-relay.xa95xa94cj2n4.us-east-1.cs.amazonlightsail.com';
+const INSTALL_SCRIPT_URL = 'https://github.com/0bkevin/brio/raw/main/scripts/install.sh';
+
+function shellQuote(value: string) {
+  return "'" + value.replace(/'/g, "'\\''") + "'";
+}
+
+function setupInstallCommand(enrollment: RelayEnrollmentResponse, relayURL: string) {
+  return `curl -fsSL ${INSTALL_SCRIPT_URL} \\
+  | BRIO_RELAY_URL=${shellQuote(relayURL)} \\
+    BRIO_ENROLL_CODE=${shellQuote(enrollment.code)} \\
+    BRIO_AGENT_NAME=${shellQuote(enrollment.name || 'Brio Agent')} \\
+    sh`;
+}
+
+function recoveryCommand(relayURL: string, agentID: string, deviceToken: string) {
+  return `hermes brio recover \\
+  --relay-url ${shellQuote(relayURL)} \\
+  --agent-id ${shellQuote(agentID)} \\
+  --device-token ${shellQuote(deviceToken)} \\
+  && hermes gateway restart`;
+}
+
+function findSetupAgent(enrollment: RelayEnrollmentResponse | undefined, agents: RelayAgent[] | undefined) {
+  if (!enrollment || !agents?.length) {
+    return undefined;
+  }
+  const setupStarted = Date.parse(enrollment.created_at);
+  return agents.find((agent) => {
+    if (agent.name !== enrollment.name) {
+      return false;
+    }
+    if (!agent.created_at || Number.isNaN(setupStarted)) {
+      return true;
+    }
+    return Date.parse(agent.created_at) >= setupStarted - 5000;
+  });
+}
 
 async function finalizeConnection(connection: AgentConnection) {
   let nextConnection = connection;
 
   if (connection.transport === 'relay') {
-    const session = await createRelayDevice(connection.url);
+    const storedSession = useRelaySessionStore.getState().session;
+    const sameRelay =
+      storedSession?.relayURL.trim().replace(/\/+$/, '') === connection.url.trim().replace(/\/+$/, '');
+    const session = sameRelay
+      ? {
+          token: storedSession.token,
+          user: { id: storedSession.userID, email: storedSession.email },
+          device: {
+            id: storedSession.deviceID,
+            user_id: storedSession.userID,
+            name: storedSession.deviceName,
+          },
+        }
+      : await createRelayDevice(connection.url);
     if (!connection.pairingCode) {
       throw new Error('Relay pairing payload is missing a code');
     }
@@ -74,7 +122,7 @@ async function finalizeConnection(connection: AgentConnection) {
   const health = await getHealth(nextConnection);
   return {
     ...nextConnection,
-    status: health.hermes_ok ? 'online' : 'error',
+    status: isAgentHealthy(health) ? 'online' : 'error',
   } satisfies AgentConnection;
 }
 
@@ -107,20 +155,32 @@ function ConnectionOnboarding() {
   return (
     <Screen>
       <ThemedView style={styles.header}>
-        <SectionLabel>Hermes Agent</SectionLabel>
+        <SectionLabel>Your private AI</SectionLabel>
         <ThemedText type="title">Brio</ThemedText>
         <ThemedText themeColor="textSecondary">
-          Connect in two steps: ask Hermes for the bridge details, then paste the reply here.
+          Bring your personal agent with you—private, connected, and ready whenever you are.
         </ThemedText>
       </ThemedView>
 
-      <AskAgentCard />
+      <DashboardCard style={styles.featureCard}>
+        <View style={styles.featureHeader}>
+          <View style={styles.featureCopy}>
+            <SectionLabel>Connect your agent</SectionLabel>
+            <ThemedText type="subtitle">Meet Brio</ThemedText>
+            <ThemedText themeColor="textSecondary">
+              Sign in once, then Brio gives you one command to securely connect your agent.
+            </ThemedText>
+          </View>
+          <StatusBadge tone="success">1 command</StatusBadge>
+        </View>
+        <RelaySignInCard embedded />
+      </DashboardCard>
       <OtherConnectionOptions />
     </Screen>
   );
 }
 
-function AskAgentCard() {
+function AskAgentCard({ embedded = false }: { embedded?: boolean }) {
   const theme = useTheme();
   const saveConnection = useConnectionStore((state) => state.saveConnection);
   const [copyLabel, setCopyLabel] = useState('Copy message');
@@ -152,15 +212,14 @@ function AskAgentCard() {
     }
   }
 
-  return (
-    <DashboardCard style={styles.featureCard}>
+  const content = (
+    <>
       <View style={styles.featureHeader}>
         <View style={styles.featureCopy}>
-          <SectionLabel>Simple Connect</SectionLabel>
-          <ThemedText type="subtitle">Ask your agent</ThemedText>
+          <ThemedText type="smallBold">Ask your agent for pairing details</ThemedText>
           <ThemedText themeColor="textSecondary">
-            This mirrors Atomic&apos;s lightweight handoff: Brio gives you a ready-made message, Hermes
-            sends back the bridge details, and the app connects.
+            Fallback for a Hermes machine reachable on this network: the agent
+            reads its API server URL and key from ~/.hermes/.env.
           </ThemedText>
         </View>
         <StatusBadge tone="success">2 steps</StatusBadge>
@@ -174,14 +233,14 @@ function AskAgentCard() {
             borderColor: theme.border,
           },
         ]}>
-        <ThemedText type="smallBold">1. Copy this message to Hermes</ThemedText>
+        <ThemedText type="smallBold">1. Copy this message to your agent</ThemedText>
         <ThemedText selectable style={styles.promptText}>
           {HERMES_CONNECT_PROMPT}
         </ThemedText>
         <SecondaryButton label={copyLabel} onPress={() => void copyMessage()} />
       </ThemedView>
 
-      <ThemedText type="smallBold">2. Paste Hermes&apos;s reply</ThemedText>
+      <ThemedText type="smallBold">2. Paste your agent&apos;s reply</ThemedText>
       <TextInput
         autoCapitalize="none"
         autoCorrect={false}
@@ -198,9 +257,20 @@ function AskAgentCard() {
 
       <PrimaryButton
         disabled={connecting || !reply.trim()}
-        label={connecting ? 'Connecting' : 'Connect From Hermes Reply'}
+        label={connecting ? 'Connecting' : 'Connect From Agent Reply'}
         onPress={() => void connectFromReply()}
       />
+    </>
+  );
+
+  if (embedded) {
+    return <View style={styles.embeddedCardContent}>{content}</View>;
+  }
+
+  return (
+    <DashboardCard style={styles.featureCard}>
+      <SectionLabel>Direct pairing</SectionLabel>
+      {content}
     </DashboardCard>
   );
 }
@@ -208,9 +278,9 @@ function AskAgentCard() {
 function OtherConnectionOptions() {
   return (
     <DashboardCard inset="compact">
-      <SectionLabel>Other Paths</SectionLabel>
-      <Collapsible title="Use the Brio relay and enroll a machine">
-        <RelaySignInCard embedded />
+      <SectionLabel>Advanced</SectionLabel>
+      <Collapsible title="Ask your agent for pairing payload">
+        <AskAgentCard embedded />
       </Collapsible>
       <Collapsible title="Paste raw credentials manually">
         <ManualConnectionCard embedded />
@@ -222,7 +292,7 @@ function OtherConnectionOptions() {
 function RelaySignInCard({ embedded = false }: { embedded?: boolean }) {
   const theme = useTheme();
   const saveSession = useRelaySessionStore((state) => state.saveSession);
-  const [relayURL, setRelayURL] = useState('http://127.0.0.1:8082');
+  const [relayURL, setRelayURL] = useState(DEFAULT_RELAY_URL);
   const [email, setEmail] = useState('dev@brio.local');
   const [deviceName, setDeviceName] = useState('Brio mobile');
   const [error, setError] = useState('');
@@ -248,7 +318,7 @@ function RelaySignInCard({ embedded = false }: { embedded?: boolean }) {
     <>
       <ThemedText type="smallBold">Brio relay sign-in</ThemedText>
       <ThemedText themeColor="textSecondary">
-        This creates or reuses an owner account and device session in the control plane.
+        This device will own the agent machines you connect.
       </ThemedText>
 
       <ThemedText type="smallBold">Relay URL</ThemedText>
@@ -308,22 +378,36 @@ function RelaySignInCard({ embedded = false }: { embedded?: boolean }) {
 
 function ControlPlaneHome({ session }: { session: RelaySession }) {
   const clearSession = useRelaySessionStore((state) => state.clearSession);
+  const saveSession = useRelaySessionStore((state) => state.saveSession);
   const clearConnection = useConnectionStore((state) => state.clearConnection);
   const saveConnection = useConnectionStore((state) => state.saveConnection);
   const theme = useTheme();
-  const [agentName, setAgentName] = useState('Hermes');
+  const [agentName, setAgentName] = useState('Brio Agent');
   const [recoveryAgentID, setRecoveryAgentID] = useState('');
-  const [recoveryResult, setRecoveryResult] = useState<Record<string, string> | null>(null);
+  const [recoveryResult, setRecoveryResult] = useState('');
+  const [activeEnrollment, setActiveEnrollment] = useState(session.activeEnrollment);
+  const [now, setNow] = useState(() => Date.now());
+  const enrollmentExpired = Boolean(
+    activeEnrollment && Date.parse(activeEnrollment.expires_at) <= now,
+  );
 
   const agents = useQuery({
     queryKey: ['relay-agents', session.relayURL, session.userID],
     queryFn: () => listRelayAgents(session.relayURL, session.token),
-    refetchInterval: 10000,
+    refetchInterval: (query) =>
+      activeEnrollment &&
+      !enrollmentExpired &&
+      !findSetupAgent(activeEnrollment, query.state.data as RelayAgent[] | undefined)
+        ? 2000
+        : 10000,
   });
 
   const enrollment = useMutation({
-    mutationFn: () => createRelayEnrollment(session.relayURL, session.token, agentName.trim() || 'Hermes'),
-    onSuccess: () => {
+    mutationFn: () => createRelayEnrollment(session.relayURL, session.token, agentName.trim() || 'Brio Agent'),
+    onSuccess: (result) => {
+      setActiveEnrollment(result);
+      setNow(Date.now());
+      void saveSession({ ...session, activeEnrollment: result });
       void agents.refetch();
     },
   });
@@ -331,12 +415,7 @@ function ControlPlaneHome({ session }: { session: RelaySession }) {
   const recovery = useMutation({
     mutationFn: () => recoverRelayAgent(session.relayURL, session.token, recoveryAgentID.trim()),
     onSuccess: (result) => {
-      setRecoveryResult({
-        agent_id: result.agent_id,
-        relay_token: result.agent_token,
-        code: result.code,
-        expires_at: result.expires_at,
-      });
+      setRecoveryResult(recoveryCommand(session.relayURL, result.agent_id, session.token));
       void agents.refetch();
     },
   });
@@ -356,6 +435,16 @@ function ControlPlaneHome({ session }: { session: RelaySession }) {
     });
   }
 
+  const setupConnectedAgent = findSetupAgent(activeEnrollment, agents.data);
+
+  useEffect(() => {
+    if (!activeEnrollment) return;
+    const expiresIn = Date.parse(activeEnrollment.expires_at) - Date.now();
+    if (expiresIn <= 0) return;
+    const timer = setTimeout(() => setNow(Date.now()), expiresIn);
+    return () => clearTimeout(timer);
+  }, [activeEnrollment]);
+
   return (
     <Screen>
       <ThemedView style={styles.headerRow}>
@@ -366,7 +455,7 @@ function ControlPlaneHome({ session }: { session: RelaySession }) {
         </View>
         <Pressable
           onPress={() => {
-            setRecoveryResult(null);
+            setRecoveryResult('');
             void clearConnection();
             void clearSession();
           }}
@@ -383,28 +472,43 @@ function ControlPlaneHome({ session }: { session: RelaySession }) {
             {agents.error instanceof Error ? agents.error.message : 'Could not load agents'}
           </ThemedText>
         ) : null}
-        {agents.data?.length ? (
-          agents.data.map((agent) => (
-            <View key={agent.id} style={styles.agentRow}>
-              <View style={styles.agentCopy}>
-                <ThemedText type="smallBold">{agent.name}</ThemedText>
-                <ThemedText themeColor="textSecondary">{agent.id}</ThemedText>
-              </View>
-              <StatusBadge tone={agent.status === 'online' ? 'success' : 'warning'}>
-                {agent.status}
-              </StatusBadge>
-              <PrimaryButton label="Connect" onPress={() => void connectAgent(agent)} />
+        {activeEnrollment && !setupConnectedAgent ? (
+          <View style={styles.agentRow}>
+            <View style={styles.agentCopy}>
+              <ThemedText type="smallBold">{activeEnrollment.name}</ThemedText>
+              <ThemedText themeColor="textSecondary">
+                {enrollmentExpired
+                  ? 'Setup code expired—generate a new command'
+                  : 'Run setup on your agent machine'}
+              </ThemedText>
             </View>
-          ))
-        ) : (
+            <StatusBadge tone="neutral">waiting</StatusBadge>
+          </View>
+        ) : null}
+        {agents.data?.map((agent) => (
+          <View key={agent.id} style={styles.agentRow}>
+            <View style={styles.agentCopy}>
+              <ThemedText type="smallBold">{agent.name}</ThemedText>
+              <ThemedText themeColor="textSecondary">{agent.id}</ThemedText>
+            </View>
+            <StatusBadge tone={agent.status === 'online' ? 'success' : 'warning'}>
+              {agent.status}
+            </StatusBadge>
+            <PrimaryButton
+              label="Connect"
+              onPress={() => void connectAgent(agent)}
+            />
+          </View>
+        ))}
+        {!agents.data?.length && !activeEnrollment ? (
           <ThemedText themeColor="textSecondary">No enrolled agents yet.</ThemedText>
-        )}
+        ) : null}
       </DashboardCard>
 
       <DashboardCard>
-        <ThemedText type="smallBold">Enroll a new Hermes machine</ThemedText>
+        <ThemedText type="smallBold">Connect an agent</ThemedText>
         <ThemedText themeColor="textSecondary">
-          Generate a short code, then run the enrollment command on the Hermes machine.
+          Generate one setup command, then run it on the machine hosting your agent.
         </ThemedText>
 
         <ThemedText type="smallBold">Agent name</ThemedText>
@@ -412,7 +516,7 @@ function ControlPlaneHome({ session }: { session: RelaySession }) {
           autoCapitalize="words"
           autoCorrect={false}
           onChangeText={setAgentName}
-          placeholder="Hermes"
+          placeholder="Brio Agent"
           placeholderTextColor={theme.textSecondary}
           style={[styles.input, { color: theme.text, borderColor: theme.backgroundSelected }]}
           value={agentName}
@@ -420,7 +524,7 @@ function ControlPlaneHome({ session }: { session: RelaySession }) {
 
         <PrimaryButton
           disabled={enrollment.isPending}
-          label={enrollment.isPending ? 'Generating Code' : 'Generate Enrollment Code'}
+          label={enrollment.isPending ? 'Generating Command' : 'Generate Setup Command'}
           onPress={() => enrollment.mutate()}
         />
 
@@ -429,69 +533,128 @@ function ControlPlaneHome({ session }: { session: RelaySession }) {
             {enrollment.error instanceof Error ? enrollment.error.message : 'Could not create enrollment'}
           </ThemedText>
         ) : null}
-        {enrollment.data ? <EnrollmentOutput enrollment={enrollment.data} relayURL={session.relayURL} /> : null}
-      </DashboardCard>
-
-      <DashboardCard>
-        <ThemedText type="smallBold">Recover an enrolled agent</ThemedText>
-        <ThemedText themeColor="textSecondary">
-          If a Hermes machine lost its local relay state, recover a fresh relay token for that agent.
-        </ThemedText>
-
-        <ThemedText type="smallBold">Agent ID</ThemedText>
-        <TextInput
-          autoCapitalize="none"
-          autoCorrect={false}
-          onChangeText={setRecoveryAgentID}
-          placeholder="agent_..."
-          placeholderTextColor={theme.textSecondary}
-          style={[styles.input, { color: theme.text, borderColor: theme.backgroundSelected }]}
-          value={recoveryAgentID}
-        />
-
-        <PrimaryButton
-          disabled={recovery.isPending || !recoveryAgentID.trim()}
-          label={recovery.isPending ? 'Recovering' : 'Recover Agent'}
-          onPress={() => {
-            setRecoveryResult(null);
-            recovery.mutate();
-          }}
-        />
-
-        {recovery.error ? (
-          <ThemedText themeColor="textSecondary">
-            {recovery.error instanceof Error ? recovery.error.message : 'Could not recover agent'}
-          </ThemedText>
-        ) : null}
-        {recoveryResult ? (
-          <ThemedText type="code" style={styles.jsonBlock}>
-            {JSON.stringify(recoveryResult, null, 2)}
-          </ThemedText>
+        {activeEnrollment ? (
+          <EnrollmentOutput
+            connectedAgent={setupConnectedAgent}
+            enrollment={activeEnrollment}
+            expired={enrollmentExpired}
+            relayURL={session.relayURL}
+          />
         ) : null}
       </DashboardCard>
 
-      <ManualConnectionCard />
+      <DashboardCard inset="compact">
+        <SectionLabel>Advanced</SectionLabel>
+        <Collapsible title="Recover an enrolled agent">
+          <View style={styles.embeddedCardContent}>
+            <ThemedText type="smallBold">Recover an enrolled agent</ThemedText>
+            <ThemedText themeColor="textSecondary">
+              If an agent machine lost its local relay state, recover a fresh relay token for it.
+            </ThemedText>
+
+            <ThemedText type="smallBold">Agent ID</ThemedText>
+            <TextInput
+              autoCapitalize="none"
+              autoCorrect={false}
+              onChangeText={setRecoveryAgentID}
+              placeholder="agent_..."
+              placeholderTextColor={theme.textSecondary}
+              style={[styles.input, { color: theme.text, borderColor: theme.backgroundSelected }]}
+              value={recoveryAgentID}
+            />
+
+            <PrimaryButton
+              disabled={recovery.isPending || !recoveryAgentID.trim()}
+              label={recovery.isPending ? 'Generating Recovery' : 'Generate Recovery Command'}
+              onPress={() => {
+                setRecoveryResult('');
+                recovery.mutate();
+              }}
+            />
+
+            {recovery.error ? (
+              <ThemedText themeColor="textSecondary">
+                {recovery.error instanceof Error ? recovery.error.message : 'Could not recover agent'}
+              </ThemedText>
+            ) : null}
+            {recoveryResult ? (
+              <>
+                <ThemedText themeColor="textSecondary" type="small">
+                  This one-time command contains a private replacement relay token. Run it only on the
+                  matching agent machine.
+                </ThemedText>
+                <ThemedText selectable type="code" style={styles.jsonBlock}>
+                  {recoveryResult}
+                </ThemedText>
+                <SecondaryButton
+                  label="Copy recovery command"
+                  onPress={() => void copyToClipboard(recoveryResult)}
+                />
+              </>
+            ) : null}
+          </View>
+        </Collapsible>
+        <Collapsible title="Ask your agent for pairing payload">
+          <AskAgentCard embedded />
+        </Collapsible>
+        <Collapsible title="Paste raw credentials manually">
+          <ManualConnectionCard embedded />
+        </Collapsible>
+      </DashboardCard>
     </Screen>
   );
 }
 
 function EnrollmentOutput({
+  connectedAgent,
   enrollment,
+  expired,
   relayURL,
 }: {
+  connectedAgent?: RelayAgent;
   enrollment: RelayEnrollmentResponse;
+  expired: boolean;
   relayURL: string;
 }) {
+  const theme = useTheme();
+  const [copyLabel, setCopyLabel] = useState('Copy setup command');
+  const command = setupInstallCommand(enrollment, relayURL);
+
+  async function copyCommand() {
+    try {
+      await copyToClipboard(command);
+      setCopyLabel('Copied');
+    } catch {
+      setCopyLabel('Copy failed');
+    }
+  }
+
   return (
     <ThemedView style={styles.outputBlock}>
-      <ThemedText type="smallBold">Enrollment code</ThemedText>
-      <ThemedText type="title">{enrollment.code}</ThemedText>
-      <ThemedText themeColor="textSecondary">
-        Run this on the Hermes machine:
-      </ThemedText>
-      <ThemedText type="code" style={styles.jsonBlock}>
-        {`brio companion enroll --relay-url ${relayURL} --code ${enrollment.code} --run`}
-      </ThemedText>
+      <View style={styles.statusRow}>
+        <StatusBadge tone={connectedAgent?.status === 'online' ? 'success' : connectedAgent ? 'warning' : 'neutral'}>
+          {connectedAgent ? (connectedAgent.status === 'online' ? 'connected' : 'enrolled offline') : 'waiting for setup'}
+        </StatusBadge>
+        <StatusBadge tone={expired ? 'danger' : 'warning'}>{expired ? 'expired' : 'expires soon'}</StatusBadge>
+      </View>
+      <ThemedText type="smallBold">Run this on your agent machine</ThemedText>
+      <ThemedView
+        style={[
+          styles.commandBlock,
+          {
+            backgroundColor: theme.backgroundSelected,
+            borderColor: theme.border,
+          },
+        ]}>
+        <ThemedText selectable type="code" style={styles.jsonBlock}>
+          {command}
+        </ThemedText>
+      </ThemedView>
+      {expired ? (
+        <ThemedText themeColor="textSecondary">Generate a new setup command before continuing.</ThemedText>
+      ) : (
+        <SecondaryButton label={copyLabel} onPress={() => void copyCommand()} />
+      )}
     </ThemedView>
   );
 }
@@ -499,7 +662,7 @@ function EnrollmentOutput({
 function ManualConnectionCard({ embedded = false }: { embedded?: boolean }) {
   const theme = useTheme();
   const saveConnection = useConnectionStore((state) => state.saveConnection);
-  const [url, setURL] = useState('http://127.0.0.1:8787');
+  const [url, setURL] = useState('http://127.0.0.1:8642');
   const [token, setToken] = useState('');
   const [pairingPayload, setPairingPayload] = useState('');
   const [error, setError] = useState('');
@@ -513,7 +676,7 @@ function ManualConnectionCard({ embedded = false }: { embedded?: boolean }) {
         ? connectionFromPairingPayload(extractPairingPayload(pairingPayload))
         : ({
             id: 'self-hosted-local',
-            name: 'Hermes',
+            name: 'Brio Agent',
             mode: 'self_hosted',
             transport: 'direct',
             status: 'connecting',
@@ -554,7 +717,7 @@ function ManualConnectionCard({ embedded = false }: { embedded?: boolean }) {
         autoCorrect={false}
         inputMode="url"
         onChangeText={setURL}
-        placeholder="http://127.0.0.1:8787"
+        placeholder="http://127.0.0.1:8642"
         placeholderTextColor={theme.textSecondary}
         style={[styles.input, { color: theme.text, borderColor: theme.backgroundSelected }]}
         value={url}
@@ -565,7 +728,7 @@ function ManualConnectionCard({ embedded = false }: { embedded?: boolean }) {
         autoCapitalize="none"
         autoCorrect={false}
         onChangeText={setToken}
-        placeholder="Paste direct companion token"
+        placeholder="Hermes API key (API_SERVER_KEY)"
         placeholderTextColor={theme.textSecondary}
         secureTextEntry
         style={[styles.input, { color: theme.text, borderColor: theme.backgroundSelected }]}
@@ -590,10 +753,7 @@ function ManualConnectionCard({ embedded = false }: { embedded?: boolean }) {
 }
 
 function ConnectedChat({ connection }: { connection: AgentConnection }) {
-  const theme = useTheme();
   const clearConnection = useConnectionStore((state) => state.clearConnection);
-  const [prompt, setPrompt] = useState('');
-  const [lastResponse, setLastResponse] = useState<Record<string, unknown> | null>(null);
 
   const health = useQuery({
     queryKey: ['health', connection.url, connection.agentId ?? connection.id],
@@ -601,62 +761,14 @@ function ConnectedChat({ connection }: { connection: AgentConnection }) {
     refetchInterval: 10000,
   });
 
-  const chat = useMutation({
-    mutationFn: (message: string) => sendResponse(connection, message),
-    onSuccess: (data) => setLastResponse(data),
-  });
-
   return (
-    <Screen>
-      <ThemedView style={styles.headerRow}>
-        <View style={styles.headerCopy}>
-          <SectionLabel>Active companion</SectionLabel>
-          <ThemedText type="subtitle">{connection.name}</ThemedText>
-          <StatusBadge tone={health.data?.hermes_ok ? 'success' : 'warning'}>
-            Hermes {health.data?.hermes_ok ? 'online' : 'not reachable'}
-          </StatusBadge>
-        </View>
-        <Pressable onPress={() => void clearConnection()} style={styles.textButton}>
-          <ThemedText type="link">Back</ThemedText>
-        </Pressable>
-      </ThemedView>
-
-      <DashboardCard>
-        <TextInput
-          multiline
-          onChangeText={setPrompt}
-          placeholder="Send a message to Hermes"
-          placeholderTextColor={theme.textSecondary}
-          style={[
-            styles.messageInput,
-            { color: theme.text, borderColor: theme.backgroundSelected },
-          ]}
-          value={prompt}
-        />
-        {chat.error ? (
-          <ThemedText themeColor="textSecondary">
-            {chat.error instanceof Error ? chat.error.message : 'Request failed'}
-          </ThemedText>
-        ) : null}
-        <PrimaryButton
-          disabled={chat.isPending || !prompt.trim()}
-          label={chat.isPending ? 'Sending' : 'Send'}
-          onPress={() => {
-            const message = prompt.trim();
-            setPrompt('');
-            chat.mutate(message);
-          }}
-        />
-      </DashboardCard>
-
-      <DashboardCard>
-        <ThemedText type="smallBold">Latest response</ThemedText>
-        {chat.isPending ? <ActivityIndicator /> : null}
-        <ThemedText type="code" style={styles.jsonBlock}>
-          {lastResponse ? JSON.stringify(lastResponse, null, 2) : 'No response yet.'}
-        </ThemedText>
-      </DashboardCard>
-    </Screen>
+    <ChatWorkspace
+      connection={connection}
+      health={health.data}
+      healthError={health.isError}
+      healthLoading={health.isLoading}
+      onDisconnect={() => void clearConnection()}
+    />
   );
 }
 
@@ -761,6 +873,12 @@ const styles = StyleSheet.create({
     gap: Spacing.two,
     padding: Spacing.three,
   },
+  commandBlock: {
+    borderRadius: Spacing.two,
+    borderWidth: StyleSheet.hairlineWidth,
+    gap: Spacing.two,
+    padding: Spacing.three,
+  },
   promptText: {
     lineHeight: 23,
   },
@@ -772,6 +890,11 @@ const styles = StyleSheet.create({
   },
   headerCopy: {
     flex: 1,
+    gap: Spacing.one,
+  },
+  statusRow: {
+    flexDirection: 'row',
+    flexWrap: 'wrap',
     gap: Spacing.one,
   },
   input: {

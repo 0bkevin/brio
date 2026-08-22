@@ -8,15 +8,10 @@
     "scheme": "brio",
     "userInterfaceStyle": "automatic",
     "ios": {
-      "icon": "./assets/expo.icon"
+      "icon": "./assets/images/icon.png",
+      "bundleIdentifier": "com.anonymous.brio"
     },
     "android": {
-      "adaptiveIcon": {
-        "backgroundColor": "#041C1C",
-        "foregroundImage": "./assets/images/android-icon-foreground.png",
-        "backgroundImage": "./assets/images/android-icon-background.png",
-        "monochromeImage": "./assets/images/android-icon-monochrome.png"
-      },
       "predictiveBackGestureEnabled": false
     },
     "web": {
@@ -28,11 +23,10 @@
       [
         "expo-splash-screen",
         {
-          "backgroundColor": "#041C1C",
-          "android": {
-            "image": "./assets/images/splash-icon.png",
-            "imageWidth": 76
-          }
+          "backgroundColor": "#07111F",
+          "image": "./assets/images/brio-mark.png",
+          "imageWidth": 96,
+          "resizeMode": "contain"
         }
       ],
       "expo-secure-store"

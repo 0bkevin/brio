@@ -1,3 +1,9 @@
+import { fetch as expoFetch } from 'expo/fetch';
+
+import { ResponsesSSEParser, type HermesResponse } from './responses-sse';
+
+export type { HermesResponse } from './responses-sse';
+
 export type AgentConnection = {
   id: string;
   name: string;
@@ -14,6 +20,7 @@ export type AgentConnection = {
 
 export type HealthResponse = {
   ok: boolean;
+  status?: string;
   hermes_ok?: boolean;
   hermes_status?: number;
   hermes_home?: string;
@@ -21,6 +28,15 @@ export type HealthResponse = {
   hermes?: unknown;
   allowed_roots?: string[];
 };
+
+/**
+ * Healthy under either shape: the former companion's `{hermes_ok: true}` or
+ * the Hermes API server's `{status: "ok"}`.
+ */
+export function isAgentHealthy(health: HealthResponse | null | undefined) {
+  if (!health) return false;
+  return health.hermes_ok === true || health.status === 'ok';
+}
 
 export type CapabilitiesResponse = {
   companion?: Record<string, unknown>;
@@ -93,10 +109,18 @@ export async function brioFetch<T>(
     },
   });
   const text = await response.text();
-  const body = text ? JSON.parse(text) : null;
+  let body: unknown = null;
+  if (text) {
+    try {
+      body = JSON.parse(text);
+    } catch {
+      body = text;
+    }
+  }
   if (!response.ok) {
-    const message = body?.error ?? body?.message ?? `Request failed: ${response.status}`;
-    throw new Error(message);
+    const errorBody = typeof body === 'object' && body ? (body as { error?: unknown; message?: unknown }) : null;
+    const message = errorBody?.error ?? errorBody?.message ?? (typeof body === 'string' ? body : null);
+    throw new Error(message ? String(message) : `Request failed: ${response.status}`);
   }
   return body as T;
 }
@@ -108,21 +132,150 @@ export function getHealth(connection: Pick<AgentConnection, 'url' | 'token'> & P
 export function getCapabilities(
   connection: Pick<AgentConnection, 'url' | 'token'> & Partial<AgentConnection>,
 ) {
-  return brioFetch<CapabilitiesResponse>(connection, '/capabilities');
+  return brioFetch<CapabilitiesResponse>(connection, '/v1/capabilities');
 }
+
+export type HermesSession = {
+  id: string;
+  source: string;
+  user_id?: string;
+  model?: string;
+  started_at: number;
+  ended_at?: number | null;
+  message_count: number;
+  title?: string;
+};
+
+export type HermesSessionMessage = {
+  role: string;
+  content: string;
+  tool_name?: string;
+  timestamp: number;
+};
 
 export async function sendResponse(
   connection: Pick<AgentConnection, 'url' | 'token'> & Partial<AgentConnection>,
   prompt: string,
+  options: {
+    conversation?: string;
+    previousResponseId?: string;
+    conversationHistory?: { role: string; content: string }[];
+  } = {},
 ) {
-  return brioFetch<Record<string, unknown>>(connection, '/chat/responses', {
+  return brioFetch<HermesResponse>(connection, '/v1/responses', {
     method: 'POST',
-    body: JSON.stringify({
-      model: 'hermes-agent',
-      input: prompt,
-      stream: false,
-    }),
+    body: JSON.stringify(responseRequestBody(prompt, options, false)),
   });
+}
+
+export async function sendResponseStream(
+  connection: Pick<AgentConnection, 'url' | 'token'> & Partial<AgentConnection>,
+  prompt: string,
+  options: {
+    conversation?: string;
+    previousResponseId?: string;
+    conversationHistory?: { role: string; content: string }[];
+    onTextDelta?: (delta: string) => void;
+  } = {},
+) {
+  const parser = new ResponsesSSEParser(options.onTextDelta);
+  const body = JSON.stringify(responseRequestBody(prompt, options, true));
+
+  if (connection.transport === 'relay') {
+    const terminal = await relayFetch<HermesResponse | null>(
+      connection,
+      '/v1/responses',
+      { method: 'POST', body },
+      (chunk) => parser.push(chunk),
+    );
+    if (terminal) return terminal;
+    return parser.finish();
+  }
+
+  const response = await expoFetch(`${normalizeBaseURL(connection.url)}/v1/responses`, {
+    method: 'POST',
+    headers: {
+      Accept: 'text/event-stream, application/json',
+      'Content-Type': 'application/json',
+      Authorization: `Bearer ${connection.token}`,
+    },
+    body,
+  });
+  const contentType = response.headers.get('Content-Type')?.toLowerCase() ?? '';
+  if (!response.ok || !contentType.includes('text/event-stream')) {
+    const text = await response.text();
+    const result = text ? (JSON.parse(text) as HermesResponse) : null;
+    if (!response.ok) {
+      const error = typeof result?.error === 'string' ? result.error : result?.error?.message;
+      throw new Error(error ?? `Request failed: ${response.status}`);
+    }
+    if (!result) throw new Error('Agent returned an empty response');
+    return result;
+  }
+
+  const reader = response.body?.getReader();
+  if (!reader) throw new Error('Streaming response body is unavailable');
+  const decoder = new TextDecoder();
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    parser.push(decoder.decode(value, { stream: true }));
+  }
+  parser.push(decoder.decode());
+  return parser.finish();
+}
+
+function responseRequestBody(
+  prompt: string,
+  options: {
+    conversation?: string;
+    previousResponseId?: string;
+    conversationHistory?: { role: string; content: string }[];
+  },
+  stream: boolean,
+) {
+  return {
+    model: 'hermes-agent',
+    input: prompt,
+    stream,
+    ...(options.previousResponseId
+      ? { previous_response_id: options.previousResponseId }
+      : options.conversationHistory?.length
+        ? { conversation: options.conversation, conversation_history: options.conversationHistory }
+        : options.conversation
+          ? { conversation: options.conversation }
+          : {}),
+  };
+}
+
+export function listHermesSessions(
+  connection: Pick<AgentConnection, 'url' | 'token'> & Partial<AgentConnection>,
+  limit = 60,
+) {
+  return brioFetch<{ sessions: HermesSession[]; error?: string }>(connection, `/v1/sessions?limit=${limit}`);
+}
+
+export function getHermesSessionMessages(
+  connection: Pick<AgentConnection, 'url' | 'token'> & Partial<AgentConnection>,
+  sessionId: string,
+) {
+  return brioFetch<{ messages: HermesSessionMessage[]; error?: string }>(
+    connection,
+    `/v1/sessions/${encodeURIComponent(sessionId)}/messages`,
+  );
+}
+
+export function hermesResponseText(response: HermesResponse) {
+  if (response.output_text?.trim()) return response.output_text.trim();
+  const parts = (response.output ?? []).flatMap((item) =>
+    (item.content ?? [])
+      .filter((part) => part.type === 'output_text' || part.type === 'text' || Boolean(part.text))
+      .map((part) => part.text?.trim())
+      .filter((text): text is string => Boolean(text)),
+  );
+  if (parts.length) return parts.join('\n\n');
+  const error = typeof response.error === 'string' ? response.error : response.error?.message;
+  return error?.trim() || 'Brio completed the request without a text response.';
 }
 
 export type PairingPayload = {
@@ -149,7 +302,7 @@ export function decodePairingPayload(raw: string): PairingPayload {
 export function extractPairingPayload(raw: string): PairingPayload {
   const value = raw.trim();
   if (!value) {
-    throw new Error('Hermes reply is empty');
+    throw new Error('Agent reply is empty');
   }
 
   const notReadyMatch = value.match(/^\s*NOT\s+READY\s*:\s*(.+)$/is);
@@ -178,7 +331,7 @@ export function extractPairingPayload(raw: string): PairingPayload {
   const tokenMatch = value.match(/(?:^|\n)\s*token\s*:\s*([^\s]+)/i);
 
   if (!urlMatch || !tokenMatch) {
-    throw new Error('Could not find a pairing payload or URL/token in the Hermes reply');
+    throw new Error('Could not find a pairing payload or URL/token in the agent reply');
   }
 
   return {
@@ -190,16 +343,31 @@ export function extractPairingPayload(raw: string): PairingPayload {
 }
 
 export function connectionFromPairingPayload(payload: PairingPayload): AgentConnection {
+  if (!payload || typeof payload !== 'object') {
+    throw new Error('Pairing payload must be an object');
+  }
   const transport = payload.transport ?? payload.mode ?? 'direct';
+  if (transport !== 'direct' && transport !== 'relay') {
+    throw new Error('Pairing payload has an unsupported transport');
+  }
+  if (typeof payload.url !== 'string' || !payload.url.trim()) {
+    throw new Error('Pairing payload is missing a server URL');
+  }
+  if (transport === 'direct' && (typeof payload.token !== 'string' || !payload.token.trim())) {
+    throw new Error('Pairing payload is missing a direct connection token');
+  }
+  if (transport === 'relay' && (typeof payload.code !== 'string' || !payload.code.trim())) {
+    throw new Error('Relay pairing payload is missing a pairing code');
+  }
   return {
     id: payload.agent_id ?? 'self-hosted-local',
-    name: 'Hermes',
+    name: 'Brio Agent',
     mode: 'self_hosted',
     transport,
     status: 'connecting',
     capabilities: {},
-    url: payload.url,
-    token: payload.token,
+    url: payload.url.trim(),
+    token: typeof payload.token === 'string' ? payload.token.trim() : '',
     agentId: payload.agent_id,
     pairingCode: payload.code,
   };
@@ -264,7 +432,7 @@ export async function listRelayAgents(relayURL: string, relayToken: string) {
 export async function createRelayEnrollment(
   relayURL: string,
   relayToken: string,
-  name = 'Hermes',
+  name = 'Brio Agent',
 ) {
   const response = await fetch(`${normalizeBaseURL(relayURL)}/enrollments`, {
     method: 'POST',
@@ -308,21 +476,222 @@ export async function recoverRelayAgent(
 }
 
 type RelayFrame = {
-  type: 'request' | 'response' | 'error';
+  type: 'request' | 'response' | 'stream_chunk' | 'stream_end' | 'error' | 'ping' | 'pong';
   id: string;
   method?: string;
   path?: string;
   status?: number;
   headers?: Record<string, string>;
   body?: unknown;
+  data?: string;
   code?: string;
   message?: string;
 };
+
+type PendingRelayRequest = {
+  resolve: (value: unknown) => void;
+  reject: (error: Error) => void;
+  timer: ReturnType<typeof setTimeout>;
+  chunks: unknown[];
+  onChunk?: (chunk: string) => void;
+};
+
+const relayClients = new Map<string, RelaySocketClient>();
+
+class RelaySocketClient {
+  private socket: WebSocket | null = null;
+  private opening: Promise<void> | null = null;
+  private pending = new Map<string, PendingRelayRequest>();
+
+  constructor(private readonly wsURL: string) {}
+
+  request<T>(frame: RelayFrame, timeoutMs = 5 * 60 * 1000, onChunk?: (chunk: string) => void): Promise<T> {
+    return this.connect().then(
+      () =>
+        new Promise<T>((resolve, reject) => {
+          const socket = this.socket;
+          if (!socket || socket.readyState !== WebSocket.OPEN) {
+            reject(new Error('Relay connection is not open'));
+            return;
+          }
+
+          const timer = setTimeout(() => {
+            if (this.pending.delete(frame.id)) {
+              reject(new Error('Relay request timed out'));
+            }
+          }, timeoutMs);
+
+          this.pending.set(frame.id, {
+            resolve: (value) => resolve(value as T),
+            reject,
+            timer,
+            chunks: [],
+            onChunk,
+          });
+
+          try {
+            socket.send(JSON.stringify(frame));
+          } catch (error) {
+            this.clearPending(frame.id);
+            reject(error instanceof Error ? error : new Error(String(error)));
+          }
+        }),
+    );
+  }
+
+  private connect(): Promise<void> {
+    if (this.socket?.readyState === WebSocket.OPEN) {
+      return Promise.resolve();
+    }
+    if (this.opening) {
+      return this.opening;
+    }
+
+    this.opening = new Promise<void>((resolve, reject) => {
+      const socket = new WebSocket(this.wsURL);
+      this.socket = socket;
+
+      const connectTimer = setTimeout(() => {
+        if (this.socket === socket) {
+          socket.close();
+          this.socket = null;
+        }
+        this.opening = null;
+        reject(new Error('Relay connection timed out'));
+      }, 15000);
+
+      socket.onopen = () => {
+        clearTimeout(connectTimer);
+        this.opening = null;
+        resolve();
+      };
+
+      socket.onerror = () => {
+        clearTimeout(connectTimer);
+        if (this.opening) {
+          this.opening = null;
+          reject(new Error('Relay connection failed'));
+        }
+      };
+
+      socket.onmessage = (event) => {
+        this.handleMessage(String(event.data));
+      };
+
+      socket.onclose = () => {
+        clearTimeout(connectTimer);
+        if (this.socket === socket) {
+          this.socket = null;
+        }
+        this.opening = null;
+        this.rejectAll(new Error('Relay connection closed'));
+      };
+    });
+
+    return this.opening;
+  }
+
+  private handleMessage(data: string) {
+    let frame: RelayFrame;
+    try {
+      frame = JSON.parse(data) as RelayFrame;
+    } catch {
+      return;
+    }
+
+    if (frame.type === 'ping') {
+      if (this.socket?.readyState === WebSocket.OPEN) {
+        this.socket.send(JSON.stringify({ type: 'pong', id: frame.id } satisfies RelayFrame));
+      }
+      return;
+    }
+
+    const pending = this.pending.get(frame.id);
+    if (!pending) {
+      return;
+    }
+
+    if (frame.type === 'stream_chunk') {
+      if (pending.onChunk) {
+        try {
+          pending.onChunk(String(frame.data ?? frame.body ?? ''));
+        } catch (error) {
+          this.clearPending(frame.id);
+          pending.reject(error instanceof Error ? error : new Error(String(error)));
+        }
+        return;
+      }
+      pending.chunks.push(frame.body ?? frame.data ?? null);
+      return;
+    }
+
+    this.clearPending(frame.id);
+
+    if (frame.type === 'error') {
+      pending.reject(new Error(frame.message ?? frame.code ?? 'Relay request failed'));
+      return;
+    }
+
+    if (frame.type === 'stream_end') {
+      if (frame.body !== undefined) {
+        pending.resolve(frame.body);
+        return;
+      }
+      if (pending.chunks.length === 0) {
+        pending.resolve(null);
+        return;
+      }
+      if (pending.chunks.every((chunk) => typeof chunk === 'string')) {
+        const combined = pending.chunks.join('');
+        try {
+          pending.resolve(JSON.parse(combined));
+        } catch {
+          pending.reject(new Error('Relay returned streamed data that could not be decoded'));
+        }
+        return;
+      }
+      if (pending.chunks.length === 1) {
+        pending.resolve(pending.chunks[0]);
+        return;
+      }
+      pending.reject(new Error('Relay returned an unsupported streamed response'));
+      return;
+    }
+
+    if ((frame.status ?? 500) >= 400) {
+      const message =
+        typeof frame.body === 'object' && frame.body && 'error' in frame.body
+          ? String((frame.body as { error?: unknown }).error)
+          : `Request failed: ${frame.status}`;
+      pending.reject(new Error(message));
+      return;
+    }
+
+    pending.resolve(frame.body);
+  }
+
+  private clearPending(id: string) {
+    const pending = this.pending.get(id);
+    if (pending) {
+      clearTimeout(pending.timer);
+      this.pending.delete(id);
+    }
+  }
+
+  private rejectAll(error: Error) {
+    for (const [id, pending] of this.pending) {
+      clearTimeout(pending.timer);
+      pending.reject(error);
+      this.pending.delete(id);
+    }
+  }
+}
 
 function relayFetch<T>(
   connection: Pick<AgentConnection, 'url' | 'token'> & Partial<AgentConnection>,
   path: string,
   init: RequestInit,
+  onChunk?: (chunk: string) => void,
 ): Promise<T> {
   const agentId = connection.agentId ?? connection.id;
   if (!agentId) {
@@ -347,42 +716,12 @@ function relayFetch<T>(
     body,
   };
 
-  return new Promise<T>((resolve, reject) => {
-    const socket = new WebSocket(wsURL);
-    const timeout = setTimeout(() => {
-      socket.close();
-      reject(new Error('Relay request timed out'));
-    }, 30000);
-
-    socket.onopen = () => {
-      socket.send(JSON.stringify(requestFrame));
-    };
-    socket.onerror = () => {
-      clearTimeout(timeout);
-      reject(new Error('Relay connection failed'));
-    };
-    socket.onmessage = (event) => {
-      const frame = JSON.parse(String(event.data)) as RelayFrame;
-      if (frame.id !== frameId) {
-        return;
-      }
-      clearTimeout(timeout);
-      socket.close();
-      if (frame.type === 'error') {
-        reject(new Error(frame.message ?? frame.code ?? 'Relay request failed'));
-        return;
-      }
-      if ((frame.status ?? 500) >= 400) {
-        const message =
-          typeof frame.body === 'object' && frame.body && 'error' in frame.body
-            ? String((frame.body as { error?: unknown }).error)
-            : `Request failed: ${frame.status}`;
-        reject(new Error(message));
-        return;
-      }
-      resolve(frame.body as T);
-    };
-  });
+  let client = relayClients.get(wsURL);
+  if (!client) {
+    client = new RelaySocketClient(wsURL);
+    relayClients.set(wsURL, client);
+  }
+  return client.request<T>(requestFrame, 5 * 60 * 1000, onChunk);
 }
 
 function relayTunnelURL(baseURL: string, agentId: string, relayToken: string) {
