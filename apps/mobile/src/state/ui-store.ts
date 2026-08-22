@@ -4,7 +4,7 @@ import { create } from 'zustand';
 
 import { DashboardThemes, type DashboardThemeName } from '@/constants/theme';
 
-const STORAGE_KEY = 'brio.dashboardTheme.v1';
+const STORAGE_KEY = 'brio.dashboardTheme.v2';
 
 type UIState = {
   hydrated: boolean;

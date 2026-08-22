@@ -3,6 +3,7 @@ package cli
 import (
 	"log/slog"
 	"os"
+	"strings"
 
 	"github.com/brio/brio/apps/relay/internal/server"
 	"github.com/spf13/cobra"
@@ -31,6 +32,8 @@ func serveCommand() *cobra.Command {
 	}
 	cmd.Flags().StringVar(&cfg.Addr, "addr", envDefault("BRIO_RELAY_ADDR", ":8080"), "HTTP bind address")
 	cmd.Flags().StringVar(&cfg.DatabaseURL, "database-url", envDefault("BRIO_DATABASE_URL", ""), "Postgres database URL")
+	cmd.Flags().StringSliceVar(&cfg.AllowedOrigins, "allowed-origin", envList("BRIO_RELAY_ALLOWED_ORIGINS"), "allowed browser origin for CORS and WebSocket upgrades; repeatable")
+	cmd.Flags().StringVar(&cfg.DeviceRegistrationKey, "device-registration-key", envDefault("BRIO_DEVICE_REGISTRATION_KEY", ""), "optional key required to create relay device tokens")
 	return cmd
 }
 
@@ -39,4 +42,19 @@ func envDefault(key string, fallback string) string {
 		return value
 	}
 	return fallback
+}
+
+func envList(key string) []string {
+	raw := strings.TrimSpace(os.Getenv(key))
+	if raw == "" {
+		return nil
+	}
+	parts := strings.Split(raw, ",")
+	out := make([]string, 0, len(parts))
+	for _, part := range parts {
+		if value := strings.TrimSpace(part); value != "" {
+			out = append(out, value)
+		}
+	}
+	return out
 }

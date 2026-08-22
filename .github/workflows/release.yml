@@ -1,0 +1,93 @@
+name: Release brio connector
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.work
+          cache-dependency-path: |
+            apps/connect/go.sum
+            apps/relay/go.sum
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: apps/mobile/package-lock.json
+      - run: npm ci --ignore-scripts
+        working-directory: apps/mobile
+      - run: make check
+
+  build:
+    needs: validate
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - goos: linux
+            goarch: amd64
+            asset: brio-linux-amd64
+          - goos: linux
+            goarch: arm64
+            asset: brio-linux-arm64
+          - goos: darwin
+            goarch: amd64
+            asset: brio-darwin-amd64
+          - goos: darwin
+            goarch: arm64
+            asset: brio-darwin-arm64
+          - goos: windows
+            goarch: amd64
+            asset: brio-windows-amd64.exe
+          - goos: windows
+            goarch: arm64
+            asset: brio-windows-arm64.exe
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.work
+          cache-dependency-path: |
+            apps/connect/go.sum
+      - name: Build ${{ matrix.asset }}
+        env:
+          CGO_ENABLED: "0"
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+        run: go build -trimpath -ldflags="-s -w" -o "dist/${{ matrix.asset }}" ./apps/connect
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset }}
+          path: dist/${{ matrix.asset }}
+          if-no-files-found: error
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Generate checksums
+        run: sha256sum dist/* > dist/checksums.txt
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: gh release create "$TAG" dist/* scripts/install.sh --verify-tag --generate-notes --title "Brio $TAG"

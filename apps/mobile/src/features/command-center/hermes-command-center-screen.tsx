@@ -23,14 +23,12 @@ import {
   type HermesControlEvent,
   type HermesSubagent,
 } from '@/lib/brio';
-import { useConnectionStore } from '@/state/connection-store';
 
 export function HermesCommandCenterScreen({ connection }: { connection: AgentConnection }) {
   const colors = useT3Theme();
   const router = useRouter();
   const queryClient = useQueryClient();
-  const savedConnections = useConnectionStore((state) => state.connections);
-  const environments = savedConnections.length ? savedConnections : [connection];
+  const environments = [connection];
   const [environmentId, setEnvironmentId] = useState(connection.id);
   const activeConnection =
     environments.find((item) => item.id === environmentId) ?? connection;
