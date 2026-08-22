@@ -3,7 +3,7 @@ import { ActivityIndicator, Pressable, ScrollView, StyleSheet, View } from 'reac
 import { SafeAreaView } from 'react-native-safe-area-context';
 
 import { DashboardCard, SectionLabel, StatusBadge } from '@/components/dashboard';
-import { brioFetch, getCapabilities, getHealth, isAgentHealthy } from '@/lib/brio';
+import { brioFetch, getCapabilities, getHealth, isAgentHealthy, listHermesSessions } from '@/lib/brio';
 import { ThemedText } from '@/components/themed-text';
 import { ThemedView } from '@/components/themed-view';
 import { BottomTabInset, MaxContentWidth, Spacing } from '@/constants/theme';
@@ -26,13 +26,14 @@ export default function ManageScreen() {
   });
   const sessions = useQuery({
     queryKey: ['sessions', connection?.url],
-    queryFn: () => brioFetch<{ sessions: unknown[] }>(connection!, '/v1/sessions?limit=5'),
+    queryFn: () => listHermesSessions(connection!, 5),
     enabled: Boolean(connection),
   });
+  const hasConnectorMemory = connection?.transport === 'relay';
   const memory = useQuery({
     queryKey: ['memory', connection?.url],
     queryFn: () => brioFetch<{ memory: string; user: string }>(connection!, '/v1/memory'),
-    enabled: Boolean(connection),
+    enabled: Boolean(connection) && hasConnectorMemory,
   });
 
   if (!connection) {
@@ -67,9 +68,9 @@ export default function ManageScreen() {
           title="Capabilities"
           loading={capabilities.isLoading}
           rows={[
-            ['Files', capabilities.data?.companion?.files ? 'available' : 'unknown'],
-            ['Sessions', capabilities.data?.companion?.sessions ? 'available' : 'unknown'],
-            ['Gateway', capabilities.data?.companion?.gateway ? 'available' : 'unknown'],
+            ['Responses API', capabilities.data?.features?.responses_api ? 'available' : 'unknown'],
+            ['Sessions', capabilities.data?.features?.session_resources ? 'available' : 'unknown'],
+            ['Memory writes', hasConnectorMemory ? 'available through Brio' : 'not exposed by Hermes'],
           ]}
           onRefresh={() => void capabilities.refetch()}
         />
@@ -84,15 +85,17 @@ export default function ManageScreen() {
           onRefresh={() => void sessions.refetch()}
         />
 
-        <StatusCard
-          title="Memory"
-          loading={memory.isLoading}
-          rows={[
-            ['MEMORY.md', `${memory.data?.memory?.length ?? 0} chars`],
-            ['USER.md', `${memory.data?.user?.length ?? 0} chars`],
-          ]}
-          onRefresh={() => void memory.refetch()}
-        />
+        {hasConnectorMemory ? (
+          <StatusCard
+            title="Memory"
+            loading={memory.isLoading}
+            rows={[
+              ['MEMORY.md', `${memory.data?.memory?.length ?? 0} chars`],
+              ['USER.md', `${memory.data?.user?.length ?? 0} chars`],
+            ]}
+            onRefresh={() => void memory.refetch()}
+          />
+        ) : null}
       </SafeAreaView>
     </ScrollView>
   );

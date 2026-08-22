@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"testing/iotest"
 
 	"github.com/brio/brio/apps/connect/internal/tunnel"
 )
@@ -53,10 +54,8 @@ func TestRoutePath(t *testing.T) {
 		{path: "/api/jobs", kind: RouteForward, forwardTo: "/api/jobs"},
 		{path: "/api/jobs/job_1", kind: RouteForward, forwardTo: "/api/jobs/job_1"},
 		{path: "/api/jobs/job_1/pause", kind: RouteForward, forwardTo: "/api/jobs/job_1/pause"},
-		{path: "/v1/sessions", kind: RouteLocal, localName: "sessions"},
-		{path: "/sessions", kind: RouteLocal, localName: "sessions"},
-		{path: "/v1/sessions/sess_1/messages", kind: RouteLocal, localName: "session-messages"},
-		{path: "/sessions/sess_1/messages", kind: RouteLocal, localName: "session-messages"},
+		{path: "/api/sessions", kind: RouteForward, forwardTo: "/api/sessions"},
+		{path: "/api/sessions/sess_1/messages", kind: RouteForward, forwardTo: "/api/sessions/sess_1/messages"},
 		{path: "/v1/memory", kind: RouteLocal, localName: "memory"},
 		{path: "/memory", kind: RouteLocal, localName: "memory"},
 
@@ -72,6 +71,9 @@ func TestRoutePath(t *testing.T) {
 		{path: "/v1/sessions/search", kind: RouteUnknown},
 		{path: "/v1/sessions/sess_1", kind: RouteUnknown},
 		{path: "/v1/sessions/sess_1/messages/extra", kind: RouteUnknown},
+		{path: "/api/sessions/search", kind: RouteUnknown},
+		{path: "/api/sessions/sess_1", kind: RouteUnknown},
+		{path: "/api/sessions/sess_1/messages/extra", kind: RouteUnknown},
 		{path: "/v1/unknown", kind: RouteUnknown},
 		{path: "/", kind: RouteUnknown},
 	}
@@ -137,13 +139,28 @@ func TestServeMapsLegacyAliases(t *testing.T) {
 	collectFrames(context.Background(), t, client, tunnel.Frame{
 		Type: "request", ID: "a3", Method: http.MethodGet, Path: "/api/jobs?status=pending",
 	})
-	for _, want := range []string{"POST /v1/responses", "GET /v1/capabilities", "GET /api/jobs"} {
+	collectFrames(context.Background(), t, client, tunnel.Frame{
+		Type: "request", ID: "a4", Method: http.MethodGet, Path: "/api/sessions?limit=5",
+	})
+	collectFrames(context.Background(), t, client, tunnel.Frame{
+		Type: "request", ID: "a5", Method: http.MethodGet, Path: "/api/sessions/session_1/messages?order=latest",
+	})
+	for _, want := range []string{
+		"POST /v1/responses",
+		"GET /v1/capabilities",
+		"GET /api/jobs",
+		"GET /api/sessions",
+		"GET /api/sessions/session_1/messages",
+	} {
 		if _, ok := seen[want]; !ok {
 			t.Fatalf("alias was not forwarded as %q; seen = %v", want, seen)
 		}
 	}
 	if seen["GET /api/jobs"] != "status=pending" {
 		t.Fatalf("query string was dropped: %q", seen["GET /api/jobs"])
+	}
+	if seen["GET /api/sessions"] != "limit=5" || seen["GET /api/sessions/session_1/messages"] != "order=latest" {
+		t.Fatalf("session query strings were dropped: %v", seen)
 	}
 }
 
@@ -214,13 +231,12 @@ func TestServeForwardsSSEAsStreamFrames(t *testing.T) {
 
 	var end *tunnel.Frame
 	chunks := 0
+	var streamed strings.Builder
 	for i := range frames {
 		switch frames[i].Type {
 		case "stream_chunk":
 			chunks++
-			if !strings.Contains(frames[i].Data, "response.output_text.delta") && !strings.Contains(frames[i].Data, "response.completed") {
-				t.Fatalf("chunk data = %q, want SSE bytes", frames[i].Data)
-			}
+			streamed.WriteString(frames[i].Data)
 		case "stream_end":
 			end = &frames[i]
 		case "error":
@@ -230,55 +246,72 @@ func TestServeForwardsSSEAsStreamFrames(t *testing.T) {
 	if chunks == 0 {
 		t.Fatal("expected at least one stream chunk")
 	}
+	if !strings.Contains(streamed.String(), "response.output_text.delta") || !strings.Contains(streamed.String(), "response.completed") {
+		t.Fatalf("stream data = %q, want the complete SSE events", streamed.String())
+	}
 	if end == nil {
 		t.Fatalf("frames = %+v, want a terminal stream_end", frames)
 	}
 	if end.Status != http.StatusOK {
 		t.Fatalf("stream_end status = %d, want 200", end.Status)
 	}
-	body, ok := end.Body.(map[string]any)
-	if !ok || body["type"] != "response.completed" {
-		t.Fatalf("stream_end body = %#v, want the last SSE data JSON", end.Body)
-	}
-}
-
-func TestServeStreamEndFallsBackPastUnparseableData(t *testing.T) {
-	hermes := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		w.Header().Set("Content-Type", "text/event-stream")
-		_, _ = io.WriteString(w, "data: {\"value\":42}\n\ndata: [DONE]\n\n")
-	}))
-	defer hermes.Close()
-
-	client := &Client{BaseURL: hermes.URL, Home: t.TempDir()}
-	frames := collectFrames(context.Background(), t, client, tunnel.Frame{
-		Type: "request", ID: "s2", Method: http.MethodPost, Path: "/v1/responses",
-	})
-	end := frames[len(frames)-1]
-	if end.Type != "stream_end" {
-		t.Fatalf("last frame = %+v, want stream_end", end)
-	}
-	body, ok := end.Body.(map[string]any)
-	if !ok || body["value"] != float64(42) {
-		t.Fatalf("stream_end body = %#v, want the last parseable data JSON", end.Body)
-	}
-}
-
-func TestServeStreamEndBodyIsNullWithoutValidData(t *testing.T) {
-	hermes := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		w.Header().Set("Content-Type", "text/event-stream")
-		_, _ = io.WriteString(w, "data: not-json\n\ndata: [DONE]\n\n")
-	}))
-	defer hermes.Close()
-
-	client := &Client{BaseURL: hermes.URL, Home: t.TempDir()}
-	frames := collectFrames(context.Background(), t, client, tunnel.Frame{
-		Type: "request", ID: "s3", Method: http.MethodPost, Path: "/v1/responses",
-	})
-	end := frames[len(frames)-1]
-	if end.Type != "stream_end" {
-		t.Fatalf("last frame = %+v, want stream_end", end)
-	}
 	if end.Body != nil {
-		t.Fatalf("stream_end body = %#v, want null", end.Body)
+		t.Fatalf("stream_end body = %#v, want an empty terminal marker", end.Body)
+	}
+}
+
+func TestStreamEventStreamPreservesSplitUTF8(t *testing.T) {
+	sse := "data: {\"type\":\"response.output_text.delta\",\"delta\":\"Olá 👋 世界\"}\n\n"
+	resp := &http.Response{
+		StatusCode: http.StatusOK,
+		Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+		Body:       io.NopCloser(iotest.OneByteReader(strings.NewReader(sse))),
+	}
+	frames := []tunnel.Frame{}
+	err := streamEventStream("unicode", resp, func(frame tunnel.Frame) error {
+		encoded, err := json.Marshal(frame)
+		if err != nil {
+			return err
+		}
+		var decoded tunnel.Frame
+		if err := json.Unmarshal(encoded, &decoded); err != nil {
+			return err
+		}
+		frames = append(frames, decoded)
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("streamEventStream returned error: %v", err)
+	}
+	var got strings.Builder
+	for _, frame := range frames {
+		if frame.Type == "stream_chunk" {
+			got.WriteString(frame.Data)
+		}
+	}
+	if got.String() != sse {
+		t.Fatalf("stream data = %q, want exact UTF-8 %q", got.String(), sse)
+	}
+	if strings.ContainsRune(got.String(), '\uFFFD') {
+		t.Fatalf("stream data contains a replacement character: %q", got.String())
+	}
+}
+
+func TestStreamEventStreamRejectsOversizedLine(t *testing.T) {
+	resp := &http.Response{
+		StatusCode: http.StatusOK,
+		Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+		Body:       io.NopCloser(strings.NewReader(strings.Repeat("a", maxStreamBytes+1))),
+	}
+	frames := []tunnel.Frame{}
+	err := streamEventStream("large-stream", resp, func(frame tunnel.Frame) error {
+		frames = append(frames, frame)
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("streamEventStream returned error: %v", err)
+	}
+	if len(frames) != 1 || frames[0].Type != "error" || frames[0].Code != "RESPONSE_TOO_LARGE" {
+		t.Fatalf("frames = %+v, want one RESPONSE_TOO_LARGE error", frames)
 	}
 }
