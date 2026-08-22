@@ -12,8 +12,8 @@ This project uses a control-plane enrollment model as the primary way to connect
   - The `brio` connector binary.
   - `brio setup` enables the stock Hermes API server in `~/.hermes/.env`, claims an enrollment code, persists state under `~/.brio/`, and installs/starts the service.
   - `brio connect` keeps an outbound WebSocket tunnel to the relay (no local HTTP listener).
-  - Forwards `/v1/responses`, `/v1/runs...`, `/api/jobs...`, `/v1/capabilities`, `/health` (plus `/chat/responses` and `/capabilities` aliases) to the Hermes API server with the local `API_SERVER_KEY`.
-  - Serves `/v1/sessions`, `/v1/sessions/{id}/messages`, and `/v1/memory` from `~/.hermes` directly (state.db + memories/, legacy paths too).
+  - Forwards `/v1/responses`, `/v1/runs...`, `/api/jobs...`, `/api/sessions`, `/api/sessions/{id}/messages`, `/v1/capabilities`, and `/health` (plus `/chat/responses` and `/capabilities` aliases) to the Hermes API server with the local `API_SERVER_KEY`.
+  - Serves `/v1/memory` from `~/.hermes/memories` directly (legacy `/memory` too); session state remains owned and shaped by the Hermes API server.
   - Everything else is a 404 error frame; there are no file/config/gateway/skills/tools/logs endpoints anymore.
 - hermes-agent (stock)
   - Only needs its built-in API server (`http://127.0.0.1:8642`, bearer `API_SERVER_KEY`).
@@ -156,7 +156,7 @@ Setup also merges into `~/.hermes/.env` (preserving unrelated keys):
 - Keep direct local connect (Hermes API server on the LAN) as a fallback for development and offline debugging.
 - Recovery is owner-authenticated and intentionally separate from normal enrollment.
 - Mobile relay sign-in is still lightweight and not a production identity system yet.
-- The mobile app speaks Hermes-native `/v1/*` paths; the connector also maps legacy companion-era paths for compatibility.
+- The mobile app speaks Hermes-native `/v1/*` and `/api/sessions` paths; the connector maps only the remaining companion-era chat/capability aliases for compatibility.
 - Releases publish connector binaries again: pushing a `v*` tag builds
   linux/darwin/windows amd64/arm64 assets plus `checksums.txt`, and
   `scripts/install.sh` downloads them with checksum verification.

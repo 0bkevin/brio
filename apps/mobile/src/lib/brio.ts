@@ -5,6 +5,12 @@ import {
   parseGoalStatus,
   parseHeartbeatStatus,
 } from './control-model';
+import {
+  normalizeHermesSessionMessages,
+  normalizeHermesSessions,
+  type HermesSession,
+  type HermesSessionMessage,
+} from './hermes-api';
 import { ResponsesSSEParser, type HermesResponse } from './responses-sse';
 
 export {
@@ -15,6 +21,7 @@ export {
 } from './control-model';
 
 export type { HermesResponse } from './responses-sse';
+export type { HermesSession, HermesSessionMessage } from './hermes-api';
 
 export type AgentConnection = {
   id: string;
@@ -54,6 +61,12 @@ export function isAgentHealthy(health: HealthResponse | null | undefined) {
 export type CapabilitiesResponse = {
   companion?: Record<string, unknown>;
   hermes?: unknown;
+  features?: {
+    session_resources?: boolean;
+    memory_write_api?: boolean;
+    [key: string]: unknown;
+  };
+  endpoints?: Record<string, { method?: string; path?: string }>;
 };
 
 export type HermesControlSession = {
@@ -242,24 +255,6 @@ export function getCapabilities(
   return brioFetch<CapabilitiesResponse>(connection, '/v1/capabilities');
 }
 
-export type HermesSession = {
-  id: string;
-  source: string;
-  user_id?: string;
-  model?: string;
-  started_at: number;
-  ended_at?: number | null;
-  message_count: number;
-  title?: string;
-};
-
-export type HermesSessionMessage = {
-  role: string;
-  content: string;
-  tool_name?: string;
-  timestamp: number;
-};
-
 export function controlRPC<T>(
   connection: AgentConnection,
   method: string,
@@ -430,13 +425,12 @@ export async function sendResponseStream(
   const body = JSON.stringify(responseRequestBody(prompt, options, true));
 
   if (connection.transport === 'relay') {
-    const terminal = await relayFetch<HermesResponse | null>(
+    await relayFetch<null>(
       connection,
       '/v1/responses',
       { method: 'POST', body },
       (chunk) => parser.push(chunk),
     );
-    if (terminal) return terminal;
     return parser.finish();
   }
 
@@ -496,21 +490,23 @@ function responseRequestBody(
   };
 }
 
-export function listHermesSessions(
+export async function listHermesSessions(
   connection: Pick<AgentConnection, 'url' | 'token'> & Partial<AgentConnection>,
   limit = 60,
 ) {
-  return brioFetch<{ sessions: HermesSession[]; error?: string }>(connection, `/v1/sessions?limit=${limit}`);
+  const result = await brioFetch<{ data?: HermesSession[] }>(connection, `/api/sessions?limit=${limit}`);
+  return normalizeHermesSessions(result);
 }
 
-export function getHermesSessionMessages(
+export async function getHermesSessionMessages(
   connection: Pick<AgentConnection, 'url' | 'token'> & Partial<AgentConnection>,
   sessionId: string,
 ) {
-  return brioFetch<{ messages: HermesSessionMessage[]; error?: string }>(
+  const result = await brioFetch<{ data?: HermesSessionMessage[] }>(
     connection,
-    `/v1/sessions/${encodeURIComponent(sessionId)}/messages`,
+    `/api/sessions/${encodeURIComponent(sessionId)}/messages`,
   );
+  return normalizeHermesSessionMessages(result);
 }
 
 export function hermesResponseText(response: HermesResponse) {
@@ -884,6 +880,10 @@ class RelaySocketClient {
     }
 
     if (frame.type === 'stream_end') {
+      if (pending.onChunk) {
+        pending.resolve(null);
+        return;
+      }
       if (frame.body !== undefined) {
         pending.resolve(frame.body);
         return;

@@ -1,10 +1,10 @@
 // Package hermes routes tunnel request frames: a fixed set of paths is
-// forwarded to the stock Hermes API server with the local API key, the
-// sessions/messages/memory endpoints are served from the Hermes home
-// directory, and everything else is rejected.
+// forwarded to the stock Hermes API server with the local API key, memory is
+// served from the Hermes home directory, and everything else is rejected.
 package hermes
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -60,11 +60,8 @@ type Route struct {
 	Kind RouteKind
 	// Path is the forwarded path after legacy alias mapping.
 	Path string
-	// Name identifies the local handler ("sessions", "session-messages",
-	// "memory").
+	// Name identifies the local handler ("memory").
 	Name string
-	// ID carries the session id for "session-messages".
-	ID string
 }
 
 // RoutePath maps a request path (without query string) to a route. Legacy
@@ -77,8 +74,6 @@ func RoutePath(path string) Route {
 		return Route{Kind: RouteForward, Path: "/v1/capabilities"}
 	case "/v1/responses", "/chat/responses":
 		return Route{Kind: RouteForward, Path: "/v1/responses"}
-	case "/v1/sessions", "/sessions":
-		return Route{Kind: RouteLocal, Name: "sessions"}
 	case "/v1/memory", "/memory":
 		return Route{Kind: RouteLocal, Name: "memory"}
 	case "/control/rpc":
@@ -89,29 +84,26 @@ func RoutePath(path string) Route {
 		return Route{Kind: RouteLocal, Name: "control-background"}
 	case "/control/events":
 		return Route{Kind: RouteLocal, Name: "control-events"}
+	case "/api/sessions":
+		return Route{Kind: RouteForward, Path: path}
 	}
 	switch {
 	case strings.HasPrefix(path, "/v1/runs"), strings.HasPrefix(path, "/api/jobs"):
 		return Route{Kind: RouteForward, Path: path}
 	}
-	if id, ok := sessionMessagesID(path); ok {
-		return Route{Kind: RouteLocal, Name: "session-messages", ID: id}
+	if isSessionMessagesPath(path) {
+		return Route{Kind: RouteForward, Path: path}
 	}
 	return Route{Kind: RouteUnknown}
 }
 
-func sessionMessagesID(path string) (string, bool) {
-	for _, prefix := range []string{"/v1/sessions/", "/sessions/"} {
-		if !strings.HasPrefix(path, prefix) {
-			continue
-		}
-		id, suffix, ok := strings.Cut(strings.TrimPrefix(path, prefix), "/")
-		if !ok || suffix != "messages" || id == "" || strings.Contains(id, "/") {
-			return "", false
-		}
-		return id, true
+func isSessionMessagesPath(path string) bool {
+	const prefix = "/api/sessions/"
+	if !strings.HasPrefix(path, prefix) {
+		return false
 	}
-	return "", false
+	id, suffix, ok := strings.Cut(strings.TrimPrefix(path, prefix), "/")
+	return ok && suffix == "messages" && id != "" && !strings.Contains(id, "/")
 }
 
 func (c *Client) httpClient() *http.Client {
@@ -226,71 +218,44 @@ func (c *Client) forward(ctx context.Context, frame tunnel.Frame, method string,
 	})
 }
 
-// streamEventStream forwards a server-sent-events response as stream_chunk
-// frames. The stream_end body carries the last valid SSE data JSON, or null
-// when none of the data lines parsed.
+// streamEventStream forwards complete SSE lines as stream_chunk frames. Line
+// framing keeps UTF-8 code points intact even when the HTTP body reader splits
+// a multi-byte character across reads. The mobile client owns SSE parsing, so
+// stream_end is only a terminal marker and deliberately carries no body.
 func streamEventStream(id string, resp *http.Response, emit func(tunnel.Frame) error) error {
-	tracker := &sseTracker{}
-	buffer := make([]byte, 32*1024)
+	reader := bufio.NewReader(resp.Body)
+	line := make([]byte, 0, 32*1024)
 	total := 0
 	for {
-		n, readErr := resp.Body.Read(buffer)
-		if n > 0 {
-			total += n
+		fragment, readErr := reader.ReadSlice('\n')
+		if len(fragment) > 0 {
+			total += len(fragment)
 			if total > maxStreamBytes {
 				return emit(errorFrame(id, "RESPONSE_TOO_LARGE", "local response stream is larger than 10 MiB"))
 			}
-			tracker.write(buffer[:n])
-			if err := emit(tunnel.Frame{Type: "stream_chunk", ID: id, Data: string(buffer[:n])}); err != nil {
-				return err
+			line = append(line, fragment...)
+			if readErr != bufio.ErrBufferFull {
+				if err := emit(tunnel.Frame{Type: "stream_chunk", ID: id, Data: string(line)}); err != nil {
+					return err
+				}
+				line = line[:0]
 			}
 		}
 		if readErr != nil {
+			if readErr == bufio.ErrBufferFull {
+				continue
+			}
 			if readErr == io.EOF {
 				return emit(tunnel.Frame{
 					Type:    "stream_end",
 					ID:      id,
 					Status:  resp.StatusCode,
 					Headers: map[string]string{"Content-Type": resp.Header.Get("Content-Type")},
-					Body:    tracker.lastDataJSON(),
 				})
 			}
 			return emit(errorFrame(id, "LOCAL_READ_FAILED", readErr.Error()))
 		}
 	}
-}
-
-// sseTracker incrementally remembers the data payloads of complete SSE lines.
-type sseTracker struct {
-	pending []byte
-	lines   []string
-}
-
-func (t *sseTracker) write(p []byte) {
-	t.pending = append(t.pending, p...)
-	for {
-		index := bytes.IndexByte(t.pending, '\n')
-		if index < 0 {
-			return
-		}
-		line := strings.TrimRight(string(t.pending[:index]), "\r")
-		t.pending = t.pending[index+1:]
-		if rest, ok := strings.CutPrefix(line, "data:"); ok {
-			t.lines = append(t.lines, strings.TrimSpace(rest))
-		}
-	}
-}
-
-// lastDataJSON returns the most recent data line that parses as JSON,
-// scanning backwards, or nil when there is none.
-func (t *sseTracker) lastDataJSON() any {
-	for i := len(t.lines) - 1; i >= 0; i-- {
-		var body any
-		if err := json.Unmarshal([]byte(t.lines[i]), &body); err == nil {
-			return body
-		}
-	}
-	return nil
 }
 
 func errorFrame(id string, code string, message string) tunnel.Frame {
