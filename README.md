@@ -93,12 +93,13 @@ Everything rides the relay tunnel. Per request frame:
 - Forwarded to the stock Hermes API server with
   `Authorization: Bearer API_SERVER_KEY` (replacing any frame credentials):
   `/v1/responses`, `/v1/runs...`, `/api/jobs...`, `/v1/capabilities`,
-  `/health`, plus the legacy aliases `/chat/responses` and `/capabilities`.
-  SSE responses stream as `stream_chunk` frames and finish with a
-  `stream_end` whose body carries the last valid SSE data JSON.
-- Served locally by brio from `~/.hermes` (same JSON shapes as before):
-  `/v1/sessions?limit=` (legacy `/sessions`),
-  `/v1/sessions/{id}/messages` (legacy `/sessions/{id}/messages`), and
+  `/api/sessions`, `/api/sessions/{id}/messages`, `/health`, plus the legacy
+  aliases `/chat/responses` and `/capabilities`. Hermes remains responsible
+  for session filtering, pagination, profiles, and compression lineage.
+  SSE responses stream as complete UTF-8-safe `stream_chunk` frames and
+  finish with an empty `stream_end` marker; the mobile client parses the SSE
+  stream into the terminal Responses API object.
+- Served locally by brio from `~/.hermes`:
   `/v1/memory` GET/PUT (legacy `/memory`) with atomic 0600 writes to
   `memories/MEMORY.md` and `USER.md`. `HERMES_HOME` is respected.
 - Everything else returns a 404-style error frame. The old file/config/
@@ -109,7 +110,9 @@ Everything rides the relay tunnel. Per request frame:
 The app can also reach a Hermes API server directly on a LAN or private
 network (for example over Tailscale): point it at the machine's
 `http://<host>:8642` with the `API_SERVER_KEY` from `~/.hermes/.env`.
-Internet-facing endpoints must terminate HTTPS before the API server.
+Chat and native session history work in direct mode. Memory-file editing is a
+connector-only feature and is hidden for direct connections. Internet-facing
+endpoints must terminate HTTPS before the API server.
 
 ## Configuration
 
