@@ -2,6 +2,9 @@
 
 Expo app for the Brio mobile control plane.
 
+Conversation drafts and queued follow-ups are persisted locally. Queued prompts
+can be paused, reordered, edited, retried, or removed before delivery.
+
 ## Run
 
 From the repo root:

@@ -1,6 +1,6 @@
 import * as Clipboard from 'expo-clipboard';
 import { useQuery } from '@tanstack/react-query';
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   ActivityIndicator,
   KeyboardAvoidingView,
@@ -28,6 +28,8 @@ import {
   type HermesSession,
 } from '@/lib/brio';
 import { createChatId, useChatStore, type ChatMessage, type ChatThread } from '@/state/chat-store';
+import { EMPTY_PROMPT_QUEUE, type QueuedPrompt } from '@/state/composer-store-model';
+import { useComposerStore } from '@/state/composer-store';
 
 const SUGGESTIONS = [
   ['Plan my day', 'Help me plan today. Ask what matters, then turn it into a realistic, prioritized plan.'],
@@ -65,7 +67,6 @@ export function ChatWorkspace({
   const importThread = useChatStore((state) => state.importThread);
   const [showThreads, setShowThreads] = useState(false);
   const [search, setSearch] = useState('');
-  const [prompt, setPrompt] = useState('');
   const [sending, setSending] = useState(false);
   const [streamingText, setStreamingText] = useState('');
   const [sendError, setSendError] = useState('');
@@ -88,6 +89,20 @@ export function ChatWorkspace({
   }, [activeThreadId, connectionKey, connectionThreads, createThread, hydrated]);
 
   const activeThread = connectionThreads.find((thread) => thread.id === activeThreadId) ?? null;
+  const composerKey = activeThread?.id ?? '';
+  const composerHydrated = useComposerStore((state) => state.hydrated);
+  const prompt = useComposerStore((state) => state.drafts[composerKey] ?? '');
+  const queue = useComposerStore((state) => state.queues[composerKey] ?? EMPTY_PROMPT_QUEUE);
+  const queuePaused = useComposerStore((state) => Boolean(state.paused[composerKey]));
+  const setDraft = useComposerStore((state) => state.setDraft);
+  const enqueueDraft = useComposerStore((state) => state.enqueueDraft);
+  const claimNext = useComposerStore((state) => state.claimNext);
+  const acknowledgePrompt = useComposerStore((state) => state.acknowledge);
+  const failPrompt = useComposerStore((state) => state.fail);
+  const retryPrompt = useComposerStore((state) => state.retry);
+  const removePrompt = useComposerStore((state) => state.remove);
+  const movePrompt = useComposerStore((state) => state.move);
+  const setQueuePaused = useComposerStore((state) => state.setPaused);
   const sortedThreads = useMemo(
     () => [...connectionThreads].sort((a, b) => b.updatedAt - a.updatedAt),
     [connectionThreads],
@@ -121,8 +136,8 @@ export function ChatWorkspace({
   }
 
   function startNewThread(initialPrompt?: string) {
-    createThread(connectionKey);
-    setPrompt(initialPrompt ?? '');
+    const threadId = createThread(connectionKey);
+    setDraft(threadId, initialPrompt ?? '');
     setShowThreads(false);
     setSendError('');
   }
@@ -153,22 +168,13 @@ export function ChatWorkspace({
     }
   }
 
-  async function submitPrompt(value = prompt) {
-    const content = value.trim();
-    if (!content || sending || !activeThread) return;
-
-    const threadId = activeThread.id;
-    const history = activeThread.messages.map((message) => ({
+  const deliverPrompt = useCallback(async (queuedPrompt: QueuedPrompt, thread: ChatThread) => {
+    const content = queuedPrompt.text.trim();
+    const threadId = thread.id;
+    const history = thread.messages.map((message) => ({
       role: message.role,
       content: message.content,
     }));
-    addMessage(threadId, {
-      id: createChatId('message'),
-      role: 'user',
-      content,
-      createdAt: Date.now(),
-    });
-    setPrompt('');
     setSendError('');
     setSending(true);
     setStreamingText('');
@@ -182,15 +188,15 @@ export function ChatWorkspace({
       try {
         response = await sendResponseStream(connection, content, {
           conversation: threadId,
-          previousResponseId: activeThread.lastResponseId,
+          previousResponseId: thread.lastResponseId,
           conversationHistory:
-            activeThread.needsHistorySeed || (!activeThread.lastResponseId && history.length)
+            thread.needsHistorySeed || (!thread.lastResponseId && history.length)
               ? history
               : undefined,
           onTextDelta,
         });
       } catch (error) {
-        if (!activeThread.lastResponseId) throw error;
+        if (!thread.lastResponseId) throw error;
         setStreamingText('');
         response = await sendResponseStream(connection, content, {
           conversation: threadId,
@@ -198,6 +204,12 @@ export function ChatWorkspace({
           onTextDelta,
         });
       }
+      addMessage(threadId, {
+        id: createChatId('message'),
+        role: 'user',
+        content,
+        createdAt: queuedPrompt.createdAt,
+      });
       completeResponse(
         threadId,
         {
@@ -208,13 +220,35 @@ export function ChatWorkspace({
         },
         response.id,
       );
+      await acknowledgePrompt(threadId, queuedPrompt.id);
       void sessions.refetch();
     } catch (error) {
-      setSendError(error instanceof Error ? error.message : 'Brio could not complete the request');
+      const message = error instanceof Error ? error.message : 'Brio could not complete the request';
+      setSendError(message);
+      await failPrompt(threadId, queuedPrompt.id, message);
     } finally {
       setSending(false);
       setStreamingText('');
     }
+  }, [acknowledgePrompt, addMessage, completeResponse, connection, failPrompt, sessions]);
+
+  useEffect(() => {
+    if (!composerHydrated || !activeThread || sending || queuePaused) return;
+    void claimNext(composerKey).then((nextPrompt) => {
+      if (nextPrompt) void deliverPrompt(nextPrompt, activeThread);
+    });
+  }, [activeThread, claimNext, composerHydrated, composerKey, deliverPrompt, queue, queuePaused, sending]);
+
+  async function submitPrompt(value = prompt) {
+    const content = value.trim();
+    if (!content || !composerHydrated || !activeThread) return;
+    await enqueueDraft(activeThread.id, content);
+  }
+
+  function editQueuedPrompt(queuedPrompt: QueuedPrompt) {
+    if (!activeThread || prompt.trim()) return;
+    setDraft(activeThread.id, queuedPrompt.text);
+    void removePrompt(activeThread.id, queuedPrompt.id);
   }
 
   if (!hydrated || !activeThread) {
@@ -276,7 +310,11 @@ export function ChatWorkspace({
               ref={scrollRef}
               style={styles.messages}>
               {activeThread.messages.length === 0 ? (
-                <EmptyConversation compact={!wide} connection={connection} onSuggestion={setPrompt} />
+                <EmptyConversation
+                  compact={!wide}
+                  connection={connection}
+                  onSuggestion={(value) => setDraft(composerKey, value)}
+                />
               ) : (
                 activeThread.messages.map((message) => <MessageBubble key={message.id} message={message} />)
               )}
@@ -293,6 +331,19 @@ export function ChatWorkspace({
             </ScrollView>
 
             <View style={[styles.composerArea, !wide && styles.composerAreaMobile]}>
+              {queue.length > 0 ? (
+                <PromptQueue
+                  activePromptId={sending ? queue.find((item) => item.state === 'sending')?.id : undefined}
+                  draftOccupied={Boolean(prompt.trim())}
+                  onEdit={editQueuedPrompt}
+                  onMove={(promptId, offset) => void movePrompt(composerKey, promptId, offset)}
+                  onPause={() => void setQueuePaused(composerKey, !queuePaused)}
+                  onRemove={(promptId) => void removePrompt(composerKey, promptId)}
+                  onRetry={(promptId) => void retryPrompt(composerKey, promptId)}
+                  paused={queuePaused}
+                  prompts={queue}
+                />
+              ) : null}
               {sendError ? (
                 <View style={[styles.errorBanner, { backgroundColor: colors.backgroundSelected }]}>
                   <ThemedText style={{ color: colors.danger }} type="small">
@@ -303,11 +354,10 @@ export function ChatWorkspace({
               <View style={[styles.composer, { backgroundColor: colors.panelStrong, borderColor: colors.border }]}>
                 <TextInput
                   accessibilityLabel="Message Brio"
-                  editable={!sending}
                   maxLength={20000}
                   multiline
-                  onChangeText={setPrompt}
-                  placeholder="Message Brio…"
+                  onChangeText={(value) => setDraft(composerKey, value)}
+                  placeholder={sending ? 'Queue a follow-up…' : 'Message Brio…'}
                   placeholderTextColor={colors.textTertiary}
                   style={[styles.composerInput, { color: colors.text }]}
                   textAlignVertical="top"
@@ -315,23 +365,22 @@ export function ChatWorkspace({
                 />
                 <Pressable
                   accessibilityLabel="Send message"
-                  disabled={sending || !prompt.trim()}
+                  disabled={!composerHydrated || !prompt.trim()}
                   onPress={() => void submitPrompt()}
                   style={({ pressed }) => [
                     styles.sendButton,
                     {
-                      backgroundColor: prompt.trim() && !sending ? colors.accent : colors.backgroundSelected,
+                      backgroundColor: prompt.trim() && composerHydrated ? colors.accent : colors.backgroundSelected,
                       opacity: pressed ? 0.72 : 1,
                     },
                   ]}>
-                  {sending ? (
-                    <ActivityIndicator color={colors.textSecondary} size="small" />
-                  ) : (
-                    <ThemedText
-                      style={{ color: prompt.trim() ? colors.accentText : colors.textDisabled, fontSize: 20 }}>
-                      ↑
-                    </ThemedText>
-                  )}
+                  <ThemedText
+                    style={{
+                      color: prompt.trim() && composerHydrated ? colors.accentText : colors.textDisabled,
+                      fontSize: 20,
+                    }}>
+                    ↑
+                  </ThemedText>
                 </Pressable>
               </View>
               {wide ? (
@@ -344,6 +393,122 @@ export function ChatWorkspace({
         ) : null}
       </View>
     </SafeAreaView>
+  );
+}
+
+function PromptQueue({
+  activePromptId,
+  draftOccupied,
+  onEdit,
+  onMove,
+  onPause,
+  onRemove,
+  onRetry,
+  paused,
+  prompts,
+}: {
+  activePromptId?: string;
+  draftOccupied: boolean;
+  onEdit: (prompt: QueuedPrompt) => void;
+  onMove: (promptId: string, offset: -1 | 1) => void;
+  onPause: () => void;
+  onRemove: (promptId: string) => void;
+  onRetry: (promptId: string) => void;
+  paused: boolean;
+  prompts: QueuedPrompt[];
+}) {
+  const colors = useTheme();
+  return (
+    <View style={[styles.queueShell, { backgroundColor: colors.panel, borderColor: colors.border }]}>
+      <View style={styles.queueHeader}>
+        <ThemedText type="smallBold">
+          {prompts.length} queued {prompts.length === 1 ? 'prompt' : 'prompts'}
+        </ThemedText>
+        <Pressable accessibilityRole="button" onPress={onPause}>
+          <ThemedText style={{ color: colors.accent }} type="smallBold">
+            {paused ? 'Resume' : 'Pause'}
+          </ThemedText>
+        </Pressable>
+      </View>
+      <ScrollView nestedScrollEnabled style={styles.queueList}>
+        {prompts.map((queuedPrompt, index) => {
+          const sending = activePromptId === queuedPrompt.id;
+          const uncertain = queuedPrompt.state === 'sending' && !sending;
+          const canEdit = queuedPrompt.state !== 'sending' && !draftOccupied;
+          const status = sending
+            ? 'Sending…'
+            : uncertain
+              ? 'Delivery unconfirmed — check the conversation before retrying.'
+              : queuedPrompt.state === 'failed'
+                ? `Not confirmed${queuedPrompt.error ? `: ${queuedPrompt.error}` : ''}`
+                : paused
+                  ? 'Paused'
+                  : `Queued ${index + 1}`;
+          return (
+            <View key={queuedPrompt.id} style={[styles.queueItem, { borderColor: colors.border }]}>
+              <View style={styles.queueCopy}>
+                <ThemedText numberOfLines={2} type="smallBold">{queuedPrompt.text}</ThemedText>
+                <ThemedText numberOfLines={2} themeColor="textTertiary" type="small">{status}</ThemedText>
+              </View>
+              {!sending ? (
+                <View style={styles.queueActions}>
+                  {queuedPrompt.state !== 'pending' ? (
+                    <QueueAction label="Retry" onPress={() => onRetry(queuedPrompt.id)} />
+                  ) : (
+                    <>
+                      <QueueAction
+                        disabled={index === 0}
+                        label="↑"
+                        onPress={() => onMove(queuedPrompt.id, -1)}
+                      />
+                      <QueueAction
+                        disabled={index === prompts.length - 1}
+                        label="↓"
+                        onPress={() => onMove(queuedPrompt.id, 1)}
+                      />
+                    </>
+                  )}
+                  {queuedPrompt.state !== 'sending' ? (
+                    <QueueAction
+                      disabled={!canEdit}
+                      label="Edit"
+                      onPress={() => onEdit(queuedPrompt)}
+                    />
+                  ) : null}
+                  <QueueAction label="Delete" onPress={() => onRemove(queuedPrompt.id)} tone="danger" />
+                </View>
+              ) : null}
+            </View>
+          );
+        })}
+      </ScrollView>
+    </View>
+  );
+}
+
+function QueueAction({
+  disabled,
+  label,
+  onPress,
+  tone = 'normal',
+}: {
+  disabled?: boolean;
+  label: string;
+  onPress: () => void;
+  tone?: 'normal' | 'danger';
+}) {
+  const colors = useTheme();
+  return (
+    <Pressable accessibilityRole="button" disabled={disabled} onPress={onPress}>
+      <ThemedText
+        style={{
+          color: tone === 'danger' ? colors.danger : colors.accent,
+          opacity: disabled ? 0.3 : 1,
+        }}
+        type="smallBold">
+        {label}
+      </ThemedText>
+    </Pressable>
   );
 }
 
@@ -715,6 +880,12 @@ const styles = StyleSheet.create({
   thinkingRow: { alignItems: 'center', flexDirection: 'row', gap: Spacing.two, minHeight: 34 },
   composerArea: { alignSelf: 'center', maxWidth: 860, paddingBottom: Spacing.two, paddingHorizontal: Spacing.four, width: '100%' },
   composerAreaMobile: { paddingBottom: Spacing.two, paddingHorizontal: Spacing.three },
+  queueShell: { borderRadius: 14, borderWidth: StyleSheet.hairlineWidth, marginBottom: Spacing.two, overflow: 'hidden' },
+  queueHeader: { alignItems: 'center', flexDirection: 'row', justifyContent: 'space-between', paddingHorizontal: Spacing.three, paddingVertical: Spacing.two },
+  queueList: { maxHeight: 220 },
+  queueItem: { alignItems: 'center', borderTopWidth: StyleSheet.hairlineWidth, flexDirection: 'row', gap: Spacing.three, paddingHorizontal: Spacing.three, paddingVertical: Spacing.two },
+  queueCopy: { flex: 1, gap: 2, minWidth: 0 },
+  queueActions: { alignItems: 'center', flexDirection: 'row', flexWrap: 'wrap', gap: Spacing.two, justifyContent: 'flex-end' },
   errorBanner: { borderRadius: 10, marginBottom: Spacing.two, paddingHorizontal: Spacing.three, paddingVertical: Spacing.two },
   composer: { alignItems: 'flex-end', borderRadius: 18, borderWidth: StyleSheet.hairlineWidth, flexDirection: 'row', gap: Spacing.two, minHeight: 58, padding: Spacing.two, paddingLeft: Spacing.three },
   composerInput: { flex: 1, fontSize: 16, lineHeight: 23, maxHeight: 150, minHeight: 40, outlineStyle: 'none', paddingBottom: 8, paddingTop: 8 } as never,

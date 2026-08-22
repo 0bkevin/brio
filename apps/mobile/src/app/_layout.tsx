@@ -5,6 +5,7 @@ import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 
 import { AnimatedSplashOverlay } from '@/components/animated-icon';
 import AppTabs from '@/components/app-tabs';
+import { useComposerStore } from '@/state/composer-store';
 import { useConnectionStore } from '@/state/connection-store';
 import { useRelaySessionStore } from '@/state/relay-session-store';
 import { useUIStore } from '@/state/ui-store';
@@ -13,15 +14,17 @@ const queryClient = new QueryClient();
 
 export default function TabLayout() {
   const colorScheme = useColorScheme();
+  const hydrateComposer = useComposerStore((state) => state.hydrate);
   const hydrate = useConnectionStore((state) => state.hydrate);
   const hydrateRelaySession = useRelaySessionStore((state) => state.hydrate);
   const hydrateUI = useUIStore((state) => state.hydrate);
 
   useEffect(() => {
+    void hydrateComposer();
     void hydrate();
     void hydrateRelaySession();
     void hydrateUI();
-  }, [hydrate, hydrateRelaySession, hydrateUI]);
+  }, [hydrate, hydrateComposer, hydrateRelaySession, hydrateUI]);
 
   return (
     <QueryClientProvider client={queryClient}>
