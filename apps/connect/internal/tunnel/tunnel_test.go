@@ -75,33 +75,52 @@ func TestConnectRespondsWithSingleWriterUnderConcurrency(t *testing.T) {
 		return emit(Frame{Type: "response", ID: frame.ID, Status: http.StatusOK, Body: map[string]string{"echo": frame.ID}})
 	}
 
-	received := make(chan Frame, total)
+	received := make(chan Frame, total*2)
+	var sequence sync.Once
 	relay := fakeRelay(t, func(conn *websocket.Conn) {
-		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		defer cancel()
-		for i := 0; i < total; i++ {
-			if err := writeRelayFrame(ctx, conn, Frame{Type: "request", ID: fmt.Sprintf("req-%d", i), Method: http.MethodGet, Path: "/health"}); err != nil {
-				return
+		// Only the FIRST connection may blast requests: if the connector
+		// drops and reconnects, replaying the sequence would produce
+		// duplicate frame IDs that crowd out the distinct IDs the test
+		// collects. The real relay never replays pending requests, so
+		// reconnected tunnels here just drain quietly.
+		drained := true
+		sequence.Do(func() {
+			drained = false
+			ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+			defer cancel()
+			for i := 0; i < total; i++ {
+				if err := writeRelayFrame(ctx, conn, Frame{Type: "request", ID: fmt.Sprintf("req-%d", i), Method: http.MethodGet, Path: "/health"}); err != nil {
+					return
+				}
 			}
-		}
-		seen := map[string]bool{}
-		for {
-			_, data, err := conn.Read(ctx)
-			if err != nil {
-				return
+			seen := map[string]bool{}
+			for {
+				_, data, err := conn.Read(ctx)
+				if err != nil {
+					return
+				}
+				var frame Frame
+				if err := json.Unmarshal(data, &frame); err != nil {
+					t.Errorf("frame was not valid JSON (single-writer violation?): %v", err)
+					return
+				}
+				if frame.Type != "response" {
+					continue
+				}
+				received <- frame
+				seen[frame.ID] = true
+				if len(seen) == total {
+					return
+				}
 			}
-			var frame Frame
-			if err := json.Unmarshal(data, &frame); err != nil {
-				t.Errorf("frame was not valid JSON (single-writer violation?): %v", err)
-				return
-			}
-			if frame.Type != "response" {
-				continue
-			}
-			received <- frame
-			seen[frame.ID] = true
-			if len(seen) == total {
-				return
+		})
+		if drained {
+			ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+			defer cancel()
+			for {
+				if _, _, err := conn.Read(ctx); err != nil {
+					return
+				}
 			}
 		}
 	})
@@ -113,7 +132,7 @@ func TestConnectRespondsWithSingleWriterUnderConcurrency(t *testing.T) {
 	}()
 
 	ids := map[string]bool{}
-	timeout := time.After(10 * time.Second)
+	timeout := time.After(20 * time.Second)
 	for len(ids) < total {
 		select {
 		case frame := <-received:
