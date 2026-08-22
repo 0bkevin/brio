@@ -116,7 +116,8 @@ const styles = StyleSheet.create({
     left: 0,
     minHeight: '100%',
     paddingTop: Spacing.three,
-    position: 'fixed',
+    // Web-only value; react-native's stock position union stops CI typechecks.
+    position: 'fixed' as never,
     top: 0,
     width: 104,
     zIndex: 10,
