@@ -6,20 +6,22 @@ endif
 BRIO_RELAY_ADDR ?= 127.0.0.1:8082
 WEB_EXPORT_DIR ?= /tmp/brio-web-export
 
-GO_PACKAGES := ./apps/relay/...
+GO_PACKAGES := ./apps/connect/... ./apps/relay/...
 MOBILE_DIR := apps/mobile
 
-.PHONY: help setup check check-static test-go lint-mobile typecheck-mobile test-mobile export-mobile dev-mobile dev-relay tidy
+.PHONY: help setup check check-static test-go lint-mobile typecheck-mobile test-mobile export-mobile dev-mobile dev-relay dev-connect tidy
 
 help:
 	@printf "Brio setup commands:\n"
-	@printf "  make setup        Install dependencies for the relay and mobile app\n"
+	@printf "  make setup        Install dependencies for the connector, relay, and mobile app\n"
 	@printf "  make check        Run Go tests and mobile validation\n"
 	@printf "  make dev-mobile   Start Expo web locally\n"
 	@printf "  make dev-relay    Start the relay on %s\n" "$(BRIO_RELAY_ADDR)"
+	@printf "  make dev-connect  Start the brio connector in the foreground\n"
 
 setup:
 	go work sync
+	cd apps/connect && go mod download
 	cd apps/relay && go mod download
 	cd $(MOBILE_DIR) && npm ci
 
@@ -52,5 +54,9 @@ dev-mobile:
 dev-relay:
 	cd apps/relay && go run . serve --addr "$(BRIO_RELAY_ADDR)"
 
+dev-connect:
+	cd apps/connect && go run . connect
+
 tidy:
+	cd apps/connect && go mod tidy
 	cd apps/relay && go mod tidy

@@ -1,112 +1,141 @@
 #!/bin/sh
-# Brio installer — connects this machine's Hermes agent to the Brio relay.
-#
-#   curl -fsSL https://github.com/0bkevin/brio/raw/main/scripts/install.sh | sh
-#
-# The Brio companion binary is gone: Hermes itself now runs the relay tunnel
-# (`hermes brio` in the hermes-agent CLI). This script installs Hermes when
-# missing, enrolls it with the Brio relay, and installs/starts the gateway
-# service, which keeps the tunnel running in the background.
+# Brio connector installer.
+#   curl -fsSL https://github.com/0bkevin/brio/releases/latest/download/install.sh | sh
 #
 # Optional env vars:
-#   BRIO_RELAY_URL       relay URL for enrollment (default: the deployed relay)
-#   BRIO_ENROLL_CODE     enrollment code from the Brio app
-#   BRIO_AGENT_NAME      display name for this machine (default: Hermes)
-#   BRIO_INSTALL_SERVICE install the hermes gateway service (default: true)
-#   BRIO_START_SERVICE   start/restart the gateway service (default: true)
-#   BRIO_HERMES_REPO     GitHub repo to install Hermes from
-#                        (default: 0bkevin/hermes-agent — carries `hermes brio`)
+#   BRIO_INSTALL_DIR   install location (default: /usr/local/bin, falls back to ~/.local/bin)
+#   BRIO_VERSION       release tag to install (default: latest)
+#   BRIO_RELAY_URL     relay URL for automatic setup
+#   BRIO_ENROLL_CODE   enrollment code from the Brio app
+#   BRIO_AGENT_NAME    display name for this Hermes machine (default: Hermes)
+#   BRIO_INSTALL_SERVICE install background service during setup (default: true)
+#   BRIO_START_SERVICE start background service during setup (default: true)
+#   BRIO_HERMES_URL    Hermes API URL (default: http://127.0.0.1:8642)
 set -eu
 
 REPO="0bkevin/brio"
-HERMES_REPO="${BRIO_HERMES_REPO:-0bkevin/hermes-agent}"
 DEFAULT_RELAY_URL="https://brio-relay.xa95xa94cj2n4.us-east-1.cs.amazonlightsail.com"
 RELAY_URL="${BRIO_RELAY_URL:-$DEFAULT_RELAY_URL}"
+VERSION="${BRIO_VERSION:-latest}"
+HERMES_URL="${BRIO_HERMES_URL:-http://127.0.0.1:8642}"
 AGENT_NAME="${BRIO_AGENT_NAME:-Hermes}"
 INSTALL_SERVICE="${BRIO_INSTALL_SERVICE:-true}"
 START_SERVICE="${BRIO_START_SERVICE:-true}"
 
 # ---- detect platform ----
 os="$(uname -s)"
+arch="$(uname -m)"
 case "$os" in
-  Linux)  ;;
-  Darwin) ;;
-  *) echo "Unsupported OS: $os (Windows: install Hermes from https://github.com/${HERMES_REPO}, then run: hermes brio enroll)" >&2; exit 1 ;;
+  Linux)  goos="linux" ;;
+  Darwin) goos="darwin" ;;
+  *) echo "Unsupported OS: $os (Windows: download brio-windows-amd64.exe from the releases page)" >&2; exit 1 ;;
 esac
+case "$arch" in
+  x86_64|amd64) goarch="amd64" ;;
+  arm64|aarch64) goarch="arm64" ;;
+  *) echo "Unsupported architecture: $arch" >&2; exit 1 ;;
+esac
+asset="brio-${goos}-${goarch}"
 
-# ---- locate or install Hermes ----
-HERMES_BIN="$(command -v hermes 2>/dev/null || true)"
-if [ -z "$HERMES_BIN" ] && [ -x "$HOME/.local/bin/hermes" ]; then
-  HERMES_BIN="$HOME/.local/bin/hermes"
-fi
-
-if [ -n "$HERMES_BIN" ]; then
-  echo "Hermes found: ${HERMES_BIN}"
+# ---- resolve download URL ----
+if [ "$VERSION" = "latest" ]; then
+  url="https://github.com/${REPO}/releases/latest/download/${asset}"
+  checksums_url="https://github.com/${REPO}/releases/latest/download/checksums.txt"
 else
-  echo "Installing Hermes Agent from ${HERMES_REPO}..."
-  if ! curl -fsSL "https://raw.githubusercontent.com/${HERMES_REPO}/main/scripts/install.sh" | bash -s -- --skip-setup --skip-browser; then
-    echo "INSTALL_HERMES_FAILED: could not install Hermes Agent" >&2
-    exit 1
-  fi
-  HERMES_BIN="$(command -v hermes 2>/dev/null || true)"
-  if [ -z "$HERMES_BIN" ] && [ -x "$HOME/.local/bin/hermes" ]; then
-    HERMES_BIN="$HOME/.local/bin/hermes"
-  fi
-  if [ -z "$HERMES_BIN" ]; then
-    echo "INSTALL_HERMES_FAILED: Hermes installed but the 'hermes' command was not found on PATH. Open a new shell and re-run this script with BRIO_ENROLL_CODE set to finish enrollment." >&2
-    exit 1
+  url="https://github.com/${REPO}/releases/download/${VERSION}/${asset}"
+  checksums_url="https://github.com/${REPO}/releases/download/${VERSION}/checksums.txt"
+fi
+
+# ---- pick install dir ----
+dir="${BRIO_INSTALL_DIR:-/usr/local/bin}"
+if [ ! -d "$dir" ]; then
+  mkdir -p "$dir" 2>/dev/null || true
+fi
+if [ ! -d "$dir" ] || [ ! -w "$dir" ]; then
+  if [ -w "$(dirname "$dir")" ] 2>/dev/null; then :; else
+    dir="$HOME/.local/bin"
+    mkdir -p "$dir"
   fi
 fi
 
-# ---- verify this Hermes build has the brio connector ----
-if ! "$HERMES_BIN" brio --help >/dev/null 2>&1; then
-  echo "INSTALL_HERMES_TOO_OLD: this Hermes build does not include 'hermes brio'." >&2
-  echo "Update to the ${HERMES_REPO} build of Hermes and re-run this script." >&2
+tmp="$(mktemp)"
+checksums_tmp="$(mktemp)"
+trap 'rm -f "$tmp" "$checksums_tmp"' EXIT HUP INT TERM
+echo "Downloading ${asset} (${VERSION})..."
+if ! curl -fsSL "$url" -o "$tmp"; then
+  echo "INSTALL_DOWNLOAD_FAILED: could not download ${url}" >&2
   exit 1
 fi
 
-if [ -z "${BRIO_ENROLL_CODE:-}" ]; then
+if curl -fsSL "$checksums_url" -o "$checksums_tmp"; then
+  expected="$(awk -v asset="$asset" '$2 == asset || $2 == "dist/" asset || $2 == "*" asset { print $1; exit }' "$checksums_tmp")"
+  if [ -z "$expected" ]; then
+    echo "INSTALL_CHECKSUM_MISSING: ${asset} is not listed in checksums.txt" >&2
+    exit 1
+  fi
+  if command -v sha256sum >/dev/null 2>&1; then
+    actual="$(sha256sum "$tmp" | awk '{ print $1 }')"
+  else
+    actual="$(shasum -a 256 "$tmp" | awk '{ print $1 }')"
+  fi
+  if [ "$actual" != "$expected" ]; then
+    echo "INSTALL_CHECKSUM_FAILED: checksum mismatch for ${asset}" >&2
+    exit 1
+  fi
+  echo "Checksum verified."
+else
+  echo "⚠️  Release checksum is unavailable; continuing for compatibility with older Brio releases." >&2
+fi
+chmod +x "$tmp"
+
+target="${dir}/brio"
+if [ -w "$dir" ]; then
+  mv "$tmp" "$target"
+else
+  echo "Elevating to write ${dir} (sudo)..."
+  sudo mv "$tmp" "$target"
+fi
+
+echo ""
+echo "✅ Installed: ${target}"
+case ":$PATH:" in
+  *":$dir:"*) ;;
+  *) echo "⚠️  ${dir} is not on your PATH. Add it:  export PATH=\"${dir}:\$PATH\"" ;;
+esac
+
+if [ "${BRIO_ENROLL_CODE:-}" ]; then
+  install_flag="--install"
+  start_flag="--start"
+  if [ "$INSTALL_SERVICE" = "false" ]; then
+    install_flag="--install=false"
+  fi
+  if [ "$START_SERVICE" = "false" ]; then
+    start_flag="--start=false"
+  fi
+
   echo ""
-  echo "Hermes is ready. Next — connect it from the Brio mobile app:"
-  echo ""
-  echo "  curl -fsSL https://github.com/${REPO}/raw/main/scripts/install.sh \\"
-  echo "    | BRIO_RELAY_URL=\"${RELAY_URL}\" \\"
-  echo "      BRIO_ENROLL_CODE=\"<CODE_FROM_THE_APP>\" \\"
-  echo "      BRIO_AGENT_NAME=\"Hermes\" \\"
-  echo "      sh"
-  echo ""
-  echo "Generate <CODE_FROM_THE_APP> in the Brio mobile app (Sign in → Generate enrollment code)."
+  echo "Running Brio setup..."
+  if ! "$target" setup \
+    --relay-url "$RELAY_URL" \
+    --code "$BRIO_ENROLL_CODE" \
+    --name "$AGENT_NAME" \
+    --hermes-url "$HERMES_URL" \
+    "$install_flag" \
+    "$start_flag"; then
+    echo "SETUP_FAILED: Brio setup did not complete." >&2
+    exit 1
+  fi
   exit 0
 fi
 
-# ---- enroll with the relay ----
 echo ""
-echo "Enrolling this machine with the Brio relay..."
-if ! "$HERMES_BIN" brio enroll \
-  --relay-url "$RELAY_URL" \
-  --code "$BRIO_ENROLL_CODE" \
-  --name "$AGENT_NAME"; then
-  echo "SETUP_FAILED: Brio enrollment did not complete." >&2
-  exit 1
-fi
-
-# ---- install / restart the gateway service (it runs the relay tunnel) ----
-if [ "$INSTALL_SERVICE" = "true" ]; then
-  echo ""
-  echo "Installing the Hermes gateway service..."
-  "$HERMES_BIN" gateway install || echo "⚠️  gateway install failed; continuing (the gateway may already be installed)" >&2
-fi
-
-if [ "$START_SERVICE" = "true" ]; then
-  echo ""
-  echo "Starting the gateway (runs the API server and the Brio relay tunnel)..."
-  if ! "$HERMES_BIN" gateway restart 2>/dev/null; then
-    "$HERMES_BIN" gateway start || {
-      echo "⚠️  Could not start the gateway service. Run: hermes gateway start" >&2
-    }
-  fi
-fi
-
+echo "Next — connect this Hermes machine from the Brio mobile app:"
 echo ""
-echo "✅ Done. The agent should now appear in the Brio mobile app."
-echo "   Check status any time with: hermes brio status"
+echo "  curl -fsSL https://github.com/${REPO}/releases/latest/download/install.sh \\"
+echo "    | BRIO_RELAY_URL=\"${RELAY_URL}\" \\"
+echo "      BRIO_ENROLL_CODE=\"<CODE_FROM_THE_APP>\" \\"
+echo "      BRIO_AGENT_NAME=\"Hermes\" \\"
+echo "      sh"
+echo ""
+echo "Generate <CODE_FROM_THE_APP> in the Brio mobile app (Sign in → Generate enrollment code)."
+echo "The setup command configures the Hermes API server, enrolls this machine, installs the background service, and starts it."

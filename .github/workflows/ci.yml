@@ -18,6 +18,7 @@ jobs:
         with:
           go-version-file: go.work
           cache-dependency-path: |
+            apps/connect/go.sum
             apps/relay/go.sum
       - uses: actions/setup-node@v4
         with:
@@ -27,5 +28,5 @@ jobs:
       - run: npm ci --ignore-scripts
         working-directory: apps/mobile
       - run: make check
-      - run: go vet ./apps/relay/...
-      - run: go test -race ./apps/relay/...
+      - run: go vet ./apps/connect/... ./apps/relay/...
+      - run: go test -race ./apps/connect/... ./apps/relay/...

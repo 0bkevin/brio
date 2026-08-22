@@ -49,7 +49,7 @@ NOT READY: <one short reason>
 Do not add markdown fences or extra explanation.`;
 
 const DEFAULT_RELAY_URL = 'https://brio-relay.xa95xa94cj2n4.us-east-1.cs.amazonlightsail.com';
-const INSTALL_SCRIPT_URL = 'https://github.com/0bkevin/brio/raw/main/scripts/install.sh';
+const INSTALL_SCRIPT_URL = 'https://github.com/0bkevin/brio/releases/latest/download/install.sh';
 
 function shellQuote(value: string) {
   return "'" + value.replace(/'/g, "'\\''") + "'";
@@ -64,11 +64,11 @@ function setupInstallCommand(enrollment: RelayEnrollmentResponse, relayURL: stri
 }
 
 function recoveryCommand(relayURL: string, agentID: string, deviceToken: string) {
-  return `hermes brio recover \\
+  return `brio recover \\
   --relay-url ${shellQuote(relayURL)} \\
   --agent-id ${shellQuote(agentID)} \\
   --device-token ${shellQuote(deviceToken)} \\
-  && hermes gateway restart`;
+  --restart`;
 }
 
 function findSetupAgent(enrollment: RelayEnrollmentResponse | undefined, agents: RelayAgent[] | undefined) {

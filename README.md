@@ -8,29 +8,27 @@ The preferred UX is:
 2. Sign in to the Brio relay.
 3. Generate a setup command.
 4. Run that command on the Hermes machine.
-5. It installs Hermes (when missing), enrolls the machine with the relay, and
-   installs/starts the gateway service — the agent appears in the app.
+5. It installs the slim `brio` connector, enables the Hermes API server,
+   enrolls the machine with the relay, and installs/starts the connector
+   service — the agent appears in the app.
 
-There is no separate companion binary. Hermes runs the Brio relay tunnel
-itself (`hermes brio` in the hermes-agent CLI), so one install covers
-everything.
+Hermes Agent stays completely stock: the connector is a small Go binary in
+this repo that keeps an outbound WebSocket tunnel to the relay and forwards
+a fixed set of request paths to Hermes' local API server
+(`http://127.0.0.1:8642`). There is no local HTTP server in the connector.
 
 ## What Is Here
 
 - `apps/mobile` - Expo React Native app.
 - `apps/relay` - Go relay/control-plane service for remote connections.
+- `apps/connect` - the `brio` connector binary (Go).
 - `packages/protocol` - Shared JSON protocol schemas.
-
-The Hermes-side connector lives in the
-[hermes-agent](https://github.com/0bkevin/hermes-agent) repo
-(`gateway/platforms/brio_connector.py`, `hermes brio` CLI).
 
 ## Prerequisites
 
-- Go `1.26.1` (relay only).
+- Go `1.26.1` (relay and connector).
 - Node.js and npm (mobile app).
-- Hermes Agent on the target machine — with the `hermes brio` connector — for
-  enrollment.
+- Hermes Agent on the target machine (stock; no fork needed).
 
 Postgres is optional. The relay uses in-memory development storage when
 `BRIO_DATABASE_URL` is unset.
@@ -57,28 +55,54 @@ on the Hermes machine.
 On the Hermes machine:
 
 ```bash
-curl -fsSL https://github.com/0bkevin/brio/raw/main/scripts/install.sh \
+curl -fsSL https://github.com/0bkevin/brio/releases/latest/download/install.sh \
   | BRIO_RELAY_URL="http://127.0.0.1:8082" \
     BRIO_ENROLL_CODE="ABCD1234" \
     BRIO_AGENT_NAME="Hermes" \
     sh
 ```
 
-The installer installs Hermes when missing (from the fork that carries the
-Brio connector), claims the enrollment code, writes `BRIO_RELAY_URL`,
-`BRIO_RELAY_TOKEN`, and `BRIO_AGENT_ID` into `~/.hermes/.env`, enables the
-Hermes API server, and installs/starts the gateway service. The gateway runs
-the relay tunnel automatically whenever the BRIO credentials are present.
+The installer downloads the release binary (with checksum verification) and
+runs `brio setup`. Setup merges `API_SERVER_ENABLED=true`,
+`API_SERVER_HOST/PORT`, and `API_SERVER_KEY` into `~/.hermes/.env`
+(preserving unrelated keys and any existing API key), claims the enrollment
+code, writes its state to `~/.brio/connect.env`, and installs/starts the
+background service. Restart Hermes if it was already running so the API
+server picks up the new settings.
 
-On the Hermes machine you can also manage everything directly:
+On the Hermes machine you can also manage the connector directly:
 
 ```bash
-hermes brio enroll --relay-url <relay-url> --code <code>   # enroll/re-enroll
-hermes brio status                                        # tunnel + relay status
-hermes brio recover --relay-url <url> --agent-id <id> \
-  --device-token <owner-device-token>                     # recover credentials
-hermes gateway install / start / restart / stop            # service lifecycle
+brio setup --relay-url <relay-url> --code <code>   # enroll/re-enroll
+brio connect                                       # run the tunnel in the foreground
+brio status                                        # service + relay + tunnel credentials
+brio recover --relay-url <url> --agent-id <id> \
+  --device-token <owner-device-token> --restart    # recover credentials
+brio install / uninstall / start / stop / restart  # service lifecycle
 ```
+
+The service is a user-level LaunchAgent (`app.brio.connect`) on macOS, a user
+systemd unit (`Restart=always`) on Linux, and a schtasks ONLOGON task on
+Windows; it runs `brio connect` with the home directory as working
+directory.
+
+## What the Connector Serves
+
+Everything rides the relay tunnel. Per request frame:
+
+- Forwarded to the stock Hermes API server with
+  `Authorization: Bearer API_SERVER_KEY` (replacing any frame credentials):
+  `/v1/responses`, `/v1/runs...`, `/api/jobs...`, `/v1/capabilities`,
+  `/health`, plus the legacy aliases `/chat/responses` and `/capabilities`.
+  SSE responses stream as `stream_chunk` frames and finish with a
+  `stream_end` whose body carries the last valid SSE data JSON.
+- Served locally by brio from `~/.hermes` (same JSON shapes as before):
+  `/v1/sessions?limit=` (legacy `/sessions`),
+  `/v1/sessions/{id}/messages` (legacy `/sessions/{id}/messages`), and
+  `/v1/memory` GET/PUT (legacy `/memory`) with atomic 0600 writes to
+  `memories/MEMORY.md` and `USER.md`. `HERMES_HOME` is respected.
+- Everything else returns a 404-style error frame. The old file/config/
+  gateway/skills/tools/logs endpoints are intentionally gone.
 
 ## Direct Connections
 
@@ -106,12 +130,22 @@ Common values:
 
 `make check` runs:
 
-- `go test ./apps/relay/...`
+- `go test ./apps/connect/... ./apps/relay/...`
+- `sh -n scripts/install.sh && sh scripts/install_test.sh`
 - `npm run lint`
 - `npm run typecheck`
 - `npm run export:web`
 
 The web export is written to `/tmp/brio-web-export` by default.
+
+## Releases
+
+Pushing a `v*` tag triggers `.github/workflows/release.yml`: it validates the
+repo (`make check`), cross-compiles the connector for
+linux/darwin/windows on amd64/arm64 (`CGO_ENABLED=0`), and publishes a
+GitHub release with the binaries, `scripts/install.sh`, and a
+`checksums.txt` manifest. The installer downloads the release binary and
+verifies its checksum.
 
 ## Relay Endpoints
 
@@ -122,15 +156,15 @@ The web export is written to `/tmp/brio-web-export` by default.
 - `GET /agents` - list agents owned by the authenticated user.
 - `POST /enrollments` - create a short-lived enrollment code for a user.
 - `POST /enrollments/{code}/claim` - claim an enrollment code from a Hermes machine.
-- `POST /agents/{id}/recover` - owner-authenticated recovery path that returns a fresh relay pairing code and companion token.
+- `POST /agents/{id}/recover` - owner-authenticated recovery path that returns a fresh relay pairing code and connector token.
 - `POST /pairings` - create a short-lived pairing record.
 - `GET /pairings/{code}` - inspect a pairing record.
 - `POST /pairings/{code}/claim` - claim a pairing once with a device token.
-- `GET /tunnel/companion/{agentID}?token=...` - authenticated Hermes-connector WebSocket tunnel.
+- `GET /tunnel/companion/{agentID}?token=...` - authenticated connector WebSocket tunnel.
 - `GET /tunnel/mobile/{agentID}?token=...` - authenticated mobile WebSocket tunnel.
 
-The relay routes request frames to one connected Hermes connector and records
-the requesting mobile peer by frame ID. Response, error, and stream frames
+The relay routes request frames to one connected connector and records the
+requesting mobile peer by frame ID. Response, error, and stream frames
 from the connector are delivered only to that requesting peer. Pending relay
 requests expire after six minutes if the connector does not finish.
 
@@ -139,9 +173,9 @@ the SSE bytes in `stream_chunk` frames and finishes with `stream_end`. The
 mobile app renders `response.output_text.delta` events incrementally and
 falls back to ordinary JSON responses for older Hermes installations.
 
-If a Hermes machine loses its `~/.hermes/.env` BRIO credentials, recover the
-agent through the relay and restart the gateway with the returned token (see
-`hermes brio recover` above). The mobile app includes the same recovery flow.
+If a Hermes machine loses its `~/.brio` state, recover the agent through the
+relay and restart the connector with the returned token (see `brio recover`
+above). The mobile app includes the same recovery flow.
 
 ## Deployment
 

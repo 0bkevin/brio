@@ -43,15 +43,14 @@ make dev-relay
 ```
 
 In the mobile app, sign in to the relay and generate a setup command. Run that
-command on the Hermes machine. It installs Hermes when missing, enrolls the
-machine with the relay, and installs/starts the gateway service, which runs
-the Brio relay tunnel automatically.
+command on the Hermes machine. It installs the slim `brio` connector, enables
+the Hermes API server, enrolls the machine with the relay, and installs/starts
+the connector service, which keeps the Brio relay tunnel running.
 
 For local CLI development without the installer:
 
 ```bash
-hermes brio enroll --relay-url http://127.0.0.1:8082 --code ABCD1234
-hermes gateway restart
+brio setup --relay-url http://127.0.0.1:8082 --code ABCD1234
 ```
 
 Direct connections to a Hermes API server on the LAN are still available in
