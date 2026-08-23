@@ -35,6 +35,7 @@ func serveCommand() *cobra.Command {
 	cmd.Flags().StringSliceVar(&cfg.AllowedOrigins, "allowed-origin", envList("BRIO_RELAY_ALLOWED_ORIGINS"), "allowed browser origin for CORS and WebSocket upgrades; repeatable")
 	cmd.Flags().StringVar(&cfg.DeviceRegistrationKey, "device-registration-key", envDefault("BRIO_DEVICE_REGISTRATION_KEY", ""), "optional key required to create relay device tokens")
 	cmd.Flags().BoolVar(&cfg.InsecureDevMode, "insecure-dev-mode", envBool("BRIO_INSECURE_DEV_MODE"), "enable unverified email sign-in and unrestricted browser origins for local development")
+	cmd.Flags().BoolVar(&cfg.AllowLegacyQueryTokens, "allow-legacy-query-tokens", envBool("BRIO_ALLOW_LEGACY_QUERY_TOKENS"), "temporarily accept relay credentials in WebSocket query strings during client migration")
 	return cmd
 }
 

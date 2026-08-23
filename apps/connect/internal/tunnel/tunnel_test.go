@@ -14,14 +14,34 @@ import (
 )
 
 func TestTunnelURL(t *testing.T) {
-	got, err := tunnelURL("https://relay.example/base/", "mobile", "agent 123", "relaytoken")
+	got, err := tunnelURL("https://relay.example/base/", "mobile", "agent 123")
 	if err != nil {
 		t.Fatalf("tunnelURL returned error: %v", err)
 	}
 
-	want := "wss://relay.example/base/tunnel/mobile/agent%20123?token=relaytoken"
+	want := "wss://relay.example/base/tunnel/mobile/agent%20123"
 	if got != want {
 		t.Fatalf("unexpected tunnel URL: got %q want %q", got, want)
+	}
+}
+
+func TestProbeSendsRelayCredentialInAuthorizationHeader(t *testing.T) {
+	authorization := make(chan string, 1)
+	relay := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		authorization <- r.Header.Get("Authorization")
+		conn, err := websocket.Accept(w, r, nil)
+		if err != nil {
+			return
+		}
+		_ = conn.Close(websocket.StatusNormalClosure, "done")
+	}))
+	defer relay.Close()
+
+	if err := Probe(context.Background(), Config{RelayURL: relay.URL, AgentID: "agent-1", RelayToken: "relay-secret"}); err != nil {
+		t.Fatalf("Probe failed: %v", err)
+	}
+	if got := <-authorization; got != "Bearer relay-secret" {
+		t.Fatalf("Authorization = %q, want bearer relay credential", got)
 	}
 }
 

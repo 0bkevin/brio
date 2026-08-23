@@ -1007,15 +1007,22 @@ type PendingRelayRequest = {
 };
 
 const relayClients = new Map<string, RelaySocketClient>();
+const RELAY_TUNNEL_SUBPROTOCOL = 'brio.tunnel.v1';
+const RELAY_MOBILE_AUTH_SUBPROTOCOL = 'brio.mobile.auth.';
 
 class RelaySocketClient {
   private readonly wsURL: string;
+  private readonly authSubprotocol: string;
   private socket: WebSocket | null = null;
   private opening: Promise<void> | null = null;
   private pending = new Map<string, PendingRelayRequest>();
 
-  constructor(wsURL: string) {
+  constructor(wsURL: string, relayToken: string) {
     this.wsURL = wsURL;
+    if (!/^[A-Za-z0-9._~-]+$/.test(relayToken)) {
+      throw new Error('Relay device token cannot be used as a WebSocket credential');
+    }
+    this.authSubprotocol = `${RELAY_MOBILE_AUTH_SUBPROTOCOL}${relayToken}`;
   }
 
   request<T>(
@@ -1082,7 +1089,10 @@ class RelaySocketClient {
     }
 
     this.opening = new Promise<void>((resolve, reject) => {
-      const socket = new WebSocket(this.wsURL);
+      // Browsers cannot attach Authorization to a WebSocket upgrade. Negotiate
+      // the device credential as a role-bound subprotocol so it never appears
+      // in the URL or load-balancer request-target logs.
+      const socket = new WebSocket(this.wsURL, [RELAY_TUNNEL_SUBPROTOCOL, this.authSubprotocol]);
       this.socket = socket;
 
       const connectTimer = setTimeout(() => {
@@ -1244,7 +1254,7 @@ function relayFetch<T>(
   if (!relayToken) {
     return Promise.reject(new Error('Relay connection is missing a device token'));
   }
-  const wsURL = relayTunnelURL(connection.url, agentId, relayToken);
+  const wsURL = relayTunnelURL(connection.url, agentId);
   const body =
     typeof init.body === 'string' && init.body.length > 0 ? JSON.parse(init.body) : null;
   const requestFrame: RelayFrame = {
@@ -1258,10 +1268,11 @@ function relayFetch<T>(
     body,
   };
 
-  let client = relayClients.get(wsURL);
+  const clientKey = `${wsURL}\u0000${relayToken}`;
+  let client = relayClients.get(clientKey);
   if (!client) {
-    client = new RelaySocketClient(wsURL);
-    relayClients.set(wsURL, client);
+    client = new RelaySocketClient(wsURL, relayToken);
+    relayClients.set(clientKey, client);
   }
   return client.request<T>(
     requestFrame,
@@ -1272,7 +1283,7 @@ function relayFetch<T>(
   );
 }
 
-function relayTunnelURL(baseURL: string, agentId: string, relayToken: string) {
+function relayTunnelURL(baseURL: string, agentId: string) {
   const normalized = normalizeBaseURL(baseURL);
   const withScheme = normalized.startsWith('http') || normalized.startsWith('ws')
     ? normalized
@@ -1284,7 +1295,6 @@ function relayTunnelURL(baseURL: string, agentId: string, relayToken: string) {
     url.protocol = 'wss:';
   }
   url.pathname = `${url.pathname.replace(/\/+$/, '')}/tunnel/mobile/${agentId}`;
-  url.searchParams.set('token', relayToken);
   return url.toString();
 }
 

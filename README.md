@@ -105,6 +105,13 @@ directory.
 
 Everything rides the relay tunnel. Per request frame:
 
+Relay credentials never appear in current-client WebSocket URLs: the Go
+connector sends its companion token in `Authorization`, while Mobile uses a
+role-bound WebSocket subprotocol because browser WebSockets cannot set request
+headers. The relay temporarily accepts the legacy `?token=` form so already
+installed connectors can upgrade without an outage only when
+`BRIO_ALLOW_LEGACY_QUERY_TOKENS=true` is explicitly configured.
+
 - Forwarded to the stock Hermes API server with
   `Authorization: Bearer API_SERVER_KEY` (replacing any frame credentials):
   `/v1/responses`, `/v1/runs...`, `/api/jobs...`, `/v1/capabilities`,
@@ -233,6 +240,7 @@ Common values:
 - `BRIO_RELAY_ADDR` - relay bind address, default `127.0.0.1:8082`.
 - `BRIO_DATABASE_URL` - optional Postgres URL for relay persistence.
 - `BRIO_INSECURE_DEV_MODE` - explicitly enables unverified email sign-in and unrestricted browser origins. `make dev-relay` sets the equivalent CLI flag; never enable it on a deployed relay.
+- `BRIO_ALLOW_LEGACY_QUERY_TOKENS` - migration-only opt-in for old clients that put relay credentials in WebSocket query strings. Current clients use headers/subprotocols; leave this disabled after upgrades.
 - `BRIO_RELAY_ALLOWED_ORIGINS` - comma-separated browser origins allowed for relay CORS and WebSocket upgrades. Browser origins are denied when this is unset unless insecure development mode is explicitly enabled; origin-less native clients continue to work.
 - `BRIO_DEVICE_REGISTRATION_KEY` - interim secret required on `POST /auth/devices` through `Authorization: Bearer ...` or `X-Brio-Registration-Key`. With neither this key nor insecure development mode configured, device registration fails closed. Do not embed this key in a public app build; replace it with the hosted account-auth flow.
 - `HERMES_CONTROL_BASE` - `hermes serve` base URL, default `http://127.0.0.1:9119`.

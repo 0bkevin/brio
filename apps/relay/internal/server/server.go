@@ -22,12 +22,19 @@ import (
 
 const pendingRequestTTL = 6 * time.Minute
 
+const (
+	relayTunnelSubprotocol         = "brio.tunnel.v1"
+	mobileAuthSubprotocolPrefix    = "brio.mobile.auth."
+	companionAuthSubprotocolPrefix = "brio.companion.auth."
+)
+
 type Config struct {
-	Addr                  string
-	DatabaseURL           string
-	AllowedOrigins        []string
-	DeviceRegistrationKey string
-	InsecureDevMode       bool
+	Addr                   string
+	DatabaseURL            string
+	AllowedOrigins         []string
+	DeviceRegistrationKey  string
+	InsecureDevMode        bool
+	AllowLegacyQueryTokens bool
 }
 
 type hub struct {
@@ -74,6 +81,9 @@ func Run(ctx context.Context, cfg Config) error {
 	a := &app{cfg: cfg, hub: newHub(), store: st}
 	if cfg.InsecureDevMode {
 		slog.Warn("relay insecure development mode is enabled; email identities are unverified and browser origins are unrestricted")
+	}
+	if cfg.AllowLegacyQueryTokens {
+		slog.Warn("legacy WebSocket query-token authentication is enabled; credentials may appear in infrastructure request logs")
 	}
 	go a.hub.pruneLoop(ctx)
 	router := chi.NewRouter()
@@ -378,8 +388,8 @@ func (a *app) tunnel(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	deviceID := ""
+	token, selectedSubprotocol := tunnelCredential(r, role, a.cfg.AllowLegacyQueryTokens)
 	if role == "mobile" {
-		token := r.URL.Query().Get("token")
 		if token == "" {
 			writeJSON(w, http.StatusUnauthorized, map[string]any{"error": "missing device token"})
 			return
@@ -400,7 +410,6 @@ func (a *app) tunnel(w http.ResponseWriter, r *http.Request) {
 		}
 		deviceID = auth.Device.ID
 	} else {
-		token := r.URL.Query().Get("token")
 		if token == "" {
 			writeJSON(w, http.StatusUnauthorized, map[string]any{"error": "missing companion token"})
 			return
@@ -410,7 +419,11 @@ func (a *app) tunnel(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	conn, err := websocket.Accept(w, r, websocketAcceptOptions(a.cfg.AllowedOrigins, a.cfg.InsecureDevMode))
+	acceptOptions := websocketAcceptOptions(a.cfg.AllowedOrigins, a.cfg.InsecureDevMode)
+	if selectedSubprotocol != "" {
+		acceptOptions.Subprotocols = []string{selectedSubprotocol}
+	}
+	conn, err := websocket.Accept(w, r, acceptOptions)
 	if err != nil {
 		return
 	}
@@ -802,6 +815,38 @@ func deviceRegistrationKey(r *http.Request) string {
 		return key
 	}
 	return bearerToken(r)
+}
+
+func tunnelCredential(r *http.Request, role string, allowLegacyQueryTokens bool) (token string, selectedSubprotocol string) {
+	if token := bearerToken(r); token != "" {
+		return token, ""
+	}
+	prefix := mobileAuthSubprotocolPrefix
+	if role == "companion" {
+		prefix = companionAuthSubprotocolPrefix
+	}
+	offeredProtocols := map[string]bool{}
+	for _, header := range r.Header.Values("Sec-WebSocket-Protocol") {
+		for _, offered := range strings.Split(header, ",") {
+			offered = strings.TrimSpace(offered)
+			offeredProtocols[offered] = true
+		}
+	}
+	if offeredProtocols[relayTunnelSubprotocol] {
+		for offered := range offeredProtocols {
+			if candidate := strings.TrimPrefix(offered, prefix); candidate != offered && candidate != "" {
+				// Echo only the fixed protocol, never the credential-bearing offer.
+				return candidate, relayTunnelSubprotocol
+			}
+		}
+	}
+	if allowLegacyQueryTokens {
+		// Explicit migration-only compatibility for already-released clients.
+		// Current clients use Authorization (connector) or a negotiated WebSocket
+		// subprotocol (mobile) so long-lived credentials do not appear in URLs.
+		return strings.TrimSpace(r.URL.Query().Get("token")), ""
+	}
+	return "", ""
 }
 
 func secretEqual(got string, want string) bool {

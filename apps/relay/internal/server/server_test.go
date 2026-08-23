@@ -440,6 +440,43 @@ func TestRequestLoggerPreservesTokenForAuthentication(t *testing.T) {
 	}
 }
 
+func TestTunnelCredentialPrefersAuthorizationAndSupportsMobileSubprotocol(t *testing.T) {
+	req := httptest.NewRequest(http.MethodGet, "/tunnel/mobile/agent-1?token=legacy-secret", nil)
+	req.Header.Set("Authorization", "Bearer header-secret")
+	req.Header.Set("Sec-WebSocket-Protocol", relayTunnelSubprotocol+", "+mobileAuthSubprotocolPrefix+"protocol-secret")
+	token, protocol := tunnelCredential(req, "mobile", true)
+	if token != "header-secret" || protocol != "" {
+		t.Fatalf("authorization credential = (%q, %q)", token, protocol)
+	}
+
+	req = httptest.NewRequest(http.MethodGet, "/tunnel/mobile/agent-1", nil)
+	offered := mobileAuthSubprotocolPrefix + "protocol-secret"
+	req.Header.Set("Sec-WebSocket-Protocol", "unrelated, "+relayTunnelSubprotocol+", "+offered)
+	token, protocol = tunnelCredential(req, "mobile", false)
+	if token != "protocol-secret" || protocol != relayTunnelSubprotocol {
+		t.Fatalf("subprotocol credential = (%q, %q), want token and fixed selected protocol", token, protocol)
+	}
+
+	req = httptest.NewRequest(http.MethodGet, "/tunnel/mobile/agent-1", nil)
+	req.Header.Set("Sec-WebSocket-Protocol", offered)
+	token, protocol = tunnelCredential(req, "mobile", false)
+	if token != "" || protocol != "" {
+		t.Fatalf("credential-only subprotocol was accepted without protocol negotiation: (%q, %q)", token, protocol)
+	}
+
+	req = httptest.NewRequest(http.MethodGet, "/tunnel/mobile/agent-1?token=legacy-secret", nil)
+	req.Header.Set("Sec-WebSocket-Protocol", relayTunnelSubprotocol+", "+companionAuthSubprotocolPrefix+"wrong-role")
+	token, protocol = tunnelCredential(req, "mobile", true)
+	if token != "legacy-secret" || protocol != "" {
+		t.Fatalf("wrong-role subprotocol bypassed role binding: (%q, %q)", token, protocol)
+	}
+
+	token, protocol = tunnelCredential(req, "mobile", false)
+	if token != "" || protocol != "" {
+		t.Fatalf("production accepted disabled legacy query credential: (%q, %q)", token, protocol)
+	}
+}
+
 func TestWebsocketOriginPatternsUseHostsFromConfiguredOrigins(t *testing.T) {
 	got := websocketOriginPatterns([]string{
 		"https://app.brio.dev",

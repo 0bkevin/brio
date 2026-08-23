@@ -147,13 +147,13 @@ func Run(ctx context.Context, cfg Config) error {
 // Probe briefly opens the tunnel WebSocket to verify that the stored relay
 // credentials are still accepted.
 func Probe(ctx context.Context, cfg Config) error {
-	wsURL, err := tunnelURL(cfg.RelayURL, "companion", cfg.AgentID, cfg.RelayToken)
+	wsURL, err := tunnelURL(cfg.RelayURL, "companion", cfg.AgentID)
 	if err != nil {
 		return err
 	}
 	probeCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
-	conn, resp, err := websocket.Dial(probeCtx, wsURL, nil)
+	conn, resp, err := websocket.Dial(probeCtx, wsURL, tunnelDialOptions(cfg.RelayToken))
 	if err != nil {
 		if resp != nil && resp.StatusCode > 0 {
 			return fmt.Errorf("relay rejected tunnel credentials (HTTP %d)", resp.StatusCode)
@@ -175,12 +175,12 @@ func jitter(d time.Duration) time.Duration {
 
 // connect serves one tunnel connection until it drops.
 func connect(ctx context.Context, cfg Config) error {
-	wsURL, err := tunnelURL(cfg.RelayURL, "companion", cfg.AgentID, cfg.RelayToken)
+	wsURL, err := tunnelURL(cfg.RelayURL, "companion", cfg.AgentID)
 	if err != nil {
 		return err
 	}
 	dialCtx, cancelDial := context.WithTimeout(ctx, dialTimeout)
-	conn, _, err := websocket.Dial(dialCtx, wsURL, nil)
+	conn, _, err := websocket.Dial(dialCtx, wsURL, tunnelDialOptions(cfg.RelayToken))
 	cancelDial()
 	if err != nil {
 		return err
@@ -282,7 +282,7 @@ func errorFrame(id string, code string, message string) Frame {
 	return Frame{Type: "error", ID: id, Code: code, Message: message}
 }
 
-func tunnelURL(base string, role string, agentID string, token string) (string, error) {
+func tunnelURL(base string, role string, agentID string) (string, error) {
 	u, err := url.Parse(strings.TrimRight(base, "/"))
 	if err != nil {
 		return "", err
@@ -297,12 +297,14 @@ func tunnelURL(base string, role string, agentID string, token string) (string, 
 		return "", fmt.Errorf("unsupported relay URL scheme: %s", u.Scheme)
 	}
 	u.Path = strings.TrimRight(u.Path, "/") + "/tunnel/" + role + "/" + agentID
-	if token != "" {
-		q := u.Query()
-		q.Set("token", token)
-		u.RawQuery = q.Encode()
-	} else {
-		u.RawQuery = ""
-	}
+	u.RawQuery = ""
 	return u.String(), nil
+}
+
+func tunnelDialOptions(token string) *websocket.DialOptions {
+	header := make(http.Header)
+	if token != "" {
+		header.Set("Authorization", "Bearer "+token)
+	}
+	return &websocket.DialOptions{HTTPHeader: header}
 }
