@@ -16,7 +16,6 @@ import {
   getComposerCapabilities,
   type AgentConnection,
   type CommandCatalog,
-  type ComposerCompletion,
 } from '@/lib/brio';
 import { applyCompletion, completionToken, composerContentFromSharedPayloads } from '@/lib/composer-model';
 import { uploadComposerAttachment, type AttachmentSource } from '@/lib/composer';

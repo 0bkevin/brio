@@ -336,18 +336,19 @@ export function ChatWorkspace({
   // simply leave the panel showing Unavailable and never break the chat.
   const pollThreadId = activeThread?.id;
   const runtimeSessionId = activeThread?.runtimeSessionId ?? null;
+  const activeThreadProfile = activeThread?.profile;
   useEffect(() => {
     if (!pollThreadId || !runtimeSessionId) return;
     let cancelled = false;
     const refresh = async () => {
       const patch: { usage?: NormalizedRuntimeUsage; contextBreakdown?: NormalizedContextBreakdown } = {};
       try {
-        patch.usage = await getSessionUsage(connection, runtimeSessionId, profileName(activeThread?.profile));
+        patch.usage = await getSessionUsage(connection, runtimeSessionId, profileName(activeThreadProfile));
       } catch {
         // Usage RPC unavailable this round; keep prior data untouched.
       }
       try {
-        patch.contextBreakdown = await getSessionContextBreakdown(connection, runtimeSessionId, profileName(activeThread?.profile));
+        patch.contextBreakdown = await getSessionContextBreakdown(connection, runtimeSessionId, profileName(activeThreadProfile));
       } catch {
         // Context RPC unavailable this round; keep prior data untouched.
       }
@@ -361,7 +362,7 @@ export function ChatWorkspace({
       cancelled = true;
       clearInterval(interval);
     };
-  }, [connection, pollThreadId, runtimeSessionId, sending, updateThreadRuntime]);
+  }, [activeThreadProfile, connection, pollThreadId, runtimeSessionId, sending, updateThreadRuntime]);
 
   // Capability checks use the effective selection: the thread override if
   // present, otherwise the model.options root profile default. Unknown

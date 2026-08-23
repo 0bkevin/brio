@@ -1,7 +1,7 @@
 import { useMutation, useQuery, useQueryClient,
   type UseMutationResult } from '@tanstack/react-query';
 import * as Clipboard from 'expo-clipboard';
-import { useEffect, useState } from 'react';
+import { useState } from 'react';
 import { Alert, Pressable, StyleSheet, TextInput, View } from 'react-native';
 
 import { DashboardCard, SectionLabel, StatusBadge } from '@/components/dashboard';
@@ -22,7 +22,6 @@ import {
   previewProfileExport,
   previewProfileDistribution,
   profileGatewayAction,
-  profileName,
   profileSetupCommand,
   renameProfile,
   updateProfileSOUL,
@@ -515,12 +514,11 @@ function ImportArchiveCard({
   const [secretsConsent, setSecretsConsent] = useState(false);
   const [notice, setNotice] = useState('');
 
-  // Any input change invalidates the stale preview, token, and consent.
-  useEffect(() => {
+  const invalidatePreview = () => {
     setPreview(null);
     setPreviewInput(null);
     setSecretsConsent(false);
-  }, [archiveB64, targetName]);
+  };
 
   const dryRun = useMutation({
     mutationFn: () => previewProfileArchiveImport(connection, { archiveB64, name: targetName }),
@@ -565,11 +563,23 @@ function ImportArchiveCard({
       <ThemedText type="smallBold">Import an exported profile archive</ThemedText>
       <ThemedInput
         label="Target profile name"
-        onChangeText={setTargetName}
+        onChangeText={(value) => {
+          setTargetName(value);
+          invalidatePreview();
+        }}
         value={targetName}
         placeholder="restored-bot"
       />
-      <ThemedInput label="Archive (base64)" multiline onChangeText={setArchiveB64} value={archiveB64} placeholder="H4sIAA…" />
+      <ThemedInput
+        label="Archive (base64)"
+        multiline
+        onChangeText={(value) => {
+          setArchiveB64(value);
+          invalidatePreview();
+        }}
+        value={archiveB64}
+        placeholder="H4sIAA…"
+      />
       {dryRun.isSuccess && preview?.has_secrets_file ? (
         <Pressable
           accessibilityRole="checkbox"
@@ -633,12 +643,12 @@ function InstallDistributionCard({
       .join('\n');
   };
 
-  // Preview token binds apply to the exact staged tree; any input change
-  // invalidates both the preview and the token.
-  useEffect(() => {
+  // Preview tokens bind apply to the exact staged tree, so input handlers
+  // invalidate both the preview and token in the same user event.
+  const invalidatePreview = () => {
     setPreview(null);
     setPreviewInput(null);
-  }, [source, targetName]);
+  };
 
   const dryRun = useMutation({
     mutationFn: () => previewProfileDistribution(connection, { source, name: targetName }),
@@ -686,13 +696,19 @@ function InstallDistributionCard({
       </ThemedText>
       <ThemedInput
         label="Source"
-        onChangeText={setSource}
+        onChangeText={(value) => {
+          setSource(value);
+          invalidatePreview();
+        }}
         value={source}
         placeholder="github.com/you/research-bot#v1.2.0"
       />
       <ThemedInput
         label="Profile name (optional — defaults to the manifest)"
-        onChangeText={setTargetName}
+        onChangeText={(value) => {
+          setTargetName(value);
+          invalidatePreview();
+        }}
         value={targetName}
         placeholder="from manifest"
       />
