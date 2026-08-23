@@ -35,6 +35,7 @@ type Config struct {
 	DeviceRegistrationKey  string
 	InsecureDevMode        bool
 	AllowLegacyQueryTokens bool
+	TrustedProxyCIDRs      []string
 }
 
 type hub struct {
@@ -60,9 +61,11 @@ type peer struct {
 }
 
 type app struct {
-	cfg   Config
-	hub   *hub
-	store store.Store
+	cfg            Config
+	hub            *hub
+	store          store.Store
+	trustedProxies trustedProxySet
+	rateLimiters   map[string]*fixedWindowLimiter
 }
 
 type tunnelFrame struct {
@@ -78,7 +81,17 @@ func Run(ctx context.Context, cfg Config) error {
 		return err
 	}
 	defer st.Close()
-	a := &app{cfg: cfg, hub: newHub(), store: st}
+	trustedProxies, err := parseTrustedProxyCIDRs(cfg.TrustedProxyCIDRs)
+	if err != nil {
+		return err
+	}
+	a := &app{
+		cfg:            cfg,
+		hub:            newHub(),
+		store:          st,
+		trustedProxies: trustedProxies,
+		rateLimiters:   newRelayRateLimiters(),
+	}
 	if cfg.InsecureDevMode {
 		slog.Warn("relay insecure development mode is enabled; email identities are unverified and browser origins are unrestricted")
 	}
@@ -88,26 +101,25 @@ func Run(ctx context.Context, cfg Config) error {
 	go a.hub.pruneLoop(ctx)
 	router := chi.NewRouter()
 	router.Use(middleware.RequestID)
-	router.Use(middleware.RealIP)
 	router.Use(requestLogger)
 	router.Use(middleware.Recoverer)
 	router.Use(a.cors)
 	router.Get("/health", a.health)
-	router.Post("/auth/devices", a.createDevice)
+	router.Post("/auth/devices", a.rateLimit("device-registration", a.createDevice))
 	router.Group(func(r chi.Router) {
 		r.Use(a.requireDevice)
 		r.Get("/me", a.me)
 		r.Get("/devices", a.listDevices)
 		r.Delete("/devices/{id}", a.revokeDevice)
 		r.Get("/agents", a.listAgents)
-		r.Post("/enrollments", a.createEnrollment)
-		r.Post("/agents/{id}/recover", a.recoverAgent)
-		r.Post("/pairings/{code}/claim", a.claimPairing)
+		r.Post("/enrollments", a.rateLimit("enrollment-create", a.createEnrollment))
+		r.Post("/agents/{id}/recover", a.rateLimit("agent-recovery", a.recoverAgent))
+		r.Post("/pairings/{code}/claim", a.rateLimit("pairing-claim", a.claimPairing))
 	})
-	router.Post("/enrollments/{code}/claim", a.claimEnrollment)
-	router.Post("/pairings", a.createPairing)
-	router.Get("/pairings/{code}", a.getPairing)
-	router.Get("/tunnel/{role}/{agentID}", a.tunnel)
+	router.Post("/enrollments/{code}/claim", a.rateLimit("enrollment-claim", a.claimEnrollment))
+	router.Post("/pairings", a.rateLimit("pairing-create", a.createPairing))
+	router.Get("/pairings/{code}", a.rateLimit("pairing-read", a.getPairing))
+	router.Get("/tunnel/{role}/{agentID}", a.rateLimit("tunnel-auth", a.tunnel))
 
 	srv := &http.Server{
 		Addr:              cfg.Addr,

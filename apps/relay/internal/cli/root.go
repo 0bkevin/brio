@@ -36,6 +36,7 @@ func serveCommand() *cobra.Command {
 	cmd.Flags().StringVar(&cfg.DeviceRegistrationKey, "device-registration-key", envDefault("BRIO_DEVICE_REGISTRATION_KEY", ""), "optional key required to create relay device tokens")
 	cmd.Flags().BoolVar(&cfg.InsecureDevMode, "insecure-dev-mode", envBool("BRIO_INSECURE_DEV_MODE"), "enable unverified email sign-in and unrestricted browser origins for local development")
 	cmd.Flags().BoolVar(&cfg.AllowLegacyQueryTokens, "allow-legacy-query-tokens", envBool("BRIO_ALLOW_LEGACY_QUERY_TOKENS"), "temporarily accept relay credentials in WebSocket query strings during client migration")
+	cmd.Flags().StringSliceVar(&cfg.TrustedProxyCIDRs, "trusted-proxy-cidr", envList("BRIO_RELAY_TRUSTED_PROXY_CIDRS"), "proxy CIDR allowed to supply X-Forwarded-For; repeatable")
 	return cmd
 }
 
