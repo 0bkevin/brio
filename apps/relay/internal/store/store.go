@@ -19,9 +19,11 @@ var (
 )
 
 type User struct {
-	ID        string    `json:"id"`
-	Email     string    `json:"email"`
-	CreatedAt time.Time `json:"created_at"`
+	ID              string    `json:"id"`
+	Email           string    `json:"email,omitempty"`
+	IdentityIssuer  string    `json:"identity_issuer,omitempty"`
+	IdentitySubject string    `json:"identity_subject,omitempty"`
+	CreatedAt       time.Time `json:"created_at"`
 }
 
 type Device struct {
@@ -68,7 +70,9 @@ type Auth struct {
 
 type Store interface {
 	Close()
+	UpsertIdentity(ctx context.Context, issuer string, subject string, email string) (User, error)
 	CreateDeviceToken(ctx context.Context, email string, deviceName string) (User, Device, string, error)
+	CreateDeviceTokenForUser(ctx context.Context, userID string, deviceName string) (User, Device, string, error)
 	AuthenticateDevice(ctx context.Context, token string) (Auth, error)
 	ListDevices(ctx context.Context, userID string) ([]Device, error)
 	RevokeDevice(ctx context.Context, userID string, deviceID string) (Device, error)
@@ -83,6 +87,13 @@ type Store interface {
 	ClaimPairing(ctx context.Context, code string, userID string) (Agent, error)
 	ListAgents(ctx context.Context, userID string) ([]Agent, error)
 	UserCanAccessAgent(ctx context.Context, userID string, agentID string) (bool, error)
+}
+
+func IdentityUserID(issuer string, subject string) string {
+	issuer = strings.TrimRight(strings.TrimSpace(issuer), "/")
+	subject = strings.TrimSpace(subject)
+	sum := sha256.Sum256([]byte(issuer + "\x00" + subject))
+	return "usr_" + hex.EncodeToString(sum[:16])
 }
 
 func HashSecret(secret string) string {

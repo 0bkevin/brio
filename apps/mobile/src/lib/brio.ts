@@ -884,12 +884,14 @@ export async function createRelayDevice(
   relayURL: string,
   email = 'dev@brio.local',
   deviceName = 'Brio mobile',
+  identityToken?: string,
 ) {
   const response = await fetch(`${normalizeBaseURL(relayURL)}/auth/devices`, {
     method: 'POST',
     headers: {
       Accept: 'application/json',
       'Content-Type': 'application/json',
+      ...(identityToken ? { Authorization: `Bearer ${identityToken}` } : {}),
     },
     body: JSON.stringify({ email, device_name: deviceName }),
   });

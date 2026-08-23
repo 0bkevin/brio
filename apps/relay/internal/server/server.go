@@ -5,6 +5,7 @@ import (
 	"crypto/subtle"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -14,6 +15,7 @@ import (
 	"sync"
 	"time"
 
+	identityauth "github.com/brio/brio/apps/relay/internal/auth"
 	"github.com/brio/brio/apps/relay/internal/store"
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
@@ -36,6 +38,11 @@ type Config struct {
 	InsecureDevMode        bool
 	AllowLegacyQueryTokens bool
 	TrustedProxyCIDRs      []string
+	ClerkSecretKey         string
+	ClerkJWTKey            string
+	ClerkIssuer            string
+	ClerkJWTAudience       string
+	ClerkAuthorizedParties []string
 }
 
 type hub struct {
@@ -64,6 +71,7 @@ type app struct {
 	cfg            Config
 	hub            *hub
 	store          store.Store
+	identity       identityauth.IdentityVerifier
 	trustedProxies trustedProxySet
 	rateLimiters   map[string]*fixedWindowLimiter
 }
@@ -76,6 +84,10 @@ type tunnelFrame struct {
 }
 
 func Run(ctx context.Context, cfg Config) error {
+	identityVerifier, err := newIdentityVerifier(cfg)
+	if err != nil {
+		return err
+	}
 	st, err := openStore(ctx, cfg.DatabaseURL)
 	if err != nil {
 		return err
@@ -89,6 +101,7 @@ func Run(ctx context.Context, cfg Config) error {
 		cfg:            cfg,
 		hub:            newHub(),
 		store:          st,
+		identity:       identityVerifier,
 		trustedProxies: trustedProxies,
 		rateLimiters:   newRelayRateLimiters(),
 	}
@@ -140,6 +153,23 @@ func Run(ctx context.Context, cfg Config) error {
 		return nil
 	}
 	return err
+}
+
+func newIdentityVerifier(cfg Config) (identityauth.IdentityVerifier, error) {
+	if strings.TrimSpace(cfg.ClerkSecretKey) == "" && strings.TrimSpace(cfg.ClerkJWTKey) == "" {
+		return nil, nil
+	}
+	verifier, err := identityauth.NewClerkVerifier(identityauth.ClerkConfig{
+		SecretKey:         cfg.ClerkSecretKey,
+		JWTKey:            cfg.ClerkJWTKey,
+		Issuer:            cfg.ClerkIssuer,
+		Audience:          cfg.ClerkJWTAudience,
+		AuthorizedParties: cfg.ClerkAuthorizedParties,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("configure Clerk authentication: %w", err)
+	}
+	return verifier, nil
 }
 
 func newHub() *hub {
@@ -209,13 +239,36 @@ func (a *app) health(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *app) createDevice(w http.ResponseWriter, r *http.Request) {
-	if a.cfg.DeviceRegistrationKey == "" && !a.cfg.InsecureDevMode {
+	identityToken := bearerToken(r)
+	var verifiedUser *store.User
+	if identityToken != "" && a.identity != nil {
+		identity, err := a.identity.Verify(r.Context(), identityToken)
+		if err != nil {
+			if !secretEqual(deviceRegistrationKey(r), a.cfg.DeviceRegistrationKey) {
+				writeJSON(w, http.StatusUnauthorized, map[string]any{"error": "identity token is invalid"})
+				return
+			}
+		} else {
+			user, err := a.store.UpsertIdentity(r.Context(), identity.Issuer, identity.Subject, identity.Email)
+			if err != nil {
+				writeJSON(w, http.StatusInternalServerError, map[string]any{"error": "could not persist verified identity"})
+				return
+			}
+			verifiedUser = &user
+		}
+	}
+	registrationAuthorized := secretEqual(deviceRegistrationKey(r), a.cfg.DeviceRegistrationKey)
+	if verifiedUser == nil && a.identity != nil && identityToken == "" && !registrationAuthorized {
+		writeJSON(w, http.StatusUnauthorized, map[string]any{"error": "verified identity bearer token is required"})
+		return
+	}
+	if verifiedUser == nil && a.cfg.DeviceRegistrationKey == "" && !a.cfg.InsecureDevMode {
 		writeJSON(w, http.StatusServiceUnavailable, map[string]any{
 			"error": "verified account authentication is not configured; unverified email sign-in is disabled",
 		})
 		return
 	}
-	if a.cfg.DeviceRegistrationKey != "" && !secretEqual(deviceRegistrationKey(r), a.cfg.DeviceRegistrationKey) {
+	if verifiedUser == nil && a.cfg.DeviceRegistrationKey != "" && !registrationAuthorized {
 		writeJSON(w, http.StatusUnauthorized, map[string]any{"error": "device registration is not authorized"})
 		return
 	}
@@ -227,7 +280,15 @@ func (a *app) createDevice(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "invalid JSON"})
 		return
 	}
-	user, device, token, err := a.store.CreateDeviceToken(r.Context(), body.Email, body.DeviceName)
+	var user store.User
+	var device store.Device
+	var token string
+	var err error
+	if verifiedUser != nil {
+		user, device, token, err = a.store.CreateDeviceTokenForUser(r.Context(), verifiedUser.ID, body.DeviceName)
+	} else {
+		user, device, token, err = a.store.CreateDeviceToken(r.Context(), body.Email, body.DeviceName)
+	}
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
 		return
@@ -765,6 +826,12 @@ func websocketAcceptOptions(allowed []string, insecureDevMode bool) *websocket.A
 }
 
 func (a *app) authMode() string {
+	if a.identity != nil && a.cfg.DeviceRegistrationKey != "" {
+		return "clerk_or_registration_key"
+	}
+	if a.identity != nil {
+		return "clerk"
+	}
 	if a.cfg.DeviceRegistrationKey != "" {
 		return "registration_key"
 	}

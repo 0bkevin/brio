@@ -21,6 +21,24 @@ func TestPostgresStoreControlPlaneAndPairingParity(t *testing.T) {
 	t.Cleanup(s.Close)
 
 	suffix := strings.ToLower(RandomCode(12))
+	verified, err := s.UpsertIdentity(ctx, "https://clerk.example/", "user-"+suffix, "Verified-"+suffix+"@Example.com")
+	if err != nil {
+		t.Fatalf("upsert verified identity: %v", err)
+	}
+	verifiedAgain, err := s.UpsertIdentity(ctx, "https://clerk.example", "user-"+suffix, "updated-"+suffix+"@example.com")
+	if err != nil {
+		t.Fatalf("update verified identity: %v", err)
+	}
+	if verifiedAgain.ID != verified.ID || verifiedAgain.Email != "updated-"+suffix+"@example.com" {
+		t.Fatalf("verified identity was not stable: first=%+v updated=%+v", verified, verifiedAgain)
+	}
+	verifiedUser, verifiedDevice, verifiedToken, err := s.CreateDeviceTokenForUser(ctx, verified.ID, "Verified phone")
+	if err != nil {
+		t.Fatalf("create verified device: %v", err)
+	}
+	if verifiedUser.ID != verified.ID || verifiedDevice.UserID != verified.ID || verifiedToken == "" {
+		t.Fatalf("unexpected verified device: user=%+v device=%+v token_empty=%v", verifiedUser, verifiedDevice, verifiedToken == "")
+	}
 	user, _, deviceToken, err := s.CreateDeviceToken(ctx, "  Owner-"+suffix+"@Example.com  ", "Phone")
 	if err != nil {
 		t.Fatalf("create device: %v", err)

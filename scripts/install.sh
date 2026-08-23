@@ -14,8 +14,7 @@
 set -eu
 
 REPO="0bkevin/brio"
-DEFAULT_RELAY_URL="https://brio-relay.xa95xa94cj2n4.us-east-1.cs.amazonlightsail.com"
-RELAY_URL="${BRIO_RELAY_URL:-$DEFAULT_RELAY_URL}"
+RELAY_URL="${BRIO_RELAY_URL:-}"
 VERSION="${BRIO_VERSION:-latest}"
 HERMES_URL="${BRIO_HERMES_URL:-http://127.0.0.1:8642}"
 AGENT_NAME="${BRIO_AGENT_NAME:-Hermes}"
@@ -104,6 +103,10 @@ case ":$PATH:" in
 esac
 
 if [ "${BRIO_ENROLL_CODE:-}" ]; then
+  if [ -z "$RELAY_URL" ]; then
+    echo "SETUP_RELAY_URL_REQUIRED: set BRIO_RELAY_URL to the relay that issued this enrollment code." >&2
+    exit 1
+  fi
   install_flag="--install"
   start_flag="--start"
   if [ "$INSTALL_SERVICE" = "false" ]; then
@@ -132,7 +135,7 @@ echo ""
 echo "Next — connect this Hermes machine from the Brio mobile app:"
 echo ""
 echo "  curl -fsSL https://github.com/${REPO}/releases/latest/download/install.sh \\"
-echo "    | BRIO_RELAY_URL=\"${RELAY_URL}\" \\"
+echo "    | BRIO_RELAY_URL=\"<RELAY_URL_FROM_THE_APP>\" \\"
 echo "      BRIO_ENROLL_CODE=\"<CODE_FROM_THE_APP>\" \\"
 echo "      BRIO_AGENT_NAME=\"Hermes\" \\"
 echo "      sh"

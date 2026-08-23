@@ -6,6 +6,42 @@ import (
 	"time"
 )
 
+func TestMemoryStoreKeepsVerifiedIdentitySeparateFromEmailMetadata(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	s := NewMemoryStore()
+
+	first, err := s.UpsertIdentity(ctx, "https://clerk.example/", "user-1", "Owner@Example.com")
+	if err != nil {
+		t.Fatal(err)
+	}
+	again, err := s.UpsertIdentity(ctx, "https://clerk.example", "user-1", "new@example.com")
+	if err != nil {
+		t.Fatal(err)
+	}
+	otherIssuer, err := s.UpsertIdentity(ctx, "https://other.example", "user-1", "new@example.com")
+	if err != nil {
+		t.Fatal(err)
+	}
+	unverified, _, _, err := s.CreateDeviceToken(ctx, "new@example.com", "Operations device")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.ID != again.ID || again.Email != "new@example.com" {
+		t.Fatalf("identity was not stably upserted: first=%+v again=%+v", first, again)
+	}
+	if otherIssuer.ID == first.ID || unverified.ID == first.ID || unverified.ID == otherIssuer.ID {
+		t.Fatalf("email metadata merged distinct principals: verified=%q other=%q unverified=%q", first.ID, otherIssuer.ID, unverified.ID)
+	}
+	createdUser, device, token, err := s.CreateDeviceTokenForUser(ctx, first.ID, "Phone")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if createdUser.ID != first.ID || device.UserID != first.ID || token == "" {
+		t.Fatalf("unexpected verified device credentials: user=%+v device=%+v token_empty=%v", createdUser, device, token == "")
+	}
+}
+
 func TestMemoryStoreCreatePairingRequiresExistingCompanionTokenForClaimedAgent(t *testing.T) {
 	ctx := context.Background()
 	s := NewMemoryStore()

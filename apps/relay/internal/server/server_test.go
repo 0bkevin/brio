@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	identityauth "github.com/brio/brio/apps/relay/internal/auth"
 	"github.com/brio/brio/apps/relay/internal/store"
 )
 
@@ -322,6 +323,64 @@ func TestCreateDeviceRequiresConfiguredRegistrationKey(t *testing.T) {
 	}
 }
 
+func TestCreateDeviceUsesVerifiedIdentityInsteadOfSubmittedEmail(t *testing.T) {
+	st := store.NewMemoryStore()
+	a := &app{
+		cfg:   Config{},
+		hub:   newHub(),
+		store: st,
+		identity: fakeIdentityVerifier{identity: identityauth.Identity{
+			Issuer:  "https://clerk.example",
+			Subject: "user-123",
+			Email:   "verified@example.com",
+		}},
+	}
+	req := httptest.NewRequest(http.MethodPost, "/auth/devices", strings.NewReader(`{"email":"attacker@example.com","device_name":"Phone"}`))
+	req.Header.Set("Authorization", "Bearer valid-clerk-token")
+	recorder := httptest.NewRecorder()
+
+	a.createDevice(recorder, req)
+
+	if recorder.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want %d: %s", recorder.Code, http.StatusCreated, recorder.Body.String())
+	}
+	var response struct {
+		User   store.User   `json:"user"`
+		Device store.Device `json:"device"`
+		Token  string       `json:"token"`
+	}
+	if err := json.Unmarshal(recorder.Body.Bytes(), &response); err != nil {
+		t.Fatal(err)
+	}
+	if response.User.Email != "verified@example.com" || response.User.IdentitySubject != "user-123" {
+		t.Fatalf("unverified request metadata affected identity: %+v", response.User)
+	}
+	if response.Device.UserID != response.User.ID || response.Token == "" {
+		t.Fatalf("unexpected device response: %+v", response)
+	}
+	authenticated, err := st.AuthenticateDevice(t.Context(), response.Token)
+	if err != nil || authenticated.User.ID != response.User.ID {
+		t.Fatalf("issued device token did not authenticate verified user: auth=%+v err=%v", authenticated, err)
+	}
+}
+
+func TestCreateDeviceRejectsInvalidVerifiedIdentity(t *testing.T) {
+	a := &app{
+		hub:      newHub(),
+		store:    store.NewMemoryStore(),
+		identity: fakeIdentityVerifier{err: identityauth.ErrInvalidIdentityToken},
+	}
+	req := httptest.NewRequest(http.MethodPost, "/auth/devices", strings.NewReader(`{"device_name":"Phone"}`))
+	req.Header.Set("Authorization", "Bearer forged-token")
+	recorder := httptest.NewRecorder()
+
+	a.createDevice(recorder, req)
+
+	if recorder.Code != http.StatusUnauthorized {
+		t.Fatalf("status = %d, want %d: %s", recorder.Code, http.StatusUnauthorized, recorder.Body.String())
+	}
+}
+
 func TestOriginAllowedNormalizesFullOriginsAndHostPatterns(t *testing.T) {
 	if !originAllowed("https://app.brio.dev", []string{"https://app.brio.dev/"}, false) {
 		t.Fatal("expected exact full origin with trailing slash to be allowed")
@@ -539,6 +598,15 @@ func peerConnected(h *hub, target *peer) bool {
 type touchStore struct {
 	store.Store
 	statuses []string
+}
+
+type fakeIdentityVerifier struct {
+	identity identityauth.Identity
+	err      error
+}
+
+func (v fakeIdentityVerifier) Verify(context.Context, string) (identityauth.Identity, error) {
+	return v.identity, v.err
 }
 
 func (s *touchStore) TouchAgent(ctx context.Context, agentID string, status string) error {
