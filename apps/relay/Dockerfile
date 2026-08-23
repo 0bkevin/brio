@@ -1,6 +1,6 @@
 # Build the Brio relay as a self-contained static binary.
 # Build context is apps/relay (set Railway root directory to apps/relay).
-FROM golang:1.26 AS build
+FROM golang:1.26.6 AS build
 WORKDIR /src
 COPY go.mod go.sum ./
 RUN go mod download

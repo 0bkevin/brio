@@ -56,6 +56,9 @@
     "check": "npm run lint && npm run typecheck && npm test && npm run export:web"
   },
   "overrides": {
+    "jayson": {
+      "uuid": "^11.1.1"
+    },
     "xcode": {
       "uuid": "^11.1.1"
     }
