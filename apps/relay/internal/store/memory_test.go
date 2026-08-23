@@ -50,14 +50,21 @@ func TestMemoryStoreCreatePairingRequiresExistingCompanionTokenForClaimedAgent(t
 	if err != nil {
 		t.Fatalf("first pairing: %v", err)
 	}
+	if agents := s.agents; agents["agent-1"].Status != "offline" || agents["agent-1"].LastSeenAt != nil {
+		t.Fatalf("pairing marked agent online before tunnel connection: %+v", agents["agent-1"])
+	}
 
 	user, _, _, err := s.CreateDeviceToken(ctx, "owner@example.com", "Phone")
 	if err != nil {
 		t.Fatalf("create device token: %v", err)
 	}
 
-	if _, err := s.ClaimPairing(ctx, firstPairing.Code, user.ID); err != nil {
+	claimed, err := s.ClaimPairing(ctx, firstPairing.Code, user.ID)
+	if err != nil {
 		t.Fatalf("claim pairing: %v", err)
+	}
+	if claimed.Status != "offline" || claimed.LastSeenAt != nil {
+		t.Fatalf("claim marked agent online before tunnel connection: %+v", claimed)
 	}
 
 	if _, err := s.CreatePairing(ctx, "agent-1", "Hermes", time.Minute, ""); err != ErrUnauthorized {

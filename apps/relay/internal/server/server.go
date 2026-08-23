@@ -8,12 +8,14 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/url"
 	"path/filepath"
 	"strings"
 	"sync"
 	"time"
+	"unicode"
 
 	identityauth "github.com/brio/brio/apps/relay/internal/auth"
 	"github.com/brio/brio/apps/relay/internal/store"
@@ -22,7 +24,20 @@ import (
 	"nhooyr.io/websocket"
 )
 
-const pendingRequestTTL = 6 * time.Minute
+const (
+	pendingRequestTTL          = 6 * time.Minute
+	maxPendingRequestsPerAgent = 1024
+	maxPendingRequestsPerPeer  = 256
+	maxRelayFrameIDLength      = 128
+	maxTunnelCredentialLength  = 512
+	maxJSONBodyBytes           = 16 * 1024
+	maxAgentIDLength           = 128
+	maxDisplayNameLength       = 160
+	maxEmailLength             = 320
+	maxPairingCodeLength       = 64
+	requestBodyReadTimeout     = 10 * time.Second
+	credentialMutationTimeout  = 10 * time.Second
+)
 
 const (
 	relayTunnelSubprotocol         = "brio.tunnel.v1"
@@ -72,6 +87,10 @@ type app struct {
 	hub            *hub
 	store          store.Store
 	identity       identityauth.IdentityVerifier
+	peerMu         sync.Mutex
+	tunnelWG       sync.WaitGroup
+	presenceMu     sync.Mutex
+	presenceLocks  map[string]*sync.Mutex
 	trustedProxies trustedProxySet
 	rateLimiters   map[string]*fixedWindowLimiter
 }
@@ -139,17 +158,28 @@ func Run(ctx context.Context, cfg Config) error {
 		Addr:              cfg.Addr,
 		Handler:           router,
 		ReadHeaderTimeout: 10 * time.Second,
+		MaxHeaderBytes:    32 * 1024,
+		BaseContext: func(net.Listener) context.Context {
+			return ctx
+		},
 	}
+	shutdownDone := make(chan struct{})
 	go func() {
 		<-ctx.Done()
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 		_ = srv.Shutdown(shutdownCtx)
+		a.disconnectAllPeers()
+		a.tunnelWG.Wait()
+		close(shutdownDone)
 	}()
 
 	slog.Info("brio relay listening", "addr", cfg.Addr)
 	err = srv.ListenAndServe()
 	if errors.Is(err, http.ErrServerClosed) {
+		if ctx.Err() != nil {
+			<-shutdownDone
+		}
 		return nil
 	}
 	return err
@@ -182,12 +212,18 @@ func newHub() *hub {
 func requestLogger(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		wrapped := middleware.NewWrapResponseWriter(w, r.ProtoMajor)
+		if r.Method != http.MethodGet && r.Method != http.MethodHead {
+			responseController := http.NewResponseController(wrapped)
+			if err := responseController.SetReadDeadline(time.Now().Add(requestBodyReadTimeout)); err == nil {
+				defer responseController.SetReadDeadline(time.Time{})
+			}
+		}
 		started := time.Now()
 		next.ServeHTTP(wrapped, r)
 		slog.Info("relay request",
 			"request_id", middleware.GetReqID(r.Context()),
 			"method", r.Method,
-			"path", r.URL.EscapedPath(),
+			"path", safeRequestLogPath(r.URL.EscapedPath()),
 			"status", wrapped.Status(),
 			"bytes", wrapped.BytesWritten(),
 			"duration", time.Since(started),
@@ -276,8 +312,13 @@ func (a *app) createDevice(w http.ResponseWriter, r *http.Request) {
 		Email      string `json:"email"`
 		DeviceName string `json:"device_name"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "invalid JSON"})
+	if !decodeJSONBody(w, r, &body, false) {
+		return
+	}
+	body.Email = strings.TrimSpace(body.Email)
+	body.DeviceName = strings.TrimSpace(body.DeviceName)
+	if !fieldLengthAllowed(w, "email", body.Email, maxEmailLength) ||
+		!fieldLengthAllowed(w, "device_name", body.DeviceName, maxDisplayNameLength) {
 		return
 	}
 	var user store.User
@@ -290,7 +331,7 @@ func (a *app) createDevice(w http.ResponseWriter, r *http.Request) {
 		user, device, token, err = a.store.CreateDeviceToken(r.Context(), body.Email, body.DeviceName)
 	}
 	if err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
+		writeInternalError(w, err)
 		return
 	}
 	writeJSON(w, http.StatusCreated, map[string]any{"user": user, "device": device, "token": token})
@@ -305,7 +346,7 @@ func (a *app) listDevices(w http.ResponseWriter, r *http.Request) {
 	auth := authFromContext(r.Context())
 	devices, err := a.store.ListDevices(r.Context(), auth.User.ID)
 	if err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
+		writeInternalError(w, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"devices": devices})
@@ -313,12 +354,18 @@ func (a *app) listDevices(w http.ResponseWriter, r *http.Request) {
 
 func (a *app) revokeDevice(w http.ResponseWriter, r *http.Request) {
 	auth := authFromContext(r.Context())
-	device, err := a.store.RevokeDevice(r.Context(), auth.User.ID, strings.TrimSpace(chi.URLParam(r, "id")))
+	mutationCtx, cancel := context.WithTimeout(r.Context(), credentialMutationTimeout)
+	defer cancel()
+	a.peerMu.Lock()
+	device, err := a.store.RevokeDevice(mutationCtx, auth.User.ID, strings.TrimSpace(chi.URLParam(r, "id")))
+	if err == nil {
+		a.hub.disconnectDevice(device.ID)
+	}
+	a.peerMu.Unlock()
 	if err != nil {
 		writeStoreError(w, err)
 		return
 	}
-	a.hub.disconnectDevice(device.ID)
 	writeJSON(w, http.StatusOK, map[string]any{"device": device})
 }
 
@@ -326,7 +373,7 @@ func (a *app) listAgents(w http.ResponseWriter, r *http.Request) {
 	auth := authFromContext(r.Context())
 	agents, err := a.store.ListAgents(r.Context(), auth.User.ID)
 	if err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
+		writeInternalError(w, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"agents": agents})
@@ -337,15 +384,16 @@ func (a *app) createEnrollment(w http.ResponseWriter, r *http.Request) {
 	var body struct {
 		Name string `json:"name"`
 	}
-	if r.Body != nil {
-		if err := json.NewDecoder(r.Body).Decode(&body); err != nil && !errors.Is(err, io.EOF) {
-			writeJSON(w, http.StatusBadRequest, map[string]any{"error": "invalid JSON"})
-			return
-		}
+	if !decodeJSONBody(w, r, &body, true) {
+		return
+	}
+	body.Name = strings.TrimSpace(body.Name)
+	if !fieldLengthAllowed(w, "name", body.Name, maxDisplayNameLength) {
+		return
 	}
 	enrollment, err := a.store.CreateEnrollment(r.Context(), auth.User.ID, body.Name, 15*time.Minute)
 	if err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
+		writeInternalError(w, err)
 		return
 	}
 	writeJSON(w, http.StatusCreated, enrollment)
@@ -353,25 +401,39 @@ func (a *app) createEnrollment(w http.ResponseWriter, r *http.Request) {
 
 func (a *app) claimEnrollment(w http.ResponseWriter, r *http.Request) {
 	code := strings.ToUpper(strings.TrimSpace(chi.URLParam(r, "code")))
+	if !fieldLengthAllowed(w, "code", code, maxPairingCodeLength) {
+		return
+	}
 	var body struct {
 		AgentID string `json:"agent_id"`
 		Name    string `json:"name"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "invalid JSON"})
+	if !decodeJSONBody(w, r, &body, false) {
 		return
 	}
 	body.AgentID = strings.TrimSpace(body.AgentID)
+	body.Name = strings.TrimSpace(body.Name)
 	if body.AgentID == "" {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "agent_id is required"})
 		return
 	}
-	agent, relayToken, err := a.store.ClaimEnrollment(r.Context(), code, body.AgentID, body.Name)
+	if !fieldLengthAllowed(w, "agent_id", body.AgentID, maxAgentIDLength) ||
+		!agentIDCharactersAllowed(w, body.AgentID) ||
+		!fieldLengthAllowed(w, "name", body.Name, maxDisplayNameLength) {
+		return
+	}
+	mutationCtx, cancel := context.WithTimeout(r.Context(), credentialMutationTimeout)
+	defer cancel()
+	a.peerMu.Lock()
+	agent, relayToken, err := a.store.ClaimEnrollment(mutationCtx, code, body.AgentID, body.Name)
+	if err == nil {
+		a.hub.disconnectCompanions(agent.ID)
+	}
+	a.peerMu.Unlock()
 	if err != nil {
 		writeStoreError(w, err)
 		return
 	}
-	a.hub.disconnectCompanions(agent.ID)
 	writeJSON(w, http.StatusCreated, map[string]any{
 		"agent":       agent,
 		"relay_token": relayToken,
@@ -385,21 +447,31 @@ func (a *app) recoverAgent(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "agent id is required"})
 		return
 	}
+	if !fieldLengthAllowed(w, "agent id", agentID, maxAgentIDLength) || !agentIDCharactersAllowed(w, agentID) {
+		return
+	}
 	var body struct {
 		Name string `json:"name"`
 	}
-	if r.Body != nil {
-		if err := json.NewDecoder(r.Body).Decode(&body); err != nil && !errors.Is(err, io.EOF) {
-			writeJSON(w, http.StatusBadRequest, map[string]any{"error": "invalid JSON"})
-			return
-		}
+	if !decodeJSONBody(w, r, &body, true) {
+		return
 	}
-	p, err := a.store.RecoverPairing(r.Context(), auth.User.ID, agentID, body.Name, 10*time.Minute)
+	body.Name = strings.TrimSpace(body.Name)
+	if !fieldLengthAllowed(w, "name", body.Name, maxDisplayNameLength) {
+		return
+	}
+	mutationCtx, cancel := context.WithTimeout(r.Context(), credentialMutationTimeout)
+	defer cancel()
+	a.peerMu.Lock()
+	p, err := a.store.RecoverPairing(mutationCtx, auth.User.ID, agentID, body.Name, 10*time.Minute)
+	if err == nil {
+		a.hub.disconnectCompanions(agentID)
+	}
+	a.peerMu.Unlock()
 	if err != nil {
 		writeStoreError(w, err)
 		return
 	}
-	a.hub.disconnectCompanions(agentID)
 	writeJSON(w, http.StatusCreated, p)
 }
 
@@ -408,29 +480,43 @@ func (a *app) createPairing(w http.ResponseWriter, r *http.Request) {
 		AgentID string `json:"agent_id"`
 		Name    string `json:"name"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "invalid JSON"})
+	if !decodeJSONBody(w, r, &body, false) {
 		return
 	}
 	body.AgentID = strings.TrimSpace(body.AgentID)
+	body.Name = strings.TrimSpace(body.Name)
 	if body.AgentID == "" {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "agent_id is required"})
+		return
+	}
+	if !fieldLengthAllowed(w, "agent_id", body.AgentID, maxAgentIDLength) ||
+		!agentIDCharactersAllowed(w, body.AgentID) ||
+		!fieldLengthAllowed(w, "name", body.Name, maxDisplayNameLength) {
 		return
 	}
 	if body.Name == "" {
 		body.Name = "Hermes"
 	}
-	p, err := a.store.CreatePairing(r.Context(), body.AgentID, body.Name, 10*time.Minute, bearerToken(r))
+	mutationCtx, cancel := context.WithTimeout(r.Context(), credentialMutationTimeout)
+	defer cancel()
+	a.peerMu.Lock()
+	p, err := a.store.CreatePairing(mutationCtx, body.AgentID, body.Name, 10*time.Minute, bearerToken(r))
+	if err == nil {
+		a.hub.disconnectCompanions(body.AgentID)
+	}
+	a.peerMu.Unlock()
 	if err != nil {
 		writeStoreError(w, err)
 		return
 	}
-	a.hub.disconnectCompanions(body.AgentID)
 	writeJSON(w, http.StatusCreated, p)
 }
 
 func (a *app) getPairing(w http.ResponseWriter, r *http.Request) {
 	code := strings.ToUpper(strings.TrimSpace(chi.URLParam(r, "code")))
+	if !fieldLengthAllowed(w, "code", code, maxPairingCodeLength) {
+		return
+	}
 	p, err := a.store.GetPairing(r.Context(), code)
 	if err != nil {
 		writeStoreError(w, err)
@@ -442,6 +528,9 @@ func (a *app) getPairing(w http.ResponseWriter, r *http.Request) {
 func (a *app) claimPairing(w http.ResponseWriter, r *http.Request) {
 	auth := authFromContext(r.Context())
 	code := strings.ToUpper(strings.TrimSpace(chi.URLParam(r, "code")))
+	if !fieldLengthAllowed(w, "code", code, maxPairingCodeLength) {
+		return
+	}
 	agent, err := a.store.ClaimPairing(r.Context(), code, auth.User.ID)
 	if err != nil {
 		writeStoreError(w, err)
@@ -451,18 +540,28 @@ func (a *app) claimPairing(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *app) tunnel(w http.ResponseWriter, r *http.Request) {
+	a.tunnelWG.Add(1)
+	defer a.tunnelWG.Done()
+
 	role := chi.URLParam(r, "role")
 	if role != "mobile" && role != "companion" {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "role must be mobile or companion"})
 		return
 	}
-	agentID := chi.URLParam(r, "agentID")
+	agentID := strings.TrimSpace(chi.URLParam(r, "agentID"))
 	if agentID == "" {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "agent id is required"})
 		return
 	}
+	if !fieldLengthAllowed(w, "agent id", agentID, maxAgentIDLength) || !agentIDCharactersAllowed(w, agentID) {
+		return
+	}
 	deviceID := ""
-	token, selectedSubprotocol := tunnelCredential(r, role, a.cfg.AllowLegacyQueryTokens)
+	token, selectedSubprotocol, credentialErr := tunnelCredential(r, role, a.cfg.AllowLegacyQueryTokens)
+	if credentialErr != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "invalid tunnel credential transport"})
+		return
+	}
 	if role == "mobile" {
 		if token == "" {
 			writeJSON(w, http.StatusUnauthorized, map[string]any{"error": "missing device token"})
@@ -475,7 +574,7 @@ func (a *app) tunnel(w http.ResponseWriter, r *http.Request) {
 		}
 		ok, err := a.store.UserCanAccessAgent(r.Context(), auth.User.ID, agentID)
 		if err != nil {
-			writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
+			writeInternalError(w, err)
 			return
 		}
 		if !ok {
@@ -493,6 +592,7 @@ func (a *app) tunnel(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+	peerID := role + "_" + store.RandomCode(24)
 	acceptOptions := websocketAcceptOptions(a.cfg.AllowedOrigins, a.cfg.InsecureDevMode)
 	if selectedSubprotocol != "" {
 		acceptOptions.Subprotocols = []string{selectedSubprotocol}
@@ -503,7 +603,7 @@ func (a *app) tunnel(w http.ResponseWriter, r *http.Request) {
 	}
 	conn.SetReadLimit(12 * 1024 * 1024)
 	p := &peer{
-		id:       role + "_" + store.RandomCode(24),
+		id:       peerID,
 		agentID:  agentID,
 		deviceID: deviceID,
 		role:     role,
@@ -511,7 +611,10 @@ func (a *app) tunnel(w http.ResponseWriter, r *http.Request) {
 		send:     make(chan []byte, 64),
 		joined:   time.Now().UTC(),
 	}
-	a.addPeer(r.Context(), p)
+	if err := a.revalidateAndAddPeer(r.Context(), p, token); err != nil {
+		_ = conn.Close(websocket.StatusPolicyViolation, "credential is no longer valid")
+		return
+	}
 	defer a.removePeer(p)
 
 	ctx := r.Context()
@@ -524,22 +627,106 @@ func (a *app) tunnel(w http.ResponseWriter, r *http.Request) {
 		if typ != websocket.MessageText && typ != websocket.MessageBinary {
 			continue
 		}
-		a.hub.route(p, data)
+		a.routePeer(p, data)
 	}
+}
+
+func (a *app) routePeer(p *peer, data []byte) {
+	var frame tunnelFrame
+	parseErr := json.Unmarshal(data, &frame)
+	a.peerMu.Lock()
+	defer a.peerMu.Unlock()
+	a.hub.routeFrame(p, data, frame, parseErr)
+}
+
+func (a *app) disconnectAllPeers() {
+	a.peerMu.Lock()
+	defer a.peerMu.Unlock()
+	a.hub.disconnectMatching(func(*peer) bool { return true })
 }
 
 func (a *app) addPeer(ctx context.Context, p *peer) {
+	a.peerMu.Lock()
+	a.addPeerLocked(p)
+	a.peerMu.Unlock()
+	a.updateAgentPresence(ctx, p)
+}
+
+func (a *app) addPeerLocked(p *peer) {
 	a.hub.add(p)
-	if p.role == "companion" {
-		_ = a.store.TouchAgent(ctx, p.agentID, "online")
-	}
 }
 
 func (a *app) removePeer(p *peer) {
+	a.peerMu.Lock()
 	a.hub.remove(p)
-	if p.role == "companion" && !a.hub.hasCompanion(p.agentID) {
-		_ = a.store.TouchAgent(context.Background(), p.agentID, "offline")
+	a.peerMu.Unlock()
+	a.updateAgentPresence(context.Background(), p)
+}
+
+func (a *app) revalidateAndAddPeer(ctx context.Context, p *peer, token string) error {
+	authCtx, cancel := context.WithTimeout(ctx, credentialMutationTimeout)
+	defer cancel()
+	a.peerMu.Lock()
+
+	if p.role == "mobile" {
+		auth, err := a.store.AuthenticateDevice(authCtx, token)
+		if err != nil {
+			a.peerMu.Unlock()
+			return err
+		}
+		ok, err := a.store.UserCanAccessAgent(authCtx, auth.User.ID, p.agentID)
+		if err != nil {
+			a.peerMu.Unlock()
+			return err
+		}
+		if !ok || auth.Device.ID != p.deviceID {
+			a.peerMu.Unlock()
+			return store.ErrUnauthorized
+		}
+	} else if err := a.store.AuthenticateCompanion(authCtx, p.agentID, token); err != nil {
+		a.peerMu.Unlock()
+		return err
 	}
+
+	a.addPeerLocked(p)
+	a.peerMu.Unlock()
+	a.updateAgentPresence(ctx, p)
+	return nil
+}
+
+func (a *app) updateAgentPresence(ctx context.Context, p *peer) {
+	if p.role != "companion" {
+		return
+	}
+	presenceLock := a.presenceLock(p.agentID)
+	presenceLock.Lock()
+	defer presenceLock.Unlock()
+
+	a.peerMu.Lock()
+	status := "offline"
+	if a.hub.hasCompanion(p.agentID) {
+		status = "online"
+	}
+	a.peerMu.Unlock()
+	touchCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	if err := a.store.TouchAgent(touchCtx, p.agentID, status); err != nil {
+		slog.Error("could not update relay agent presence", "agent_id", p.agentID, "status", status, "error_type", fmt.Sprintf("%T", err))
+	}
+}
+
+func (a *app) presenceLock(agentID string) *sync.Mutex {
+	a.presenceMu.Lock()
+	defer a.presenceMu.Unlock()
+	if a.presenceLocks == nil {
+		a.presenceLocks = map[string]*sync.Mutex{}
+	}
+	lock := a.presenceLocks[agentID]
+	if lock == nil {
+		lock = &sync.Mutex{}
+		a.presenceLocks[agentID] = lock
+	}
+	return lock
 }
 
 func (h *hub) add(p *peer) {
@@ -551,13 +738,23 @@ func (h *hub) add(p *peer) {
 	h.agents[p.agentID][p] = true
 }
 
-func (h *hub) remove(p *peer) {
+func (h *hub) remove(p *peer) bool {
 	h.mu.Lock()
-	defer h.mu.Unlock()
+	removed := h.removeLocked(p)
+	h.mu.Unlock()
+	if removed && p.conn != nil {
+		_ = p.conn.CloseNow()
+	}
+	return removed
+}
+
+func (h *hub) removeLocked(p *peer) bool {
+	removed := false
 	if peers := h.agents[p.agentID]; peers != nil {
 		if _, ok := peers[p]; ok {
 			delete(peers, p)
 			close(p.send)
+			removed = true
 		}
 		if len(peers) == 0 {
 			delete(h.agents, p.agentID)
@@ -577,9 +774,7 @@ func (h *hub) remove(p *peer) {
 			delete(h.pending, p.agentID)
 		}
 	}
-	if p.conn != nil {
-		_ = p.conn.Close(websocket.StatusNormalClosure, "bye")
-	}
+	return removed
 }
 
 func (h *hub) hasCompanion(agentID string) bool {
@@ -597,27 +792,22 @@ func (h *hub) disconnectDevice(deviceID string) {
 	if deviceID == "" {
 		return
 	}
-	for _, p := range h.matchingPeers(func(p *peer) bool {
+	h.disconnectMatching(func(p *peer) bool {
 		return p.role == "mobile" && p.deviceID == deviceID
-	}) {
-		h.remove(p)
-	}
+	})
 }
 
 func (h *hub) disconnectCompanions(agentID string) {
 	if agentID == "" {
 		return
 	}
-	for _, p := range h.matchingPeers(func(p *peer) bool {
+	h.disconnectMatching(func(p *peer) bool {
 		return p.role == "companion" && p.agentID == agentID
-	}) {
-		h.remove(p)
-	}
+	})
 }
 
-func (h *hub) matchingPeers(matches func(*peer) bool) []*peer {
+func (h *hub) disconnectMatching(matches func(*peer) bool) {
 	h.mu.Lock()
-	defer h.mu.Unlock()
 	var peers []*peer
 	for _, set := range h.agents {
 		for p := range set {
@@ -626,33 +816,52 @@ func (h *hub) matchingPeers(matches func(*peer) bool) []*peer {
 			}
 		}
 	}
-	return peers
+	for _, p := range peers {
+		h.removeLocked(p)
+	}
+	h.mu.Unlock()
+	for _, p := range peers {
+		if p.conn != nil {
+			_ = p.conn.CloseNow()
+		}
+	}
 }
 
 func (h *hub) route(from *peer, data []byte) {
 	var frame tunnelFrame
-	if err := json.Unmarshal(data, &frame); err != nil {
-		h.enqueue(from, errorFrame("", "BAD_FRAME", "frame must be valid JSON"))
+	parseErr := json.Unmarshal(data, &frame)
+	h.routeFrame(from, data, frame, parseErr)
+}
+
+func (h *hub) routeFrame(from *peer, data []byte, frame tunnelFrame, parseErr error) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if !h.isConnectedLocked(from) {
+		return
+	}
+	if parseErr != nil {
+		h.enqueueLocked(from, errorFrame("", "BAD_FRAME", "frame must be valid JSON"))
 		return
 	}
 	if frame.Type == "" {
-		h.enqueue(from, errorFrame(frame.ID, "BAD_FRAME", "frame type is required"))
+		h.enqueueLocked(from, errorFrame(frame.ID, "BAD_FRAME", "frame type is required"))
 		return
 	}
 	if frame.Type == "ping" {
-		h.enqueue(from, mustJSON(tunnelFrame{Type: "pong", ID: frame.ID}))
+		h.enqueueLocked(from, mustJSON(tunnelFrame{Type: "pong", ID: frame.ID}))
 		return
 	}
 	if frame.Type == "pong" {
 		return
 	}
 	if frame.ID == "" {
-		h.enqueue(from, errorFrame("", "BAD_FRAME", "frame id is required"))
+		h.enqueueLocked(from, errorFrame("", "BAD_FRAME", "frame id is required"))
 		return
 	}
-
-	h.mu.Lock()
-	defer h.mu.Unlock()
+	if len(frame.ID) > maxRelayFrameIDLength {
+		h.enqueueLocked(from, errorFrame("", "BAD_FRAME", "frame id is too long"))
+		return
+	}
 	now := time.Now().UTC()
 	h.pruneLocked(now)
 
@@ -672,6 +881,10 @@ func (h *hub) route(from *peer, data []byte) {
 		}
 		if _, exists := h.pending[from.agentID][frame.ID]; exists {
 			h.enqueueLocked(from, errorFrame(frame.ID, "DUPLICATE_REQUEST_ID", "a relay request with this frame id is already pending"))
+			return
+		}
+		if len(h.pending[from.agentID]) >= maxPendingRequestsPerAgent || h.pendingForPeerLocked(from) >= maxPendingRequestsPerPeer {
+			h.enqueueLocked(from, errorFrame(frame.ID, "RELAY_BACKPRESSURE", "too many relay requests are pending"))
 			return
 		}
 		h.pending[from.agentID][frame.ID] = pendingRequest{requester: from, companion: companion, createdAt: now}
@@ -702,6 +915,20 @@ func (h *hub) route(from *peer, data []byte) {
 			}
 		}
 	}
+}
+
+func (h *hub) isConnectedLocked(p *peer) bool {
+	return p != nil && h.agents[p.agentID][p]
+}
+
+func (h *hub) pendingForPeerLocked(p *peer) int {
+	count := 0
+	for _, request := range h.pending[p.agentID] {
+		if request.requester == p {
+			count++
+		}
+	}
+	return count
 }
 
 func (h *hub) pruneLoop(ctx context.Context) {
@@ -771,7 +998,7 @@ func (p *peer) writeLoop(ctx context.Context) {
 		err := p.conn.Write(writeCtx, websocket.MessageText, data)
 		cancel()
 		if err != nil {
-			_ = p.conn.Close(websocket.StatusPolicyViolation, "write failed")
+			_ = p.conn.CloseNow()
 			return
 		}
 	}
@@ -897,36 +1124,46 @@ func deviceRegistrationKey(r *http.Request) string {
 	return bearerToken(r)
 }
 
-func tunnelCredential(r *http.Request, role string, allowLegacyQueryTokens bool) (token string, selectedSubprotocol string) {
+func tunnelCredential(r *http.Request, role string, allowLegacyQueryTokens bool) (token string, selectedSubprotocol string, err error) {
 	if token := bearerToken(r); token != "" {
-		return token, ""
+		if len(token) > maxTunnelCredentialLength {
+			return "", "", errors.New("tunnel credential is too long")
+		}
+		return token, "", nil
 	}
 	prefix := mobileAuthSubprotocolPrefix
 	if role == "companion" {
 		prefix = companionAuthSubprotocolPrefix
 	}
 	offeredProtocols := map[string]bool{}
+	credential := ""
 	for _, header := range r.Header.Values("Sec-WebSocket-Protocol") {
 		for _, offered := range strings.Split(header, ",") {
 			offered = strings.TrimSpace(offered)
 			offeredProtocols[offered] = true
-		}
-	}
-	if offeredProtocols[relayTunnelSubprotocol] {
-		for offered := range offeredProtocols {
 			if candidate := strings.TrimPrefix(offered, prefix); candidate != offered && candidate != "" {
-				// Echo only the fixed protocol, never the credential-bearing offer.
-				return candidate, relayTunnelSubprotocol
+				if credential != "" || len(candidate) > maxTunnelCredentialLength {
+					return "", "", errors.New("ambiguous or oversized tunnel credential")
+				}
+				credential = candidate
 			}
 		}
+	}
+	if offeredProtocols[relayTunnelSubprotocol] && credential != "" {
+		// Echo only the fixed protocol, never the credential-bearing offer.
+		return credential, relayTunnelSubprotocol, nil
 	}
 	if allowLegacyQueryTokens {
 		// Explicit migration-only compatibility for already-released clients.
 		// Current clients use Authorization (connector) or a negotiated WebSocket
 		// subprotocol (mobile) so long-lived credentials do not appear in URLs.
-		return strings.TrimSpace(r.URL.Query().Get("token")), ""
+		credential = strings.TrimSpace(r.URL.Query().Get("token"))
+		if len(credential) > maxTunnelCredentialLength {
+			return "", "", errors.New("tunnel credential is too long")
+		}
+		return credential, "", nil
 	}
-	return "", ""
+	return "", "", nil
 }
 
 func secretEqual(got string, want string) bool {
@@ -934,6 +1171,67 @@ func secretEqual(got string, want string) bool {
 		return false
 	}
 	return subtle.ConstantTimeCompare([]byte(got), []byte(want)) == 1
+}
+
+func decodeJSONBody(w http.ResponseWriter, r *http.Request, destination any, allowEmpty bool) bool {
+	if r.Body == nil {
+		if allowEmpty {
+			return true
+		}
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "JSON body is required"})
+		return false
+	}
+	r.Body = http.MaxBytesReader(w, r.Body, maxJSONBodyBytes)
+	decoder := json.NewDecoder(r.Body)
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(destination); err != nil {
+		if allowEmpty && errors.Is(err, io.EOF) {
+			return true
+		}
+		writeJSONDecodeError(w, err)
+		return false
+	}
+	var extra any
+	if err := decoder.Decode(&extra); !errors.Is(err, io.EOF) {
+		writeJSONDecodeError(w, err)
+		return false
+	}
+	return true
+}
+
+func safeRequestLogPath(path string) string {
+	segments := strings.Split(path, "/")
+	if len(segments) >= 3 && (segments[1] == "enrollments" || segments[1] == "pairings") {
+		segments[2] = ":code"
+	}
+	return strings.Join(segments, "/")
+}
+
+func writeJSONDecodeError(w http.ResponseWriter, err error) {
+	var tooLarge *http.MaxBytesError
+	if errors.As(err, &tooLarge) {
+		writeJSON(w, http.StatusRequestEntityTooLarge, map[string]any{"error": "JSON body is too large"})
+		return
+	}
+	writeJSON(w, http.StatusBadRequest, map[string]any{"error": "invalid JSON"})
+}
+
+func fieldLengthAllowed(w http.ResponseWriter, field string, value string, maximum int) bool {
+	if len(value) <= maximum {
+		return true
+	}
+	writeJSON(w, http.StatusBadRequest, map[string]any{"error": fmt.Sprintf("%s is too long", field)})
+	return false
+}
+
+func agentIDCharactersAllowed(w http.ResponseWriter, value string) bool {
+	for _, character := range value {
+		if unicode.IsControl(character) || strings.ContainsRune(`/\\?#`, character) {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"error": "agent id contains unsupported characters"})
+			return false
+		}
+	}
+	return true
 }
 
 func writeJSON(w http.ResponseWriter, status int, payload any) {

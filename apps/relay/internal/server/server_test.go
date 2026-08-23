@@ -4,16 +4,20 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"reflect"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	identityauth "github.com/brio/brio/apps/relay/internal/auth"
 	"github.com/brio/brio/apps/relay/internal/store"
+	"github.com/go-chi/chi/v5"
 )
 
 func TestHubRoutesResponseOnlyToRequestingMobilePeer(t *testing.T) {
@@ -158,6 +162,67 @@ func TestHubNotifiesRequesterWhenCompanionDisconnects(t *testing.T) {
 	}
 }
 
+func TestHubIgnoresFramesAlreadyReadFromRemovedPeer(t *testing.T) {
+	h := newHub()
+	mobile := testPeer("mobile", "agent-1")
+	companion := testPeer("companion", "agent-1")
+	h.add(mobile)
+	h.add(companion)
+	h.remove(mobile)
+
+	// A socket read can finish just before revocation removes the peer. Routing
+	// that already-read frame must neither panic on the closed send queue nor
+	// forward a request authenticated by the revoked connection.
+	h.route(mobile, mustJSON(tunnelFrame{Type: "ping", ID: "ping-1"}))
+	h.route(mobile, mustJSON(tunnelFrame{Type: "request", ID: "req-1"}))
+	h.route(mobile, []byte(`not-json`))
+	assertNoFrame(t, companion)
+}
+
+func TestCredentialMutationBoundaryBlocksConcurrentFrameRouting(t *testing.T) {
+	a := &app{hub: newHub(), store: store.NewMemoryStore()}
+	mobile := testPeer("mobile", "agent-1")
+	companion := testPeer("companion", "agent-1")
+	a.hub.add(mobile)
+	a.hub.add(companion)
+
+	a.peerMu.Lock()
+	routed := make(chan struct{})
+	go func() {
+		a.routePeer(mobile, mustJSON(tunnelFrame{Type: "request", ID: "req-1"}))
+		close(routed)
+	}()
+	select {
+	case <-routed:
+		t.Fatal("frame routed through an in-progress credential mutation")
+	case <-time.After(25 * time.Millisecond):
+	}
+	a.hub.remove(mobile)
+	a.peerMu.Unlock()
+	<-routed
+	assertNoFrame(t, companion)
+}
+
+func TestHubCapsPendingRequestsPerMobilePeer(t *testing.T) {
+	h := newHub()
+	mobile := testPeer("mobile", "agent-1")
+	companion := testPeer("companion", "agent-1")
+	companion.send = make(chan []byte, maxPendingRequestsPerPeer+1)
+	h.add(mobile)
+	h.add(companion)
+
+	for index := 0; index < maxPendingRequestsPerPeer; index++ {
+		id := fmt.Sprintf("req-%d", index)
+		h.route(mobile, mustJSON(tunnelFrame{Type: "request", ID: id}))
+	}
+	h.route(mobile, mustJSON(tunnelFrame{Type: "request", ID: "one-too-many"}))
+
+	got := readFrame(t, mobile)
+	if got.Type != "error" || got.Code != "RELAY_BACKPRESSURE" {
+		t.Fatalf("mobile got %+v, want RELAY_BACKPRESSURE error", got)
+	}
+}
+
 func TestRemovePeerMarksLastCompanionOffline(t *testing.T) {
 	st := &touchStore{}
 	a := &app{hub: newHub(), store: st}
@@ -198,11 +263,87 @@ func TestRemovePeerKeepsAgentOnlineWhenAnotherCompanionRemains(t *testing.T) {
 
 	a.removePeer(oldCompanion)
 
-	if len(st.statuses) != 0 {
-		t.Fatalf("touch statuses = %#v, want no offline update while another companion remains", st.statuses)
+	if got := st.statuses; !reflect.DeepEqual(got, []string{"agent-1:online"}) {
+		t.Fatalf("touch statuses = %#v, want current online state while another companion remains", got)
 	}
 	if !a.hub.hasCompanion("agent-1") {
 		t.Fatal("expected another companion to remain connected")
+	}
+}
+
+func TestPeerPresenceUpdatesCannotRaceReplacementConnection(t *testing.T) {
+	st := newOrderedTouchStore()
+	a := &app{hub: newHub(), store: st}
+	oldCompanion := testPeer("companion", "agent-1")
+	newCompanion := testPeer("companion", "agent-1")
+	a.hub.add(oldCompanion)
+
+	removed := make(chan struct{})
+	go func() {
+		a.removePeer(oldCompanion)
+		close(removed)
+	}()
+	<-st.offlineStarted
+
+	added := make(chan struct{})
+	go func() {
+		a.addPeer(context.Background(), newCompanion)
+		close(added)
+	}()
+	select {
+	case <-st.onlineStarted:
+		t.Fatal("replacement companion wrote online before the prior offline update completed")
+	case <-time.After(25 * time.Millisecond):
+	}
+
+	close(st.releaseOffline)
+	<-removed
+	<-added
+	if got := st.snapshot(); !reflect.DeepEqual(got, []string{"agent-1:offline", "agent-1:online"}) {
+		t.Fatalf("touch statuses = %#v, want ordered offline then online", got)
+	}
+}
+
+func TestDeviceRevocationCannotMissPeerJoiningAfterRevalidation(t *testing.T) {
+	st := newRevocationRaceStore()
+	a := &app{hub: newHub(), store: st}
+	mobile := testPeer("mobile", "agent-1")
+	mobile.deviceID = "device-1"
+
+	registered := make(chan error, 1)
+	go func() {
+		registered <- a.revalidateAndAddPeer(context.Background(), mobile, "device-token")
+	}()
+	<-st.authenticationStarted
+
+	req := httptest.NewRequest(http.MethodDelete, "/devices/device-1", nil)
+	routeContext := chi.NewRouteContext()
+	routeContext.URLParams.Add("id", "device-1")
+	ctx := context.WithValue(req.Context(), chi.RouteCtxKey, routeContext)
+	ctx = context.WithValue(ctx, authContextKey{}, store.Auth{User: store.User{ID: "user-1"}})
+	req = req.WithContext(ctx)
+	recorder := httptest.NewRecorder()
+	revoked := make(chan struct{})
+	go func() {
+		a.revokeDevice(recorder, req)
+		close(revoked)
+	}()
+
+	select {
+	case <-st.revocationStarted:
+		t.Fatal("revocation mutated credentials while peer revalidation was still in progress")
+	case <-time.After(25 * time.Millisecond):
+	}
+	close(st.releaseAuthentication)
+	if err := <-registered; err != nil {
+		t.Fatalf("revalidate and add peer: %v", err)
+	}
+	<-revoked
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("revoke status = %d, want %d: %s", recorder.Code, http.StatusOK, recorder.Body.String())
+	}
+	if peerConnected(a.hub, mobile) {
+		t.Fatal("revoked device peer joined after the revocation disconnect pass")
 	}
 }
 
@@ -279,6 +420,22 @@ func TestHubDisconnectCompanionsRotatesOnlyTargetAgent(t *testing.T) {
 	}
 }
 
+func TestDisconnectAllPeersDrainsHub(t *testing.T) {
+	a := &app{hub: newHub(), store: &touchStore{}}
+	a.hub.add(testPeer("mobile", "agent-1"))
+	a.hub.add(testPeer("companion", "agent-1"))
+	a.hub.add(testPeer("companion", "agent-2"))
+
+	a.disconnectAllPeers()
+
+	a.hub.mu.Lock()
+	remaining := len(a.hub.agents)
+	a.hub.mu.Unlock()
+	if remaining != 0 {
+		t.Fatalf("hub retained %d agent peer sets after shutdown", remaining)
+	}
+}
+
 func TestCreateDeviceRequiresExplicitAuthenticationMode(t *testing.T) {
 	body := `{"email":"owner@example.com","device_name":"Phone"}`
 
@@ -296,6 +453,61 @@ func TestCreateDeviceRequiresExplicitAuthenticationMode(t *testing.T) {
 	development.createDevice(recorder, req)
 	if recorder.Code != http.StatusCreated {
 		t.Fatalf("development status = %d, want %d: %s", recorder.Code, http.StatusCreated, recorder.Body.String())
+	}
+}
+
+func TestCreateDeviceRejectsOversizedAndAmbiguousJSONBodies(t *testing.T) {
+	a := &app{cfg: Config{InsecureDevMode: true}, hub: newHub(), store: store.NewMemoryStore()}
+
+	oversized := `{"email":"` + strings.Repeat("a", maxJSONBodyBytes) + `"}`
+	req := httptest.NewRequest(http.MethodPost, "/auth/devices", strings.NewReader(oversized))
+	recorder := httptest.NewRecorder()
+	a.createDevice(recorder, req)
+	if recorder.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("oversized body status = %d, want %d: %s", recorder.Code, http.StatusRequestEntityTooLarge, recorder.Body.String())
+	}
+
+	req = httptest.NewRequest(http.MethodPost, "/auth/devices", strings.NewReader(`{"email":"owner@example.com"} {"email":"other@example.com"}`))
+	recorder = httptest.NewRecorder()
+	a.createDevice(recorder, req)
+	if recorder.Code != http.StatusBadRequest {
+		t.Fatalf("multiple JSON values status = %d, want %d", recorder.Code, http.StatusBadRequest)
+	}
+
+	req = httptest.NewRequest(http.MethodPost, "/auth/devices", strings.NewReader(`{"email":"owner@example.com","admin":true}`))
+	recorder = httptest.NewRecorder()
+	a.createDevice(recorder, req)
+	if recorder.Code != http.StatusBadRequest {
+		t.Fatalf("unknown JSON field status = %d, want %d", recorder.Code, http.StatusBadRequest)
+	}
+}
+
+func TestCreatePairingRejectsAgentIDThatCannotBeAddressedByTunnel(t *testing.T) {
+	a := &app{hub: newHub(), store: store.NewMemoryStore()}
+	req := httptest.NewRequest(http.MethodPost, "/pairings", strings.NewReader(`{"agent_id":"parent/child"}`))
+	recorder := httptest.NewRecorder()
+	a.createPairing(recorder, req)
+	if recorder.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want %d: %s", recorder.Code, http.StatusBadRequest, recorder.Body.String())
+	}
+}
+
+func TestInternalStoreErrorsAreNotExposedToClients(t *testing.T) {
+	var logs bytes.Buffer
+	previousLogger := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&logs, nil)))
+	t.Cleanup(func() { slog.SetDefault(previousLogger) })
+
+	recorder := httptest.NewRecorder()
+	writeStoreError(recorder, errors.New("postgres password=super-secret"))
+	if recorder.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want %d", recorder.Code, http.StatusInternalServerError)
+	}
+	if strings.Contains(recorder.Body.String(), "super-secret") || !strings.Contains(recorder.Body.String(), "internal server error") {
+		t.Fatalf("unsafe internal error response: %s", recorder.Body.String())
+	}
+	if strings.Contains(logs.String(), "super-secret") {
+		t.Fatalf("unsafe internal error log: %s", logs.String())
 	}
 }
 
@@ -499,11 +711,41 @@ func TestRequestLoggerPreservesTokenForAuthentication(t *testing.T) {
 	}
 }
 
+func TestRequestLoggerRedactsEnrollmentAndPairingCodesFromPaths(t *testing.T) {
+	var logs bytes.Buffer
+	previousLogger := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&logs, nil)))
+	t.Cleanup(func() { slog.SetDefault(previousLogger) })
+
+	handler := requestLogger(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	for _, path := range []string{
+		"/enrollments/SECRET01/claim",
+		"/pairings/SECRET02",
+		"/pairings/SECRET03/claim",
+	} {
+		recorder := httptest.NewRecorder()
+		handler.ServeHTTP(recorder, httptest.NewRequest(http.MethodPost, path, nil))
+	}
+
+	if strings.Contains(logs.String(), "SECRET") {
+		t.Fatalf("request log exposed a short-lived credential: %s", logs.String())
+	}
+	if !strings.Contains(logs.String(), "path=/enrollments/:code/claim") ||
+		!strings.Contains(logs.String(), "path=/pairings/:code") {
+		t.Fatalf("request log omitted redacted route shape: %s", logs.String())
+	}
+}
+
 func TestTunnelCredentialPrefersAuthorizationAndSupportsMobileSubprotocol(t *testing.T) {
 	req := httptest.NewRequest(http.MethodGet, "/tunnel/mobile/agent-1?token=legacy-secret", nil)
 	req.Header.Set("Authorization", "Bearer header-secret")
 	req.Header.Set("Sec-WebSocket-Protocol", relayTunnelSubprotocol+", "+mobileAuthSubprotocolPrefix+"protocol-secret")
-	token, protocol := tunnelCredential(req, "mobile", true)
+	token, protocol, err := tunnelCredential(req, "mobile", true)
+	if err != nil {
+		t.Fatalf("authorization credential: %v", err)
+	}
 	if token != "header-secret" || protocol != "" {
 		t.Fatalf("authorization credential = (%q, %q)", token, protocol)
 	}
@@ -511,28 +753,46 @@ func TestTunnelCredentialPrefersAuthorizationAndSupportsMobileSubprotocol(t *tes
 	req = httptest.NewRequest(http.MethodGet, "/tunnel/mobile/agent-1", nil)
 	offered := mobileAuthSubprotocolPrefix + "protocol-secret"
 	req.Header.Set("Sec-WebSocket-Protocol", "unrelated, "+relayTunnelSubprotocol+", "+offered)
-	token, protocol = tunnelCredential(req, "mobile", false)
+	token, protocol, err = tunnelCredential(req, "mobile", false)
+	if err != nil {
+		t.Fatalf("subprotocol credential: %v", err)
+	}
 	if token != "protocol-secret" || protocol != relayTunnelSubprotocol {
 		t.Fatalf("subprotocol credential = (%q, %q), want token and fixed selected protocol", token, protocol)
 	}
 
 	req = httptest.NewRequest(http.MethodGet, "/tunnel/mobile/agent-1", nil)
 	req.Header.Set("Sec-WebSocket-Protocol", offered)
-	token, protocol = tunnelCredential(req, "mobile", false)
+	token, protocol, err = tunnelCredential(req, "mobile", false)
+	if err != nil {
+		t.Fatalf("credential-only subprotocol: %v", err)
+	}
 	if token != "" || protocol != "" {
 		t.Fatalf("credential-only subprotocol was accepted without protocol negotiation: (%q, %q)", token, protocol)
 	}
 
 	req = httptest.NewRequest(http.MethodGet, "/tunnel/mobile/agent-1?token=legacy-secret", nil)
 	req.Header.Set("Sec-WebSocket-Protocol", relayTunnelSubprotocol+", "+companionAuthSubprotocolPrefix+"wrong-role")
-	token, protocol = tunnelCredential(req, "mobile", true)
+	token, protocol, err = tunnelCredential(req, "mobile", true)
+	if err != nil {
+		t.Fatalf("wrong-role subprotocol: %v", err)
+	}
 	if token != "legacy-secret" || protocol != "" {
 		t.Fatalf("wrong-role subprotocol bypassed role binding: (%q, %q)", token, protocol)
 	}
 
-	token, protocol = tunnelCredential(req, "mobile", false)
+	token, protocol, err = tunnelCredential(req, "mobile", false)
+	if err != nil {
+		t.Fatalf("disabled legacy credential: %v", err)
+	}
 	if token != "" || protocol != "" {
 		t.Fatalf("production accepted disabled legacy query credential: (%q, %q)", token, protocol)
+	}
+
+	req = httptest.NewRequest(http.MethodGet, "/tunnel/mobile/agent-1", nil)
+	req.Header.Set("Sec-WebSocket-Protocol", relayTunnelSubprotocol+", "+mobileAuthSubprotocolPrefix+"first, "+mobileAuthSubprotocolPrefix+"second")
+	if _, _, err = tunnelCredential(req, "mobile", false); err == nil {
+		t.Fatal("multiple credential-bearing subprotocols were accepted ambiguously")
 	}
 }
 
@@ -598,6 +858,79 @@ func peerConnected(h *hub, target *peer) bool {
 type touchStore struct {
 	store.Store
 	statuses []string
+}
+
+type orderedTouchStore struct {
+	store.Store
+	mu             sync.Mutex
+	statuses       []string
+	offlineStarted chan struct{}
+	onlineStarted  chan struct{}
+	releaseOffline chan struct{}
+	offlineOnce    sync.Once
+	onlineOnce     sync.Once
+}
+
+func newOrderedTouchStore() *orderedTouchStore {
+	return &orderedTouchStore{
+		offlineStarted: make(chan struct{}),
+		onlineStarted:  make(chan struct{}),
+		releaseOffline: make(chan struct{}),
+	}
+}
+
+func (s *orderedTouchStore) TouchAgent(_ context.Context, agentID string, status string) error {
+	if status == "offline" {
+		s.offlineOnce.Do(func() { close(s.offlineStarted) })
+		<-s.releaseOffline
+	} else if status == "online" {
+		s.onlineOnce.Do(func() { close(s.onlineStarted) })
+	}
+	s.mu.Lock()
+	s.statuses = append(s.statuses, agentID+":"+status)
+	s.mu.Unlock()
+	return nil
+}
+
+func (s *orderedTouchStore) snapshot() []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]string(nil), s.statuses...)
+}
+
+type revocationRaceStore struct {
+	store.Store
+	authenticationStarted chan struct{}
+	releaseAuthentication chan struct{}
+	revocationStarted     chan struct{}
+	authenticationOnce    sync.Once
+	revocationOnce        sync.Once
+}
+
+func newRevocationRaceStore() *revocationRaceStore {
+	return &revocationRaceStore{
+		authenticationStarted: make(chan struct{}),
+		releaseAuthentication: make(chan struct{}),
+		revocationStarted:     make(chan struct{}),
+	}
+}
+
+func (s *revocationRaceStore) AuthenticateDevice(context.Context, string) (store.Auth, error) {
+	s.authenticationOnce.Do(func() { close(s.authenticationStarted) })
+	<-s.releaseAuthentication
+	return store.Auth{
+		User:   store.User{ID: "user-1"},
+		Device: store.Device{ID: "device-1", UserID: "user-1"},
+	}, nil
+}
+
+func (s *revocationRaceStore) UserCanAccessAgent(context.Context, string, string) (bool, error) {
+	return true, nil
+}
+
+func (s *revocationRaceStore) RevokeDevice(context.Context, string, string) (store.Device, error) {
+	s.revocationOnce.Do(func() { close(s.revocationStarted) })
+	return store.Device{ID: "device-1", UserID: "user-1"}, nil
 }
 
 type fakeIdentityVerifier struct {

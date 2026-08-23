@@ -7,6 +7,8 @@ import (
 	"encoding/base32"
 	"encoding/hex"
 	"errors"
+	"fmt"
+	"io"
 	"strings"
 	"time"
 )
@@ -102,17 +104,28 @@ func HashSecret(secret string) string {
 }
 
 func RandomToken(bytes int) (string, error) {
+	return randomToken(rand.Reader, bytes)
+}
+
+func randomToken(reader io.Reader, bytes int) (string, error) {
+	if bytes <= 0 {
+		return "", errors.New("random token size must be positive")
+	}
 	buf := make([]byte, bytes)
-	if _, err := rand.Read(buf); err != nil {
+	if _, err := io.ReadFull(reader, buf); err != nil {
 		return "", err
 	}
 	return base32.StdEncoding.WithPadding(base32.NoPadding).EncodeToString(buf), nil
 }
 
 func RandomCode(length int) string {
-	token, err := RandomToken(length)
+	return mustRandomCode(rand.Reader, length)
+}
+
+func mustRandomCode(reader io.Reader, length int) string {
+	token, err := randomToken(reader, length)
 	if err != nil {
-		return strings.Repeat("A", length)
+		panic(fmt.Errorf("generate cryptographically secure random code: %w", err))
 	}
 	if len(token) > length {
 		return token[:length]

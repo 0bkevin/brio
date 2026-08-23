@@ -238,11 +238,9 @@ func (s *MemoryStore) ClaimEnrollment(ctx context.Context, code string, agentID 
 	agent.ID = agentID
 	agent.Name = name
 	agent.Mode = "self_hosted"
+	agent.Status = "offline"
 	if agent.CreatedAt.IsZero() {
 		agent.CreatedAt = now
-	}
-	if agent.Status == "" {
-		agent.Status = "offline"
 	}
 	s.agents[agentID] = agent
 	enrollment.UsedAt = &now
@@ -260,7 +258,7 @@ func (s *MemoryStore) CreatePairing(ctx context.Context, agentID string, name st
 	}
 	agent := s.agents[agentID]
 	if agent.ID == "" {
-		agent = Agent{ID: agentID, Name: name, Mode: "self_hosted", Status: "online", CreatedAt: time.Now().UTC()}
+		agent = Agent{ID: agentID, Name: name, Mode: "self_hosted", Status: "offline", CreatedAt: time.Now().UTC()}
 	} else {
 		if companionToken == "" || s.agentToken[agentID] != HashSecret(companionToken) {
 			return Pairing{}, ErrUnauthorized
@@ -268,8 +266,7 @@ func (s *MemoryStore) CreatePairing(ctx context.Context, agentID string, name st
 		agent.Name = name
 	}
 	now := time.Now().UTC()
-	agent.Status = "online"
-	agent.LastSeenAt = &now
+	agent.Status = "offline"
 	s.agents[agentID] = agent
 	code := RandomCode(8)
 	agentToken := "brio_agent_" + RandomCode(48)
@@ -293,6 +290,7 @@ func (s *MemoryStore) RecoverPairing(ctx context.Context, userID string, agentID
 		name = agent.Name
 	}
 	agent.Name = name
+	agent.Status = "offline"
 	now := time.Now().UTC()
 	s.agents[agentID] = agent
 	code := RandomCode(8)
@@ -345,8 +343,6 @@ func (s *MemoryStore) ClaimPairing(ctx context.Context, code string, userID stri
 	p.UsedAt = &now
 	s.pairings[key] = p
 	agent.OwnerUserID = &userID
-	agent.Status = "online"
-	agent.LastSeenAt = &now
 	s.agents[p.AgentID] = agent
 	return agent, nil
 }

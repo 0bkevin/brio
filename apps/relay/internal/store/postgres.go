@@ -83,6 +83,26 @@ ALTER TABLE users ALTER COLUMN email DROP NOT NULL;
 ALTER TABLE users DROP CONSTRAINT IF EXISTS users_email_key;
 ALTER TABLE users ADD COLUMN IF NOT EXISTS identity_issuer TEXT;
 ALTER TABLE users ADD COLUMN IF NOT EXISTS identity_subject TEXT;
+WITH legacy_unverified_users AS (
+  SELECT id,
+         ROW_NUMBER() OVER (
+           PARTITION BY lower(btrim(email))
+           ORDER BY
+             EXISTS(SELECT 1 FROM agents WHERE agents.owner_user_id = users.id) DESC,
+             EXISTS(SELECT 1 FROM devices WHERE devices.user_id = users.id) DESC,
+             created_at ASC
+         ) AS principal_rank
+  FROM users
+  WHERE identity_issuer IS NULL
+    AND identity_subject IS NULL
+    AND NULLIF(btrim(email), '') IS NOT NULL
+)
+UPDATE users
+SET identity_issuer = 'urn:brio:unverified-email',
+    identity_subject = lower(btrim(users.email))
+FROM legacy_unverified_users
+WHERE users.id = legacy_unverified_users.id
+  AND legacy_unverified_users.principal_rank = 1;
 CREATE UNIQUE INDEX IF NOT EXISTS idx_users_identity ON users(identity_issuer, identity_subject)
   WHERE identity_issuer IS NOT NULL AND identity_subject IS NOT NULL;
 `)
@@ -118,38 +138,11 @@ func (s *PostgresStore) CreateDeviceToken(ctx context.Context, email string, dev
 	if deviceName == "" {
 		deviceName = "Development device"
 	}
-	userID := IdentityUserID("urn:brio:unverified-email", email)
-
-	tx, err := s.pool.Begin(ctx)
+	user, err := s.UpsertIdentity(ctx, "urn:brio:unverified-email", email, email)
 	if err != nil {
 		return User{}, Device{}, "", err
 	}
-	defer tx.Rollback(ctx)
-
-	_, err = tx.Exec(ctx, `
-INSERT INTO users (id, email) VALUES ($1, $2)
-ON CONFLICT (id) DO UPDATE SET email = EXCLUDED.email
-`, userID, email)
-	if err != nil {
-		return User{}, Device{}, "", err
-	}
-	var user User
-	err = tx.QueryRow(ctx, `
-SELECT id, COALESCE(email, ''), COALESCE(identity_issuer, ''), COALESCE(identity_subject, ''), created_at
-FROM users
-WHERE id = $1
-`, userID).Scan(&user.ID, &user.Email, &user.IdentityIssuer, &user.IdentitySubject, &user.CreatedAt)
-	if err != nil {
-		return User{}, Device{}, "", err
-	}
-	device, token, err := createPostgresDeviceToken(ctx, tx, user.ID, deviceName)
-	if err != nil {
-		return User{}, Device{}, "", err
-	}
-	if err := tx.Commit(ctx); err != nil {
-		return User{}, Device{}, "", err
-	}
-	return user, device, token, nil
+	return s.CreateDeviceTokenForUser(ctx, user.ID, deviceName)
 }
 
 func (s *PostgresStore) CreateDeviceTokenForUser(ctx context.Context, userID string, deviceName string) (User, Device, string, error) {
@@ -395,7 +388,8 @@ VALUES ($1, $2, $3, $4, 'self_hosted', 'offline', NULL)
 ON CONFLICT (id) DO UPDATE
 SET owner_user_id = EXCLUDED.owner_user_id,
     name = EXCLUDED.name,
-    companion_token_hash = EXCLUDED.companion_token_hash
+    companion_token_hash = EXCLUDED.companion_token_hash,
+    status = 'offline'
 RETURNING id, owner_user_id, name, mode, status, last_seen_at, created_at
 `, agentID, enrollment.UserID, name, HashSecret(token)).Scan(
 		&agent.ID,
@@ -443,7 +437,7 @@ FOR UPDATE
 	if errors.Is(err, pgx.ErrNoRows) {
 		_, err = tx.Exec(ctx, `
 INSERT INTO agents (id, name, status, last_seen_at)
-VALUES ($1, $2, 'online', now())
+VALUES ($1, $2, 'offline', NULL)
 `, agentID, name)
 		if err != nil {
 			return Pairing{}, err
@@ -456,7 +450,7 @@ VALUES ($1, $2, 'online', now())
 		}
 		_, err = tx.Exec(ctx, `
 UPDATE agents
-SET name = $2, status = 'online', last_seen_at = now()
+SET name = $2, status = 'offline'
 WHERE id = $1
 `, agentID, name)
 		if err != nil {
@@ -520,7 +514,7 @@ FOR UPDATE
 	var p Pairing
 	_, err = tx.Exec(ctx, `
 UPDATE agents
-SET name = $3, companion_token_hash = $4
+SET name = $3, companion_token_hash = $4, status = 'offline'
 WHERE id = $1 AND owner_user_id = $2
 `, agentID, userID, name, HashSecret(agentToken))
 	if err != nil {
@@ -599,7 +593,7 @@ FOR UPDATE
 	var agent Agent
 	err = tx.QueryRow(ctx, `
 UPDATE agents
-SET owner_user_id = COALESCE(owner_user_id, $2), status = 'online', last_seen_at = now()
+SET owner_user_id = COALESCE(owner_user_id, $2)
 WHERE id = $1 AND (owner_user_id IS NULL OR owner_user_id = $2)
 RETURNING id, owner_user_id, name, mode, status, last_seen_at, created_at
 `, p.AgentID, userID).Scan(&agent.ID, &agent.OwnerUserID, &agent.Name, &agent.Mode, &agent.Status, &agent.LastSeenAt, &agent.CreatedAt)
