@@ -1,8 +1,9 @@
 import { ClerkProvider, useAuth } from '@clerk/expo';
 import { tokenCache } from '@clerk/expo/token-cache';
 import type { ReactNode } from 'react';
-import { useEffect } from 'react';
+import { useEffect, useRef } from 'react';
 
+import { disconnectRelayClients, revokeRelayDevice } from '@/lib/brio';
 import { useConnectionStore } from '@/state/connection-store';
 import { useRelaySessionStore } from '@/state/relay-session-store';
 
@@ -31,12 +32,22 @@ function CloudSessionGuard({ children }: { children: ReactNode }) {
   const relaySession = useRelaySessionStore((state) => state.session);
   const clearRelaySession = useRelaySessionStore((state) => state.clearSession);
   const clearConnection = useConnectionStore((state) => state.clearConnection);
+  const clearingSession = useRef('');
 
   useEffect(() => {
     if (!isLoaded || !relaySession?.identitySubject) return;
     if (isSignedIn && userId === relaySession.identitySubject) return;
-    void clearConnection();
-    void clearRelaySession();
+    const sessionKey = `${relaySession.deviceID}:${relaySession.token}`;
+    if (clearingSession.current === sessionKey) return;
+    clearingSession.current = sessionKey;
+    disconnectRelayClients(relaySession.token);
+    void Promise.allSettled([
+      revokeRelayDevice(relaySession.relayURL, relaySession.token, relaySession.deviceID),
+      clearConnection(),
+      clearRelaySession(),
+    ]).finally(() => {
+      if (clearingSession.current === sessionKey) clearingSession.current = '';
+    });
   }, [clearConnection, clearRelaySession, isLoaded, isSignedIn, relaySession, userId]);
 
   return children;

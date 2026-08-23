@@ -288,6 +288,40 @@ function normalizeBaseURL(url: string) {
   return url.trim().replace(/\/+$/, '');
 }
 
+function parseRelayURL(rawURL: string) {
+  const normalized = normalizeBaseURL(rawURL);
+  const withScheme = /^[a-z][a-z\d+.-]*:/i.test(normalized) ? normalized : `https://${normalized}`;
+  const url = new URL(withScheme);
+  if (!url.hostname || url.username || url.password) {
+    throw new Error('Relay URL must include a host and must not include user info');
+  }
+  if (!['http:', 'https:', 'ws:', 'wss:'].includes(url.protocol)) {
+    throw new Error('Relay URL must use HTTP(S) or WebSocket transport');
+  }
+  if ((url.protocol === 'http:' || url.protocol === 'ws:') && !isLoopbackHostname(url.hostname)) {
+    throw new Error('Relay URL must use HTTPS/WSS outside loopback');
+  }
+  url.search = '';
+  url.hash = '';
+  return url;
+}
+
+function relayHTTPBaseURL(rawURL: string) {
+  const url = parseRelayURL(rawURL);
+  if (url.protocol === 'ws:') url.protocol = 'http:';
+  if (url.protocol === 'wss:') url.protocol = 'https:';
+  url.pathname = url.pathname.replace(/\/+$/, '') || '/';
+  return url.toString().replace(/\/$/, '');
+}
+
+function isLoopbackHostname(rawHostname: string) {
+  const hostname = rawHostname.toLowerCase().replace(/^\[|\]$/g, '');
+  if (hostname === 'localhost' || hostname.endsWith('.localhost')) return true;
+  if (hostname === '::1' || hostname === '0:0:0:0:0:0:0:1') return true;
+  const octets = hostname.split('.').map(Number);
+  return octets.length === 4 && octets.every((octet) => Number.isInteger(octet) && octet >= 0 && octet <= 255) && octets[0] === 127;
+}
+
 function cleanConnectionValue(value: string) {
   return value.trim().replace(/^["'`]+|[,"'`.;]+$/g, '');
 }
@@ -886,8 +920,9 @@ export async function createRelayDevice(
   deviceName = 'Brio mobile',
   identityToken?: string,
 ) {
-  const response = await fetch(`${normalizeBaseURL(relayURL)}/auth/devices`, {
+  const response = await fetch(`${relayHTTPBaseURL(relayURL)}/auth/devices`, {
     method: 'POST',
+    redirect: 'error',
     headers: {
       Accept: 'application/json',
       'Content-Type': 'application/json',
@@ -902,15 +937,45 @@ export async function createRelayDevice(
   return body as RelayDeviceSession;
 }
 
+export async function revokeRelayDevice(
+  relayURL: string,
+  relayToken: string,
+  deviceID: string,
+) {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 5_000);
+  try {
+    const response = await fetch(
+      `${relayHTTPBaseURL(relayURL)}/devices/${encodeURIComponent(deviceID)}`,
+      {
+        method: 'DELETE',
+        redirect: 'error',
+        headers: {
+          Accept: 'application/json',
+          Authorization: `Bearer ${relayToken}`,
+        },
+        signal: controller.signal,
+      },
+    );
+    const body = await response.json().catch(() => null);
+    if (!response.ok) {
+      throw new Error(body?.error ?? 'Could not revoke relay device');
+    }
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
 export async function claimRelayPairing(
   relayURL: string,
   relayToken: string,
   pairingCode: string,
 ) {
   const response = await fetch(
-    `${normalizeBaseURL(relayURL)}/pairings/${encodeURIComponent(pairingCode)}/claim`,
+    `${relayHTTPBaseURL(relayURL)}/pairings/${encodeURIComponent(pairingCode)}/claim`,
     {
       method: 'POST',
+      redirect: 'error',
       headers: {
         Accept: 'application/json',
         Authorization: `Bearer ${relayToken}`,
@@ -925,7 +990,8 @@ export async function claimRelayPairing(
 }
 
 export async function listRelayAgents(relayURL: string, relayToken: string) {
-  const response = await fetch(`${normalizeBaseURL(relayURL)}/agents`, {
+  const response = await fetch(`${relayHTTPBaseURL(relayURL)}/agents`, {
+    redirect: 'error',
     headers: {
       Accept: 'application/json',
       Authorization: `Bearer ${relayToken}`,
@@ -943,8 +1009,9 @@ export async function createRelayEnrollment(
   relayToken: string,
   name = 'Brio Agent',
 ) {
-  const response = await fetch(`${normalizeBaseURL(relayURL)}/enrollments`, {
+  const response = await fetch(`${relayHTTPBaseURL(relayURL)}/enrollments`, {
     method: 'POST',
+    redirect: 'error',
     headers: {
       Accept: 'application/json',
       Authorization: `Bearer ${relayToken}`,
@@ -966,9 +1033,10 @@ export async function recoverRelayAgent(
   name?: string,
 ) {
   const response = await fetch(
-    `${normalizeBaseURL(relayURL)}/agents/${encodeURIComponent(agentID)}/recover`,
+    `${relayHTTPBaseURL(relayURL)}/agents/${encodeURIComponent(agentID)}/recover`,
     {
       method: 'POST',
+      redirect: 'error',
       headers: {
         Accept: 'application/json',
         Authorization: `Bearer ${relayToken}`,
@@ -1015,12 +1083,14 @@ const RELAY_MOBILE_AUTH_SUBPROTOCOL = 'brio.mobile.auth.';
 class RelaySocketClient {
   private readonly wsURL: string;
   private readonly authSubprotocol: string;
+  private readonly cacheKey: string;
   private socket: WebSocket | null = null;
   private opening: Promise<void> | null = null;
   private pending = new Map<string, PendingRelayRequest>();
 
-  constructor(wsURL: string, relayToken: string) {
+  constructor(wsURL: string, relayToken: string, cacheKey: string) {
     this.wsURL = wsURL;
+    this.cacheKey = cacheKey;
     if (!/^[A-Za-z0-9._~-]+$/.test(relayToken)) {
       throw new Error('Relay device token cannot be used as a WebSocket credential');
     }
@@ -1103,6 +1173,7 @@ class RelaySocketClient {
           this.socket = null;
         }
         this.opening = null;
+        if (relayClients.get(this.cacheKey) === this) relayClients.delete(this.cacheKey);
         reject(new Error('Relay connection timed out'));
       }, 15000);
 
@@ -1126,15 +1197,30 @@ class RelaySocketClient {
 
       socket.onclose = () => {
         clearTimeout(connectTimer);
-        if (this.socket === socket) {
-          this.socket = null;
-        }
+        if (this.socket !== socket) return;
+        const connectionWasOpening = this.opening !== null;
+        this.socket = null;
         this.opening = null;
+        if (relayClients.get(this.cacheKey) === this) relayClients.delete(this.cacheKey);
         this.rejectAll(new Error('Relay connection closed'));
+        if (connectionWasOpening) reject(new Error('Relay connection closed before opening'));
       };
     });
 
     return this.opening;
+  }
+
+  close() {
+    const socket = this.socket;
+    if (relayClients.get(this.cacheKey) === this) relayClients.delete(this.cacheKey);
+    this.rejectAll(new Error('Relay connection closed'));
+    if (socket?.readyState === WebSocket.CONNECTING) {
+      socket.close();
+      return;
+    }
+    this.socket = null;
+    this.opening = null;
+    socket?.close();
   }
 
   private handleMessage(data: string) {
@@ -1273,7 +1359,7 @@ function relayFetch<T>(
   const clientKey = `${wsURL}\u0000${relayToken}`;
   let client = relayClients.get(clientKey);
   if (!client) {
-    client = new RelaySocketClient(wsURL, relayToken);
+    client = new RelaySocketClient(wsURL, relayToken, clientKey);
     relayClients.set(clientKey, client);
   }
   return client.request<T>(
@@ -1285,18 +1371,21 @@ function relayFetch<T>(
   );
 }
 
+export function disconnectRelayClients(relayToken: string) {
+  const suffix = `\u0000${relayToken}`;
+  for (const [key, client] of relayClients) {
+    if (key.endsWith(suffix)) client.close();
+  }
+}
+
 function relayTunnelURL(baseURL: string, agentId: string) {
-  const normalized = normalizeBaseURL(baseURL);
-  const withScheme = normalized.startsWith('http') || normalized.startsWith('ws')
-    ? normalized
-    : `https://${normalized}`;
-  const url = new URL(withScheme);
+  const url = parseRelayURL(baseURL);
   if (url.protocol === 'http:') {
     url.protocol = 'ws:';
   } else if (url.protocol === 'https:') {
     url.protocol = 'wss:';
   }
-  url.pathname = `${url.pathname.replace(/\/+$/, '')}/tunnel/mobile/${agentId}`;
+  url.pathname = `${url.pathname.replace(/\/+$/, '')}/tunnel/mobile/${encodeURIComponent(agentId)}`;
   return url.toString();
 }
 

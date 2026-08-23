@@ -3,7 +3,7 @@ import { useAuth, useClerk, useUser } from '@clerk/expo';
 import * as Clipboard from 'expo-clipboard';
 import * as Device from 'expo-device';
 import type { ReactNode } from 'react';
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useLayoutEffect, useRef, useState } from 'react';
 import {
   ActivityIndicator,
   Pressable,
@@ -23,11 +23,13 @@ import {
   connectionFromPairingPayload,
   createRelayDevice,
   createRelayEnrollment,
+  disconnectRelayClients,
   extractPairingPayload,
   getHealth,
   isAgentHealthy,
   listRelayAgents,
   recoverRelayAgent,
+  revokeRelayDevice,
   type AgentConnection,
   type RelayAgent,
   type RelayEnrollmentResponse,
@@ -174,6 +176,8 @@ function CloudControlPlaneEntry() {
   const [error, setError] = useState('');
   const [attempt, setAttempt] = useState(0);
   const registering = useRef('');
+  const currentIdentity = useRef<string | null>(null);
+  const mounted = useRef(false);
   const relayURL = configuredRelayURL();
   const sessionMatches = Boolean(
     session &&
@@ -183,11 +187,22 @@ function CloudControlPlaneEntry() {
       session.deviceID,
   );
 
+  useLayoutEffect(() => {
+    currentIdentity.current = isSignedIn && userId ? userId : null;
+  }, [isSignedIn, userId]);
+
+  useEffect(() => {
+    mounted.current = true;
+    return () => {
+      mounted.current = false;
+    };
+  }, []);
+
   useEffect(() => {
     if (!isLoaded || !isSignedIn || !userId || !user) return;
     if (session?.identitySubject && session.identitySubject !== userId) return;
     if (sessionMatches) return;
-    if (registering.current === userId) return;
+    if (registering.current) return;
     registering.current = userId;
     void (async () => {
       try {
@@ -200,6 +215,12 @@ function CloudControlPlaneEntry() {
           deviceName,
           identityToken,
         );
+        if (currentIdentity.current !== userId) {
+          await Promise.allSettled([
+            revokeRelayDevice(relayURL, registration.token, registration.device.id),
+          ]);
+          return;
+        }
         await saveSession({
           relayURL,
           email: registration.user.email || user.primaryEmailAddress?.emailAddress || userId,
@@ -209,15 +230,30 @@ function CloudControlPlaneEntry() {
           deviceID: registration.device.id,
           identitySubject: userId,
         });
+        if (currentIdentity.current !== userId) {
+          await Promise.allSettled([
+            revokeRelayDevice(relayURL, registration.token, registration.device.id),
+            clearSession(),
+          ]);
+          return;
+        }
         setError('');
       } catch (cause) {
-        setError(cause instanceof Error ? cause.message : 'Could not register this device');
+        if (mounted.current && currentIdentity.current === userId) {
+          setError(cause instanceof Error ? cause.message : 'Could not register this device');
+        }
       } finally {
-        registering.current = '';
+        if (registering.current === userId) {
+          registering.current = '';
+          if (mounted.current && currentIdentity.current && currentIdentity.current !== userId) {
+            setAttempt((value) => value + 1);
+          }
+        }
       }
     })();
   }, [
     attempt,
+    clearSession,
     getToken,
     isLoaded,
     isSignedIn,
@@ -246,7 +282,15 @@ function CloudControlPlaneEntry() {
   return (
     <ControlPlaneHome
       onSignOut={async () => {
-        await Promise.all([clearConnection(), clearSession(), signOut()]);
+        disconnectRelayClients(session.token);
+        const results = await Promise.allSettled([
+          revokeRelayDevice(session.relayURL, session.token, session.deviceID),
+          clearConnection(),
+          clearSession(),
+          signOut(),
+        ]);
+        const signOutResult = results[3];
+        if (signOutResult?.status === 'rejected') throw signOutResult.reason;
       }}
       session={session}
     />
@@ -606,8 +650,12 @@ function ControlPlaneHome({
             if (onSignOut) {
               void onSignOut();
             } else {
-              void clearConnection();
-              void clearSession();
+              disconnectRelayClients(session.token);
+              void Promise.allSettled([
+                revokeRelayDevice(session.relayURL, session.token, session.deviceID),
+                clearConnection(),
+                clearSession(),
+              ]);
             }
           }}
           style={styles.textButton}>

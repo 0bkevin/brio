@@ -25,6 +25,29 @@ func TestTunnelURL(t *testing.T) {
 	}
 }
 
+func TestRelayURLRejectsPlaintextCredentialsOutsideLoopback(t *testing.T) {
+	for _, raw := range []string{"http://relay.example", "ws://relay.example"} {
+		if _, err := tunnelURL(raw, "companion", "agent-1"); err == nil {
+			t.Fatalf("tunnelURL accepted insecure remote relay %q", raw)
+		}
+	}
+	for _, raw := range []string{"http://127.0.0.1:8082", "ws://localhost:8082", "http://[::1]:8082"} {
+		if _, err := tunnelURL(raw, "companion", "agent-1"); err != nil {
+			t.Fatalf("tunnelURL rejected loopback relay %q: %v", raw, err)
+		}
+	}
+}
+
+func TestRelayAPIURLDropsUntrustedURLComponents(t *testing.T) {
+	got, err := RelayAPIURL("https://relay.example/base/?token=leak#fragment", "/enrollments/CODE/claim")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != "https://relay.example/base/enrollments/CODE/claim" {
+		t.Fatalf("RelayAPIURL = %q", got)
+	}
+}
+
 func TestProbeSendsRelayCredentialInAuthorizationHeader(t *testing.T) {
 	authorization := make(chan string, 1)
 	relay := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -42,6 +65,28 @@ func TestProbeSendsRelayCredentialInAuthorizationHeader(t *testing.T) {
 	}
 	if got := <-authorization; got != "Bearer relay-secret" {
 		t.Fatalf("Authorization = %q, want bearer relay credential", got)
+	}
+}
+
+func TestProbeDoesNotForwardRelayCredentialThroughRedirect(t *testing.T) {
+	forwarded := make(chan string, 1)
+	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		forwarded <- r.Header.Get("Authorization")
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer target.Close()
+	redirect := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, target.URL, http.StatusTemporaryRedirect)
+	}))
+	defer redirect.Close()
+
+	if err := Probe(context.Background(), Config{RelayURL: redirect.URL, AgentID: "agent-1", RelayToken: "relay-secret"}); err == nil {
+		t.Fatal("Probe followed a relay redirect")
+	}
+	select {
+	case credential := <-forwarded:
+		t.Fatalf("redirect target received relay credential %q", credential)
+	default:
 	}
 }
 
