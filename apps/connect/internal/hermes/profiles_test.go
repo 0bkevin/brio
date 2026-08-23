@@ -1548,10 +1548,11 @@ func TestProxyForwardsProfileWithOwnKey(t *testing.T) {
 func TestProfileMemoryIsolation(t *testing.T) {
 	home := t.TempDir()
 	writeProfileFile(t, filepath.Join(home, "memories", "MEMORY.md"), "default memory\n")
+	// This test exercises request routing, not CLI profile creation. Build the
+	// named-profile fixture directly so a no-op fake CLI cannot claim it created
+	// filesystem state that does not exist.
+	writeProfileFile(t, filepath.Join(home, profilesDirName, "coder", "memories", "MEMORY.md"), "")
 	manager := newTestManager(home, &fakeCLI{})
-	if _, err := manager.Create(context.Background(), "coder", CreateOptions{}); err != nil {
-		t.Fatal(err)
-	}
 	client := &Client{BaseURL: "http://127.0.0.1:9", Home: home, profileMgr: manager}
 
 	put := func(id string, path string, memory string) []tunnel.Frame {
@@ -1595,10 +1596,10 @@ func TestProfileMemoryIsolation(t *testing.T) {
 
 func TestProfileControlFailsClosedWithoutOverride(t *testing.T) {
 	home := t.TempDir()
-	manager := newTestManager(home, &fakeCLI{})
-	if _, err := manager.Create(context.Background(), "coder", CreateOptions{}); err != nil {
+	if err := os.MkdirAll(filepath.Join(home, profilesDirName, "coder"), 0o700); err != nil {
 		t.Fatal(err)
 	}
+	manager := newTestManager(home, &fakeCLI{})
 	client := &Client{BaseURL: "http://127.0.0.1:9", Home: home, ControlBaseURL: "http://127.0.0.1:9119", profileMgr: manager}
 
 	frames := collectFrames(context.Background(), t, client, tunnel.Frame{

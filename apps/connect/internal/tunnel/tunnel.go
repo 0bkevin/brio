@@ -10,6 +10,7 @@ import (
 	"io"
 	"log/slog"
 	"math/rand/v2"
+	"net"
 	"net/http"
 	"net/url"
 	"strings"
@@ -60,6 +61,7 @@ type AgentInfo struct {
 
 const (
 	maxFrameBytes         = 12 * 1024 * 1024
+	maxRelayAPIResponse   = 64 * 1024
 	maxConcurrentRequests = 16
 	initialBackoff        = time.Second
 	maxBackoff            = 32 * time.Second
@@ -70,7 +72,14 @@ const (
 	dialTimeout           = 15 * time.Second
 )
 
-var relayHTTPClient = &http.Client{Timeout: 30 * time.Second}
+var relayHTTPClient = &http.Client{
+	Timeout:       30 * time.Second,
+	CheckRedirect: rejectRelayRedirect,
+}
+
+func rejectRelayRedirect(*http.Request, []*http.Request) error {
+	return http.ErrUseLastResponse
+}
 
 // ClaimEnrollment claims an enrollment code with the relay and returns the
 // owned agent plus the long-lived relay token.
@@ -85,10 +94,17 @@ func ClaimEnrollment(ctx context.Context, relayURL string, code string, agentID 
 	if err != nil {
 		return EnrollmentResult{}, err
 	}
+	endpoint, err := RelayAPIURL(
+		relayURL,
+		"/enrollments/"+strings.ToUpper(strings.TrimSpace(code))+"/claim",
+	)
+	if err != nil {
+		return EnrollmentResult{}, err
+	}
 	req, err := http.NewRequestWithContext(
 		ctx,
 		http.MethodPost,
-		strings.TrimRight(relayURL, "/")+"/enrollments/"+url.PathEscape(strings.ToUpper(strings.TrimSpace(code)))+"/claim",
+		endpoint,
 		bytes.NewReader(encoded),
 	)
 	if err != nil {
@@ -101,11 +117,11 @@ func ClaimEnrollment(ctx context.Context, relayURL string, code string, agentID 
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode >= 300 {
-		data, _ := io.ReadAll(resp.Body)
+		data, _ := io.ReadAll(io.LimitReader(resp.Body, maxRelayAPIResponse))
 		return EnrollmentResult{}, fmt.Errorf("enrollment claim failed: %s", strings.TrimSpace(string(data)))
 	}
 	var result EnrollmentResult
-	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+	if err := json.NewDecoder(io.LimitReader(resp.Body, maxRelayAPIResponse)).Decode(&result); err != nil {
 		return EnrollmentResult{}, err
 	}
 	if result.Token == "" || result.Agent.ID == "" {
@@ -147,13 +163,13 @@ func Run(ctx context.Context, cfg Config) error {
 // Probe briefly opens the tunnel WebSocket to verify that the stored relay
 // credentials are still accepted.
 func Probe(ctx context.Context, cfg Config) error {
-	wsURL, err := tunnelURL(cfg.RelayURL, "companion", cfg.AgentID, cfg.RelayToken)
+	wsURL, err := tunnelURL(cfg.RelayURL, "companion", cfg.AgentID)
 	if err != nil {
 		return err
 	}
 	probeCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
-	conn, resp, err := websocket.Dial(probeCtx, wsURL, nil)
+	conn, resp, err := websocket.Dial(probeCtx, wsURL, tunnelDialOptions(cfg.RelayToken))
 	if err != nil {
 		if resp != nil && resp.StatusCode > 0 {
 			return fmt.Errorf("relay rejected tunnel credentials (HTTP %d)", resp.StatusCode)
@@ -175,12 +191,12 @@ func jitter(d time.Duration) time.Duration {
 
 // connect serves one tunnel connection until it drops.
 func connect(ctx context.Context, cfg Config) error {
-	wsURL, err := tunnelURL(cfg.RelayURL, "companion", cfg.AgentID, cfg.RelayToken)
+	wsURL, err := tunnelURL(cfg.RelayURL, "companion", cfg.AgentID)
 	if err != nil {
 		return err
 	}
 	dialCtx, cancelDial := context.WithTimeout(ctx, dialTimeout)
-	conn, _, err := websocket.Dial(dialCtx, wsURL, nil)
+	conn, _, err := websocket.Dial(dialCtx, wsURL, tunnelDialOptions(cfg.RelayToken))
 	cancelDial()
 	if err != nil {
 		return err
@@ -282,8 +298,8 @@ func errorFrame(id string, code string, message string) Frame {
 	return Frame{Type: "error", ID: id, Code: code, Message: message}
 }
 
-func tunnelURL(base string, role string, agentID string, token string) (string, error) {
-	u, err := url.Parse(strings.TrimRight(base, "/"))
+func tunnelURL(base string, role string, agentID string) (string, error) {
+	u, err := parseRelayURL(base)
 	if err != nil {
 		return "", err
 	}
@@ -297,12 +313,64 @@ func tunnelURL(base string, role string, agentID string, token string) (string, 
 		return "", fmt.Errorf("unsupported relay URL scheme: %s", u.Scheme)
 	}
 	u.Path = strings.TrimRight(u.Path, "/") + "/tunnel/" + role + "/" + agentID
-	if token != "" {
-		q := u.Query()
-		q.Set("token", token)
-		u.RawQuery = q.Encode()
-	} else {
-		u.RawQuery = ""
-	}
+	u.RawPath = ""
 	return u.String(), nil
+}
+
+// RelayAPIURL resolves an API path against a relay base URL while enforcing
+// encrypted transport outside loopback and dropping base query/fragment data.
+func RelayAPIURL(base string, path string) (string, error) {
+	u, err := parseRelayURL(base)
+	if err != nil {
+		return "", err
+	}
+	switch u.Scheme {
+	case "ws":
+		u.Scheme = "http"
+	case "wss":
+		u.Scheme = "https"
+	}
+	u.Path = strings.TrimRight(u.Path, "/") + "/" + strings.TrimLeft(path, "/")
+	u.RawPath = ""
+	return u.String(), nil
+}
+
+func parseRelayURL(base string) (*url.URL, error) {
+	u, err := url.Parse(strings.TrimSpace(base))
+	if err != nil {
+		return nil, err
+	}
+	if u.Host == "" || u.User != nil {
+		return nil, fmt.Errorf("relay URL must include a host and must not include user info")
+	}
+	switch u.Scheme {
+	case "https", "wss":
+	case "http", "ws":
+		if !isLoopbackHostname(u.Hostname()) {
+			return nil, fmt.Errorf("relay URL must use HTTPS/WSS outside loopback")
+		}
+	default:
+		return nil, fmt.Errorf("unsupported relay URL scheme: %s", u.Scheme)
+	}
+	u.RawQuery = ""
+	u.ForceQuery = false
+	u.Fragment = ""
+	return u, nil
+}
+
+func isLoopbackHostname(host string) bool {
+	host = strings.Trim(strings.ToLower(strings.TrimSpace(host)), "[]")
+	if host == "localhost" || strings.HasSuffix(host, ".localhost") {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
+}
+
+func tunnelDialOptions(token string) *websocket.DialOptions {
+	header := make(http.Header)
+	if token != "" {
+		header.Set("Authorization", "Bearer "+token)
+	}
+	return &websocket.DialOptions{HTTPClient: relayHTTPClient, HTTPHeader: header}
 }

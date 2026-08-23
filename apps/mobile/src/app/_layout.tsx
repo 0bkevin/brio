@@ -7,6 +7,7 @@ import { AnimatedSplashOverlay } from '@/components/animated-icon';
 import AppTabs from '@/components/app-tabs';
 import { parseBrioDeepLink } from '@/lib/profiles-model';
 import { IncomingShareProvider } from '@/features/threads/incoming-share-context';
+import { CloudAuthProvider } from '@/lib/cloud-auth';
 import { useComposerStore } from '@/state/composer-store';
 import { useConnectionStore } from '@/state/connection-store';
 import { useDeepLinkStore } from '@/state/deep-link-store';
@@ -63,13 +64,15 @@ export default function TabLayout() {
   }, [flushComposer]);
 
   return (
-    <QueryClientProvider client={queryClient}>
-      <ThemeProvider value={colorScheme === 'dark' ? DarkTheme : DefaultTheme}>
-        <IncomingShareProvider>
-          <AnimatedSplashOverlay />
-          <AppTabs />
-        </IncomingShareProvider>
-      </ThemeProvider>
-    </QueryClientProvider>
+    <CloudAuthProvider>
+      <QueryClientProvider client={queryClient}>
+        <ThemeProvider value={colorScheme === 'dark' ? DarkTheme : DefaultTheme}>
+          <IncomingShareProvider>
+            <AnimatedSplashOverlay />
+            <AppTabs />
+          </IncomingShareProvider>
+        </ThemeProvider>
+      </QueryClientProvider>
+    </CloudAuthProvider>
   );
 }

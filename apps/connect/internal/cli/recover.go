@@ -6,10 +6,10 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"net/url"
 	"strings"
 	"time"
 
+	"github.com/brio/brio/apps/connect/internal/tunnel"
 	"github.com/spf13/cobra"
 )
 
@@ -19,6 +19,8 @@ type recoveryResult struct {
 	AgentID    string `json:"agent_id"`
 	Name       string `json:"name"`
 }
+
+const maxRecoveryResponseBytes = 64 * 1024
 
 func recoverCommand() *cobra.Command {
 	opts := defaultRunOptions()
@@ -73,10 +75,14 @@ func runRecover(ctx context.Context, opts runOptions, deviceToken string, restar
 }
 
 func recoverRelayAgent(ctx context.Context, relayURL string, deviceToken string, agentID string) (recoveryResult, error) {
+	endpoint, err := tunnel.RelayAPIURL(relayURL, "/agents/"+agentID+"/recover")
+	if err != nil {
+		return recoveryResult{}, err
+	}
 	req, err := http.NewRequestWithContext(
 		ctx,
 		http.MethodPost,
-		strings.TrimRight(relayURL, "/")+"/agents/"+url.PathEscape(agentID)+"/recover",
+		endpoint,
 		strings.NewReader("{}"),
 	)
 	if err != nil {
@@ -84,17 +90,22 @@ func recoverRelayAgent(ctx context.Context, relayURL string, deviceToken string,
 	}
 	req.Header.Set("Authorization", "Bearer "+strings.TrimSpace(deviceToken))
 	req.Header.Set("Content-Type", "application/json")
-	resp, err := (&http.Client{Timeout: 30 * time.Second}).Do(req)
+	resp, err := (&http.Client{
+		Timeout: 30 * time.Second,
+		CheckRedirect: func(*http.Request, []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}).Do(req)
 	if err != nil {
 		return recoveryResult{}, err
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode >= 300 {
-		data, _ := io.ReadAll(resp.Body)
+		data, _ := io.ReadAll(io.LimitReader(resp.Body, maxRecoveryResponseBytes))
 		return recoveryResult{}, fmt.Errorf("relay recovery failed: %s", strings.TrimSpace(string(data)))
 	}
 	var result recoveryResult
-	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+	if err := json.NewDecoder(io.LimitReader(resp.Body, maxRecoveryResponseBytes)).Decode(&result); err != nil {
 		return recoveryResult{}, err
 	}
 	if result.AgentToken == "" {

@@ -34,6 +34,14 @@ func serveCommand() *cobra.Command {
 	cmd.Flags().StringVar(&cfg.DatabaseURL, "database-url", envDefault("BRIO_DATABASE_URL", ""), "Postgres database URL")
 	cmd.Flags().StringSliceVar(&cfg.AllowedOrigins, "allowed-origin", envList("BRIO_RELAY_ALLOWED_ORIGINS"), "allowed browser origin for CORS and WebSocket upgrades; repeatable")
 	cmd.Flags().StringVar(&cfg.DeviceRegistrationKey, "device-registration-key", envDefault("BRIO_DEVICE_REGISTRATION_KEY", ""), "optional key required to create relay device tokens")
+	cmd.Flags().BoolVar(&cfg.InsecureDevMode, "insecure-dev-mode", envBool("BRIO_INSECURE_DEV_MODE"), "enable unverified email sign-in and unrestricted browser origins for local development")
+	cmd.Flags().BoolVar(&cfg.AllowLegacyQueryTokens, "allow-legacy-query-tokens", envBool("BRIO_ALLOW_LEGACY_QUERY_TOKENS"), "temporarily accept relay credentials in WebSocket query strings during client migration")
+	cmd.Flags().StringSliceVar(&cfg.TrustedProxyCIDRs, "trusted-proxy-cidr", envList("BRIO_RELAY_TRUSTED_PROXY_CIDRS"), "proxy CIDR allowed to supply X-Forwarded-For; repeatable")
+	cmd.Flags().StringVar(&cfg.ClerkSecretKey, "clerk-secret-key", envDefault("BRIO_CLERK_SECRET_KEY", ""), "Clerk backend secret used to fetch signing keys")
+	cmd.Flags().StringVar(&cfg.ClerkJWTKey, "clerk-jwt-key", envDefault("BRIO_CLERK_JWT_KEY", ""), "Clerk JWT public key PEM for networkless verification")
+	cmd.Flags().StringVar(&cfg.ClerkIssuer, "clerk-issuer", envDefault("BRIO_CLERK_ISSUER", ""), "exact Clerk token issuer")
+	cmd.Flags().StringVar(&cfg.ClerkJWTAudience, "clerk-jwt-audience", envDefault("BRIO_CLERK_JWT_AUDIENCE", "brio-relay"), "required Clerk JWT audience")
+	cmd.Flags().StringSliceVar(&cfg.ClerkAuthorizedParties, "clerk-authorized-party", envList("BRIO_CLERK_AUTHORIZED_PARTIES"), "allowed Clerk azp value; repeatable")
 	return cmd
 }
 
@@ -57,4 +65,13 @@ func envList(key string) []string {
 		}
 	}
 	return out
+}
+
+func envBool(key string) bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv(key))) {
+	case "1", "true", "yes", "on":
+		return true
+	default:
+		return false
+	}
 }

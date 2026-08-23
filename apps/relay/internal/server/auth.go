@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"strings"
@@ -61,6 +62,11 @@ func writeStoreError(w http.ResponseWriter, err error) {
 	case errors.Is(err, store.ErrUsed):
 		writeJSON(w, http.StatusConflict, map[string]any{"error": "already used"})
 	default:
-		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
+		writeInternalError(w, err)
 	}
+}
+
+func writeInternalError(w http.ResponseWriter, err error) {
+	slog.Error("relay request failed", "error_type", fmt.Sprintf("%T", err))
+	writeJSON(w, http.StatusInternalServerError, map[string]any{"error": "internal server error"})
 }

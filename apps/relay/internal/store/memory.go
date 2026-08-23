@@ -9,31 +9,61 @@ import (
 )
 
 type MemoryStore struct {
-	mu          sync.Mutex
-	users       map[string]User
-	userByEmail map[string]string
-	devices     map[string]Device
-	deviceToken map[string]string
-	agents      map[string]Agent
-	agentToken  map[string]string
-	pairings    map[string]Pairing
-	enrollments map[string]Enrollment
+	mu             sync.Mutex
+	users          map[string]User
+	userByEmail    map[string]string
+	userByIdentity map[string]string
+	devices        map[string]Device
+	deviceToken    map[string]string
+	agents         map[string]Agent
+	agentToken     map[string]string
+	pairings       map[string]Pairing
+	enrollments    map[string]Enrollment
 }
 
 func NewMemoryStore() *MemoryStore {
 	return &MemoryStore{
-		users:       map[string]User{},
-		userByEmail: map[string]string{},
-		devices:     map[string]Device{},
-		deviceToken: map[string]string{},
-		agents:      map[string]Agent{},
-		agentToken:  map[string]string{},
-		pairings:    map[string]Pairing{},
-		enrollments: map[string]Enrollment{},
+		users:          map[string]User{},
+		userByEmail:    map[string]string{},
+		userByIdentity: map[string]string{},
+		devices:        map[string]Device{},
+		deviceToken:    map[string]string{},
+		agents:         map[string]Agent{},
+		agentToken:     map[string]string{},
+		pairings:       map[string]Pairing{},
+		enrollments:    map[string]Enrollment{},
 	}
 }
 
 func (s *MemoryStore) Close() {}
+
+func (s *MemoryStore) UpsertIdentity(ctx context.Context, issuer string, subject string, email string) (User, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	issuer = strings.TrimRight(strings.TrimSpace(issuer), "/")
+	subject = strings.TrimSpace(subject)
+	if issuer == "" || subject == "" {
+		return User{}, ErrUnauthorized
+	}
+	key := issuer + "\x00" + subject
+	userID := s.userByIdentity[key]
+	if userID == "" {
+		userID = IdentityUserID(issuer, subject)
+		s.users[userID] = User{
+			ID:              userID,
+			Email:           strings.ToLower(strings.TrimSpace(email)),
+			IdentityIssuer:  issuer,
+			IdentitySubject: subject,
+			CreatedAt:       time.Now().UTC(),
+		}
+		s.userByIdentity[key] = userID
+	} else if email = strings.ToLower(strings.TrimSpace(email)); email != "" {
+		user := s.users[userID]
+		user.Email = email
+		s.users[userID] = user
+	}
+	return s.users[userID], nil
+}
 
 func (s *MemoryStore) CreateDeviceToken(ctx context.Context, email string, deviceName string) (User, Device, string, error) {
 	s.mu.Lock()
@@ -51,12 +81,29 @@ func (s *MemoryStore) CreateDeviceToken(ctx context.Context, email string, devic
 		s.users[userID] = User{ID: userID, Email: email, CreatedAt: time.Now().UTC()}
 		s.userByEmail[email] = userID
 	}
+	return s.createDeviceTokenLocked(s.users[userID], deviceName)
+}
+
+func (s *MemoryStore) CreateDeviceTokenForUser(ctx context.Context, userID string, deviceName string) (User, Device, string, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	user, ok := s.users[strings.TrimSpace(userID)]
+	if !ok {
+		return User{}, Device{}, "", ErrUnauthorized
+	}
+	return s.createDeviceTokenLocked(user, deviceName)
+}
+
+func (s *MemoryStore) createDeviceTokenLocked(user User, deviceName string) (User, Device, string, error) {
+	if deviceName == "" {
+		deviceName = "Development device"
+	}
 	deviceID := "dev_" + RandomCode(20)
 	token := "brio_dev_" + RandomCode(40)
-	device := Device{ID: deviceID, UserID: userID, Name: deviceName, CreatedAt: time.Now().UTC()}
+	device := Device{ID: deviceID, UserID: user.ID, Name: deviceName, CreatedAt: time.Now().UTC()}
 	s.devices[deviceID] = device
 	s.deviceToken[HashSecret(token)] = deviceID
-	return s.users[userID], device, token, nil
+	return user, device, token, nil
 }
 
 func (s *MemoryStore) AuthenticateDevice(ctx context.Context, token string) (Auth, error) {
@@ -191,11 +238,9 @@ func (s *MemoryStore) ClaimEnrollment(ctx context.Context, code string, agentID 
 	agent.ID = agentID
 	agent.Name = name
 	agent.Mode = "self_hosted"
+	agent.Status = "offline"
 	if agent.CreatedAt.IsZero() {
 		agent.CreatedAt = now
-	}
-	if agent.Status == "" {
-		agent.Status = "offline"
 	}
 	s.agents[agentID] = agent
 	enrollment.UsedAt = &now
@@ -213,7 +258,7 @@ func (s *MemoryStore) CreatePairing(ctx context.Context, agentID string, name st
 	}
 	agent := s.agents[agentID]
 	if agent.ID == "" {
-		agent = Agent{ID: agentID, Name: name, Mode: "self_hosted", Status: "online", CreatedAt: time.Now().UTC()}
+		agent = Agent{ID: agentID, Name: name, Mode: "self_hosted", Status: "offline", CreatedAt: time.Now().UTC()}
 	} else {
 		if companionToken == "" || s.agentToken[agentID] != HashSecret(companionToken) {
 			return Pairing{}, ErrUnauthorized
@@ -221,8 +266,7 @@ func (s *MemoryStore) CreatePairing(ctx context.Context, agentID string, name st
 		agent.Name = name
 	}
 	now := time.Now().UTC()
-	agent.Status = "online"
-	agent.LastSeenAt = &now
+	agent.Status = "offline"
 	s.agents[agentID] = agent
 	code := RandomCode(8)
 	agentToken := "brio_agent_" + RandomCode(48)
@@ -246,6 +290,7 @@ func (s *MemoryStore) RecoverPairing(ctx context.Context, userID string, agentID
 		name = agent.Name
 	}
 	agent.Name = name
+	agent.Status = "offline"
 	now := time.Now().UTC()
 	s.agents[agentID] = agent
 	code := RandomCode(8)
@@ -298,8 +343,6 @@ func (s *MemoryStore) ClaimPairing(ctx context.Context, code string, userID stri
 	p.UsedAt = &now
 	s.pairings[key] = p
 	agent.OwnerUserID = &userID
-	agent.Status = "online"
-	agent.LastSeenAt = &now
 	s.agents[p.AgentID] = agent
 	return agent, nil
 }

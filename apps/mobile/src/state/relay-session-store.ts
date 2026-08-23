@@ -11,6 +11,7 @@ type RelaySession = {
   token: string;
   userID: string;
   deviceID: string;
+  identitySubject?: string;
   activeEnrollment?: RelayEnrollmentResponse;
 };
 

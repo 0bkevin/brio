@@ -14,14 +14,79 @@ import (
 )
 
 func TestTunnelURL(t *testing.T) {
-	got, err := tunnelURL("https://relay.example/base/", "mobile", "agent 123", "relaytoken")
+	got, err := tunnelURL("https://relay.example/base/", "mobile", "agent 123")
 	if err != nil {
 		t.Fatalf("tunnelURL returned error: %v", err)
 	}
 
-	want := "wss://relay.example/base/tunnel/mobile/agent%20123?token=relaytoken"
+	want := "wss://relay.example/base/tunnel/mobile/agent%20123"
 	if got != want {
 		t.Fatalf("unexpected tunnel URL: got %q want %q", got, want)
+	}
+}
+
+func TestRelayURLRejectsPlaintextCredentialsOutsideLoopback(t *testing.T) {
+	for _, raw := range []string{"http://relay.example", "ws://relay.example"} {
+		if _, err := tunnelURL(raw, "companion", "agent-1"); err == nil {
+			t.Fatalf("tunnelURL accepted insecure remote relay %q", raw)
+		}
+	}
+	for _, raw := range []string{"http://127.0.0.1:8082", "ws://localhost:8082", "http://[::1]:8082"} {
+		if _, err := tunnelURL(raw, "companion", "agent-1"); err != nil {
+			t.Fatalf("tunnelURL rejected loopback relay %q: %v", raw, err)
+		}
+	}
+}
+
+func TestRelayAPIURLDropsUntrustedURLComponents(t *testing.T) {
+	got, err := RelayAPIURL("https://relay.example/base/?token=leak#fragment", "/enrollments/CODE/claim")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != "https://relay.example/base/enrollments/CODE/claim" {
+		t.Fatalf("RelayAPIURL = %q", got)
+	}
+}
+
+func TestProbeSendsRelayCredentialInAuthorizationHeader(t *testing.T) {
+	authorization := make(chan string, 1)
+	relay := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		authorization <- r.Header.Get("Authorization")
+		conn, err := websocket.Accept(w, r, nil)
+		if err != nil {
+			return
+		}
+		_ = conn.Close(websocket.StatusNormalClosure, "done")
+	}))
+	defer relay.Close()
+
+	if err := Probe(context.Background(), Config{RelayURL: relay.URL, AgentID: "agent-1", RelayToken: "relay-secret"}); err != nil {
+		t.Fatalf("Probe failed: %v", err)
+	}
+	if got := <-authorization; got != "Bearer relay-secret" {
+		t.Fatalf("Authorization = %q, want bearer relay credential", got)
+	}
+}
+
+func TestProbeDoesNotForwardRelayCredentialThroughRedirect(t *testing.T) {
+	forwarded := make(chan string, 1)
+	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		forwarded <- r.Header.Get("Authorization")
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer target.Close()
+	redirect := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, target.URL, http.StatusTemporaryRedirect)
+	}))
+	defer redirect.Close()
+
+	if err := Probe(context.Background(), Config{RelayURL: redirect.URL, AgentID: "agent-1", RelayToken: "relay-secret"}); err == nil {
+		t.Fatal("Probe followed a relay redirect")
+	}
+	select {
+	case credential := <-forwarded:
+		t.Fatalf("redirect target received relay credential %q", credential)
+	default:
 	}
 }
 

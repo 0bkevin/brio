@@ -35,7 +35,9 @@ func (s *PostgresStore) migrate(ctx context.Context) error {
 	_, err := s.pool.Exec(ctx, `
 CREATE TABLE IF NOT EXISTS users (
   id TEXT PRIMARY KEY,
-  email TEXT NOT NULL UNIQUE,
+  email TEXT,
+  identity_issuer TEXT,
+  identity_subject TEXT,
   created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 CREATE TABLE IF NOT EXISTS devices (
@@ -77,8 +79,55 @@ CREATE INDEX IF NOT EXISTS idx_agents_owner_user_id ON agents(owner_user_id);
 CREATE INDEX IF NOT EXISTS idx_pairing_sessions_agent_id ON pairing_sessions(agent_id);
 CREATE INDEX IF NOT EXISTS idx_enrollment_sessions_user_id ON enrollment_sessions(user_id);
 ALTER TABLE agents ADD COLUMN IF NOT EXISTS companion_token_hash TEXT;
+ALTER TABLE users ALTER COLUMN email DROP NOT NULL;
+ALTER TABLE users DROP CONSTRAINT IF EXISTS users_email_key;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS identity_issuer TEXT;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS identity_subject TEXT;
+WITH legacy_unverified_users AS (
+  SELECT id,
+         ROW_NUMBER() OVER (
+           PARTITION BY lower(btrim(email))
+           ORDER BY
+             EXISTS(SELECT 1 FROM agents WHERE agents.owner_user_id = users.id) DESC,
+             EXISTS(SELECT 1 FROM devices WHERE devices.user_id = users.id) DESC,
+             created_at ASC
+         ) AS principal_rank
+  FROM users
+  WHERE identity_issuer IS NULL
+    AND identity_subject IS NULL
+    AND NULLIF(btrim(email), '') IS NOT NULL
+)
+UPDATE users
+SET identity_issuer = 'urn:brio:unverified-email',
+    identity_subject = lower(btrim(users.email))
+FROM legacy_unverified_users
+WHERE users.id = legacy_unverified_users.id
+  AND legacy_unverified_users.principal_rank = 1;
+CREATE UNIQUE INDEX IF NOT EXISTS idx_users_identity ON users(identity_issuer, identity_subject)
+  WHERE identity_issuer IS NOT NULL AND identity_subject IS NOT NULL;
 `)
 	return err
+}
+
+func (s *PostgresStore) UpsertIdentity(ctx context.Context, issuer string, subject string, email string) (User, error) {
+	issuer = strings.TrimRight(strings.TrimSpace(issuer), "/")
+	subject = strings.TrimSpace(subject)
+	email = strings.ToLower(strings.TrimSpace(email))
+	if issuer == "" || subject == "" {
+		return User{}, ErrUnauthorized
+	}
+	var user User
+	err := s.pool.QueryRow(ctx, `
+INSERT INTO users (id, email, identity_issuer, identity_subject)
+VALUES ($1, NULLIF($2, ''), $3, $4)
+ON CONFLICT (identity_issuer, identity_subject)
+  WHERE identity_issuer IS NOT NULL AND identity_subject IS NOT NULL
+DO UPDATE SET email = COALESCE(NULLIF(EXCLUDED.email, ''), users.email)
+RETURNING id, COALESCE(email, ''), COALESCE(identity_issuer, ''), COALESCE(identity_subject, ''), created_at
+`, IdentityUserID(issuer, subject), email, issuer, subject).Scan(
+		&user.ID, &user.Email, &user.IdentityIssuer, &user.IdentitySubject, &user.CreatedAt,
+	)
+	return user, err
 }
 
 func (s *PostgresStore) CreateDeviceToken(ctx context.Context, email string, deviceName string) (User, Device, string, error) {
@@ -89,35 +138,38 @@ func (s *PostgresStore) CreateDeviceToken(ctx context.Context, email string, dev
 	if deviceName == "" {
 		deviceName = "Development device"
 	}
-	userID := "usr_" + RandomCode(24)
-	deviceID := "dev_" + RandomCode(24)
-	token := "brio_dev_" + RandomCode(48)
-	tokenHash := HashSecret(token)
+	user, err := s.UpsertIdentity(ctx, "urn:brio:unverified-email", email, email)
+	if err != nil {
+		return User{}, Device{}, "", err
+	}
+	return s.CreateDeviceTokenForUser(ctx, user.ID, deviceName)
+}
 
+func (s *PostgresStore) CreateDeviceTokenForUser(ctx context.Context, userID string, deviceName string) (User, Device, string, error) {
+	if deviceName == "" {
+		deviceName = "Development device"
+	}
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return User{}, Device{}, "", err
 	}
 	defer tx.Rollback(ctx)
 
-	_, err = tx.Exec(ctx, `
-INSERT INTO users (id, email) VALUES ($1, lower($2))
-ON CONFLICT (email) DO NOTHING
-`, userID, email)
-	if err != nil {
-		return User{}, Device{}, "", err
-	}
 	var user User
-	err = tx.QueryRow(ctx, `SELECT id, email, created_at FROM users WHERE email = lower($1)`, email).Scan(&user.ID, &user.Email, &user.CreatedAt)
+	err = tx.QueryRow(ctx, `
+SELECT id, COALESCE(email, ''), COALESCE(identity_issuer, ''), COALESCE(identity_subject, ''), created_at
+FROM users
+WHERE id = $1
+`, strings.TrimSpace(userID)).Scan(
+		&user.ID, &user.Email, &user.IdentityIssuer, &user.IdentitySubject, &user.CreatedAt,
+	)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return User{}, Device{}, "", ErrUnauthorized
+	}
 	if err != nil {
 		return User{}, Device{}, "", err
 	}
-	var device Device
-	err = tx.QueryRow(ctx, `
-INSERT INTO devices (id, user_id, name, token_hash)
-VALUES ($1, $2, $3, $4)
-RETURNING id, user_id, name, created_at, revoked_at
-`, deviceID, user.ID, deviceName, tokenHash).Scan(&device.ID, &device.UserID, &device.Name, &device.CreatedAt, &device.RevokedAt)
+	device, token, err := createPostgresDeviceToken(ctx, tx, user.ID, deviceName)
 	if err != nil {
 		return User{}, Device{}, "", err
 	}
@@ -127,15 +179,36 @@ RETURNING id, user_id, name, created_at, revoked_at
 	return user, device, token, nil
 }
 
+type postgresDeviceTokenTx interface {
+	QueryRow(context.Context, string, ...any) pgx.Row
+}
+
+func createPostgresDeviceToken(ctx context.Context, tx postgresDeviceTokenTx, userID string, deviceName string) (Device, string, error) {
+	deviceID := "dev_" + RandomCode(24)
+	token := "brio_dev_" + RandomCode(48)
+	tokenHash := HashSecret(token)
+	var device Device
+	err := tx.QueryRow(ctx, `
+INSERT INTO devices (id, user_id, name, token_hash)
+VALUES ($1, $2, $3, $4)
+RETURNING id, user_id, name, created_at, revoked_at
+`, deviceID, userID, deviceName, tokenHash).Scan(&device.ID, &device.UserID, &device.Name, &device.CreatedAt, &device.RevokedAt)
+	if err != nil {
+		return Device{}, "", err
+	}
+	return device, token, nil
+}
+
 func (s *PostgresStore) AuthenticateDevice(ctx context.Context, token string) (Auth, error) {
 	var auth Auth
 	err := s.pool.QueryRow(ctx, `
-SELECT u.id, u.email, u.created_at, d.id, d.user_id, d.name, d.created_at, d.revoked_at
+SELECT u.id, COALESCE(u.email, ''), COALESCE(u.identity_issuer, ''), COALESCE(u.identity_subject, ''), u.created_at,
+       d.id, d.user_id, d.name, d.created_at, d.revoked_at
 FROM devices d
 JOIN users u ON u.id = d.user_id
 WHERE d.token_hash = $1 AND d.revoked_at IS NULL
 `, HashSecret(token)).Scan(
-		&auth.User.ID, &auth.User.Email, &auth.User.CreatedAt,
+		&auth.User.ID, &auth.User.Email, &auth.User.IdentityIssuer, &auth.User.IdentitySubject, &auth.User.CreatedAt,
 		&auth.Device.ID, &auth.Device.UserID, &auth.Device.Name, &auth.Device.CreatedAt, &auth.Device.RevokedAt,
 	)
 	if errors.Is(err, pgx.ErrNoRows) {
@@ -315,7 +388,8 @@ VALUES ($1, $2, $3, $4, 'self_hosted', 'offline', NULL)
 ON CONFLICT (id) DO UPDATE
 SET owner_user_id = EXCLUDED.owner_user_id,
     name = EXCLUDED.name,
-    companion_token_hash = EXCLUDED.companion_token_hash
+    companion_token_hash = EXCLUDED.companion_token_hash,
+    status = 'offline'
 RETURNING id, owner_user_id, name, mode, status, last_seen_at, created_at
 `, agentID, enrollment.UserID, name, HashSecret(token)).Scan(
 		&agent.ID,
@@ -363,7 +437,7 @@ FOR UPDATE
 	if errors.Is(err, pgx.ErrNoRows) {
 		_, err = tx.Exec(ctx, `
 INSERT INTO agents (id, name, status, last_seen_at)
-VALUES ($1, $2, 'online', now())
+VALUES ($1, $2, 'offline', NULL)
 `, agentID, name)
 		if err != nil {
 			return Pairing{}, err
@@ -376,7 +450,7 @@ VALUES ($1, $2, 'online', now())
 		}
 		_, err = tx.Exec(ctx, `
 UPDATE agents
-SET name = $2, status = 'online', last_seen_at = now()
+SET name = $2, status = 'offline'
 WHERE id = $1
 `, agentID, name)
 		if err != nil {
@@ -440,7 +514,7 @@ FOR UPDATE
 	var p Pairing
 	_, err = tx.Exec(ctx, `
 UPDATE agents
-SET name = $3, companion_token_hash = $4
+SET name = $3, companion_token_hash = $4, status = 'offline'
 WHERE id = $1 AND owner_user_id = $2
 `, agentID, userID, name, HashSecret(agentToken))
 	if err != nil {
@@ -519,7 +593,7 @@ FOR UPDATE
 	var agent Agent
 	err = tx.QueryRow(ctx, `
 UPDATE agents
-SET owner_user_id = COALESCE(owner_user_id, $2), status = 'online', last_seen_at = now()
+SET owner_user_id = COALESCE(owner_user_id, $2)
 WHERE id = $1 AND (owner_user_id IS NULL OR owner_user_id = $2)
 RETURNING id, owner_user_id, name, mode, status, last_seen_at, created_at
 `, p.AgentID, userID).Scan(&agent.ID, &agent.OwnerUserID, &agent.Name, &agent.Mode, &agent.Status, &agent.LastSeenAt, &agent.CreatedAt)

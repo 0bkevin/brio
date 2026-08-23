@@ -59,6 +59,7 @@ out2="$tmp/out2"
 PATH="$tmp/fake-bin:$PATH" HOME="$tmp/home" \
   BRIO_INSTALL_DIR="$tmp/new2/bin" \
   BRIO_VERSION="vtest" \
+  BRIO_RELAY_URL="http://relay.test" \
   BRIO_ENROLL_CODE="ABCD1234" \
   BRIO_INSTALL_SERVICE="false" \
   BRIO_START_SERVICE="false" \
@@ -90,7 +91,19 @@ PATH="$tmp/fake-bin:$PATH" HOME="$tmp/home" \
   BRIO_VERSION="vtest" \
   sh "$root/scripts/install.sh" > "$out4" 2>&1
 test -x "$tmp/new4/bin/brio"
-grep -q 'CODE_FROM_THE_APP' "$out4"
+grep -q 'RELAY_URL_FROM_THE_APP' "$out4"
 [ ! -s "$BRIO_SETUP_LOG" ]
 
-echo "install_test: all 4 tests passed"
+# --- test 5: an enrollment code cannot silently use a stale built-in relay ---
+BRIO_SETUP_LOG="$tmp/log5"; : > "$BRIO_SETUP_LOG"
+out5="$tmp/out5"
+PATH="$tmp/fake-bin:$PATH" HOME="$tmp/home" \
+  BRIO_INSTALL_DIR="$tmp/new5/bin" \
+  BRIO_VERSION="vtest" \
+  BRIO_ENROLL_CODE="ABCD1234" \
+  sh "$root/scripts/install.sh" > "$out5" 2>&1 && rc=0 || rc=$?
+[ "$rc" -eq 1 ]
+grep -q 'SETUP_RELAY_URL_REQUIRED' "$out5"
+[ ! -s "$BRIO_SETUP_LOG" ]
+
+echo "install_test: all 5 tests passed"

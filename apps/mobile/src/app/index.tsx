@@ -1,7 +1,9 @@
 import { useMutation, useQuery } from '@tanstack/react-query';
+import { useAuth, useClerk, useUser } from '@clerk/expo';
 import * as Clipboard from 'expo-clipboard';
+import * as Device from 'expo-device';
 import type { ReactNode } from 'react';
-import { useEffect, useState } from 'react';
+import { useEffect, useLayoutEffect, useRef, useState } from 'react';
 import {
   ActivityIndicator,
   Pressable,
@@ -14,21 +16,30 @@ import { SafeAreaView } from 'react-native-safe-area-context';
 
 import { DashboardCard, SectionLabel, StatusBadge } from '@/components/dashboard';
 import { ChatWorkspace } from '@/components/chat-workspace';
+import { CloudAuthView } from '@/components/cloud-auth-view';
 import { Collapsible } from '@/components/ui/collapsible';
 import {
   claimRelayPairing,
   connectionFromPairingPayload,
   createRelayDevice,
   createRelayEnrollment,
+  disconnectRelayClients,
   extractPairingPayload,
   getHealth,
   isAgentHealthy,
   listRelayAgents,
   recoverRelayAgent,
+  revokeRelayDevice,
   type AgentConnection,
   type RelayAgent,
   type RelayEnrollmentResponse,
 } from '@/lib/brio';
+import {
+  cloudAuthConfigured,
+  configuredRelayURL,
+  developmentAuthEnabled,
+  relayTokenOptions,
+} from '@/lib/cloud-auth';
 import { ThemedText } from '@/components/themed-text';
 import { ThemedView } from '@/components/themed-view';
 import { BottomTabInset, MaxContentWidth, Spacing } from '@/constants/theme';
@@ -48,7 +59,6 @@ NOT READY: <one short reason>
 
 Do not add markdown fences or extra explanation.`;
 
-const DEFAULT_RELAY_URL = 'https://brio-relay.xa95xa94cj2n4.us-east-1.cs.amazonlightsail.com';
 const INSTALL_SCRIPT_URL = 'https://github.com/0bkevin/brio/releases/latest/download/install.sh';
 
 function shellQuote(value: string) {
@@ -144,11 +154,147 @@ export default function ChatScreen() {
     return <ConnectedChat connection={connection} />;
   }
 
+  if (cloudAuthConfigured()) {
+    return <CloudControlPlaneEntry />;
+  }
+
   if (relaySession) {
     return <ControlPlaneHome session={relaySession} />;
   }
 
   return <ConnectionOnboarding />;
+}
+
+function CloudControlPlaneEntry() {
+  const { getToken, isLoaded, isSignedIn, userId } = useAuth({ treatPendingAsSignedOut: false });
+  const { user } = useUser();
+  const { signOut } = useClerk();
+  const session = useRelaySessionStore((state) => state.session);
+  const saveSession = useRelaySessionStore((state) => state.saveSession);
+  const clearSession = useRelaySessionStore((state) => state.clearSession);
+  const clearConnection = useConnectionStore((state) => state.clearConnection);
+  const [error, setError] = useState('');
+  const [attempt, setAttempt] = useState(0);
+  const registering = useRef('');
+  const currentIdentity = useRef<string | null>(null);
+  const mounted = useRef(false);
+  const relayURL = configuredRelayURL();
+  const sessionMatches = Boolean(
+    session &&
+      session.identitySubject === userId &&
+      session.relayURL.replace(/\/+$/, '') === relayURL &&
+      session.token &&
+      session.deviceID,
+  );
+
+  useLayoutEffect(() => {
+    currentIdentity.current = isSignedIn && userId ? userId : null;
+  }, [isSignedIn, userId]);
+
+  useEffect(() => {
+    mounted.current = true;
+    return () => {
+      mounted.current = false;
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!isLoaded || !isSignedIn || !userId || !user) return;
+    if (session?.identitySubject && session.identitySubject !== userId) return;
+    if (sessionMatches) return;
+    if (registering.current) return;
+    registering.current = userId;
+    void (async () => {
+      try {
+        const identityToken = await getToken(relayTokenOptions());
+        if (!identityToken) throw new Error('Clerk did not issue a Brio relay token');
+        const deviceName = Device.deviceName ?? `${Device.brand ?? 'Brio'} device`;
+        const registration = await createRelayDevice(
+          relayURL,
+          user.primaryEmailAddress?.emailAddress ?? '',
+          deviceName,
+          identityToken,
+        );
+        if (currentIdentity.current !== userId) {
+          await Promise.allSettled([
+            revokeRelayDevice(relayURL, registration.token, registration.device.id),
+          ]);
+          return;
+        }
+        await saveSession({
+          relayURL,
+          email: registration.user.email || user.primaryEmailAddress?.emailAddress || userId,
+          deviceName: registration.device.name,
+          token: registration.token,
+          userID: registration.user.id,
+          deviceID: registration.device.id,
+          identitySubject: userId,
+        });
+        if (currentIdentity.current !== userId) {
+          await Promise.allSettled([
+            revokeRelayDevice(relayURL, registration.token, registration.device.id),
+            clearSession(),
+          ]);
+          return;
+        }
+        setError('');
+      } catch (cause) {
+        if (mounted.current && currentIdentity.current === userId) {
+          setError(cause instanceof Error ? cause.message : 'Could not register this device');
+        }
+      } finally {
+        if (registering.current === userId) {
+          registering.current = '';
+          if (mounted.current && currentIdentity.current && currentIdentity.current !== userId) {
+            setAttempt((value) => value + 1);
+          }
+        }
+      }
+    })();
+  }, [
+    attempt,
+    clearSession,
+    getToken,
+    isLoaded,
+    isSignedIn,
+    relayURL,
+    saveSession,
+    session,
+    sessionMatches,
+    user,
+    userId,
+  ]);
+
+  if (!isLoaded) return <CenteredStatus label="Loading Brio Connect" />;
+  if (!isSignedIn || !userId) return <ConnectionOnboarding />;
+  if (!sessionMatches || !session) {
+    if (error) {
+      return (
+        <Screen>
+          <ThemedText type="subtitle">Could not activate Brio Connect</ThemedText>
+          <ThemedText themeColor="textSecondary">{error}</ThemedText>
+          <PrimaryButton label="Retry" onPress={() => setAttempt((value) => value + 1)} />
+        </Screen>
+      );
+    }
+    return <CenteredStatus label="Securing this device" />;
+  }
+  return (
+    <ControlPlaneHome
+      onSignOut={async () => {
+        disconnectRelayClients(session.token);
+        const results = await Promise.allSettled([
+          revokeRelayDevice(session.relayURL, session.token, session.deviceID),
+          clearConnection(),
+          clearSession(),
+          signOut(),
+        ]);
+        const signOutResult = results[3];
+        if (signOutResult?.status === 'rejected') throw signOutResult.reason;
+      }}
+      session={session}
+    />
+  );
 }
 
 function ConnectionOnboarding() {
@@ -290,9 +436,48 @@ function OtherConnectionOptions() {
 }
 
 function RelaySignInCard({ embedded = false }: { embedded?: boolean }) {
+  if (cloudAuthConfigured()) return <CloudRelaySignInCard embedded={embedded} />;
+  if (!developmentAuthEnabled()) {
+    return (
+      <View style={embedded ? styles.embeddedCardContent : undefined}>
+        <ThemedText type="smallBold">Brio Connect is not configured</ThemedText>
+        <ThemedText themeColor="textSecondary">
+          Configure the Clerk publishable key, JWT template, and hosted relay URL in the build
+          environment.
+        </ThemedText>
+      </View>
+    );
+  }
+  return <DevelopmentRelaySignInCard embedded={embedded} />;
+}
+
+function CloudRelaySignInCard({ embedded = false }: { embedded?: boolean }) {
+  const { isLoaded, isSignedIn } = useAuth({ treatPendingAsSignedOut: false });
+  const content = (
+    <>
+      <ThemedText type="smallBold">Brio Connect account</ThemedText>
+      <ThemedText themeColor="textSecondary">
+        Your account is verified before this device receives separate relay credentials.
+      </ThemedText>
+      {isLoaded ? (
+        isSignedIn ? (
+          <ThemedText>Signed in. Securing this device…</ThemedText>
+        ) : (
+          <CloudAuthView />
+        )
+      ) : (
+        <ActivityIndicator />
+      )}
+    </>
+  );
+  if (embedded) return <View style={styles.embeddedCardContent}>{content}</View>;
+  return <DashboardCard>{content}</DashboardCard>;
+}
+
+function DevelopmentRelaySignInCard({ embedded = false }: { embedded?: boolean }) {
   const theme = useTheme();
   const saveSession = useRelaySessionStore((state) => state.saveSession);
-  const [relayURL, setRelayURL] = useState(DEFAULT_RELAY_URL);
+  const [relayURL, setRelayURL] = useState('http://127.0.0.1:8082');
   const [email, setEmail] = useState('dev@brio.local');
   const [deviceName, setDeviceName] = useState('Brio mobile');
   const [error, setError] = useState('');
@@ -316,9 +501,9 @@ function RelaySignInCard({ embedded = false }: { embedded?: boolean }) {
 
   const content = (
     <>
-      <ThemedText type="smallBold">Brio relay sign-in</ThemedText>
+      <ThemedText type="smallBold">Development relay identity</ThemedText>
       <ThemedText themeColor="textSecondary">
-        This device will own the agent machines you connect.
+        Unverified email mode is for an explicitly insecure local relay only.
       </ThemedText>
 
       <ThemedText type="smallBold">Relay URL</ThemedText>
@@ -376,7 +561,13 @@ function RelaySignInCard({ embedded = false }: { embedded?: boolean }) {
   return <DashboardCard>{content}</DashboardCard>;
 }
 
-function ControlPlaneHome({ session }: { session: RelaySession }) {
+function ControlPlaneHome({
+  session,
+  onSignOut,
+}: {
+  session: RelaySession;
+  onSignOut?: () => Promise<void>;
+}) {
   const clearSession = useRelaySessionStore((state) => state.clearSession);
   const saveSession = useRelaySessionStore((state) => state.saveSession);
   const clearConnection = useConnectionStore((state) => state.clearConnection);
@@ -456,8 +647,16 @@ function ControlPlaneHome({ session }: { session: RelaySession }) {
         <Pressable
           onPress={() => {
             setRecoveryResult('');
-            void clearConnection();
-            void clearSession();
+            if (onSignOut) {
+              void onSignOut();
+            } else {
+              disconnectRelayClients(session.token);
+              void Promise.allSettled([
+                revokeRelayDevice(session.relayURL, session.token, session.deviceID),
+                clearConnection(),
+                clearSession(),
+              ]);
+            }
           }}
           style={styles.textButton}>
           <ThemedText type="link">Sign out</ThemedText>
