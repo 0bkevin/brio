@@ -1,63 +1,18 @@
-import { fetch as expoFetch } from 'expo/fetch';
-
-import {
-  filterAgentsForControlSession,
-  parseGoalStatus,
-  parseHeartbeatStatus,
-} from './control-model';
-import {
-  normalizeHermesSessionMessages,
-  normalizeHermesSessions,
-  SESSION_ID_HEADER,
-  headerValue,
-  mergeRequestHeaders,
-  sessionIdentityHeaders,
-  type HermesModelOptions,
-  type HermesSession,
-  type HermesSessionMessage,
-  type HermesSessionModelLock,
-  type HermesSessionModelPayload,
+import { scopedPath } from './profiles-model.ts';
+import { responseRequestBody, type ResponseRequestOptions } from './response-request.ts';
+import type {
+  HermesModelOptions,
+  HermesSession as HermesAnalyticsSession,
+  HermesSessionModelLock,
+  HermesSessionModelPayload,
 } from './hermes-api';
-import { ResponsesSSEParser, type HermesResponse } from './responses-sse';
-// Import the dependency-free model module: profiles.ts re-exports it, but
-// importing from there would create a brio <-> profiles cycle.
-import { scopedPath } from './profiles-model';
-import {
-  responseRequestBody,
-  type ResponseRequestOptions,
-} from './response-request';
 import {
   normalizeContextBreakdown,
   normalizeLiveUsage,
   normalizeModelOptions,
   type NormalizedContextBreakdown,
   type NormalizedRuntimeUsage,
-} from './session-runtime';
-
-export {
-  aggregateRootAgentUsage,
-  filterAgentsForControlSession,
-  parseGoalStatus,
-  parseHeartbeatStatus,
-} from './control-model';
-
-export {
-  normalizeContextBreakdown,
-  normalizeLiveUsage,
-  normalizeModelOptions,
-} from './session-runtime';
-
-export type { HermesResponse } from './responses-sse';
-export type { NormalizedContextBreakdown, NormalizedRuntimeUsage } from './session-runtime';
-export type {
-  HermesContextBreakdown,
-  HermesLiveUsage,
-  HermesModelOptions,
-  HermesSession,
-  HermesSessionMessage,
-  HermesSessionModelLock,
-  HermesSessionModelPayload,
-} from './hermes-api';
+} from './session-runtime.ts';
 
 export type AgentConnection = {
   id: string;
@@ -71,11 +26,15 @@ export type AgentConnection = {
   relayToken?: string;
   agentId?: string;
   pairingCode?: string;
+  agentKind?: string;
+  agentName?: string;
 };
 
 export type HealthResponse = {
   ok: boolean;
-  status?: string;
+  agent_ok?: boolean;
+  agent_kind?: string;
+  agent_name?: string;
   hermes_ok?: boolean;
   hermes_status?: number;
   hermes_home?: string;
@@ -85,24 +44,9 @@ export type HealthResponse = {
   allowed_roots?: string[];
 };
 
-/**
- * Healthy under either shape: the former companion's `{hermes_ok: true}` or
- * the Hermes API server's `{status: "ok"}`.
- */
-export function isAgentHealthy(health: HealthResponse | null | undefined) {
-  if (!health) return false;
-  return health.hermes_ok === true || health.status === 'ok';
-}
-
 export type CapabilitiesResponse = {
   companion?: Record<string, unknown>;
   hermes?: unknown;
-  features?: {
-    session_resources?: boolean;
-    memory_write_api?: boolean;
-    [key: string]: unknown;
-  };
-  endpoints?: Record<string, { method?: string; path?: string }>;
 };
 
 export type ComposerAttachmentUpload = {
@@ -148,6 +92,101 @@ export type CommandCatalog = {
   skills?: Record<string, { usage?: number; origin?: string }>;
   permissions?: Record<string, string>;
   warning?: string;
+};
+
+export type HermesResponse = {
+  id?: string;
+  status?: string;
+  model?: string;
+  session_id?: string;
+  output?: {
+    type?: string;
+    role?: string;
+    content?: { type?: string; text?: string }[];
+    name?: string;
+  }[];
+  output_text?: string;
+  error?: { message?: string } | string;
+};
+
+export type HermesSession = {
+  id: string;
+  source: string;
+  user_id?: string;
+  model?: string;
+  started_at: number;
+  ended_at?: number | null;
+  message_count: number;
+  title?: string;
+};
+
+export type HermesMessage = {
+  role: string;
+  content: string;
+  tool_name?: string;
+  timestamp: number;
+};
+
+export type HermesSearchResult = {
+  session_id: string;
+  role: string;
+  snippet: string;
+};
+
+export type HermesRunStatus = {
+  object: 'hermes.run';
+  run_id: string;
+  status:
+    | 'started'
+    | 'queued'
+    | 'running'
+    | 'waiting_for_approval'
+    | 'stopping'
+    | 'completed'
+    | 'failed'
+    | 'cancelled';
+  session_id?: string;
+  model?: string;
+  output?: string;
+  error?: string;
+  last_event?: string;
+  created_at?: number;
+  updated_at?: number;
+  usage?: {
+    input_tokens?: number;
+    output_tokens?: number;
+    total_tokens?: number;
+  };
+};
+
+export type HermesRunStart = {
+  run_id: string;
+  status: 'started';
+};
+
+export type HermesFileEntry = {
+  name: string;
+  path: string;
+  dir: boolean;
+  size: number;
+};
+
+export type HermesSkill = {
+  name: string;
+  category: string;
+  path: string;
+  description: string;
+  enabled: boolean;
+};
+
+export type HermesJob = Record<string, unknown> & {
+  id?: string;
+  job_id?: string;
+  name?: string;
+  prompt?: string;
+  enabled?: boolean;
+  paused?: boolean;
+  schedule?: string;
 };
 
 export type HermesControlSession = {
@@ -244,6 +283,7 @@ export type HermesCommandCenterSnapshot = {
   events: HermesControlEvent[];
   latestEvent: number;
 };
+
 export type RelayDeviceSession = {
   user: { id: string; email: string };
   device: { id: string; user_id: string; name: string };
@@ -292,6 +332,45 @@ function cleanConnectionValue(value: string) {
   return value.trim().replace(/^["'`]+|[,"'`.;]+$/g, '');
 }
 
+async function fetchWithTimeout(
+  input: string,
+  init: RequestInit = {},
+  timeoutMilliseconds = 15_000,
+) {
+  const controller = new AbortController();
+  const callerSignal = init.signal;
+  const abortFromCaller = () => controller.abort();
+  if (callerSignal?.aborted) controller.abort();
+  callerSignal?.addEventListener('abort', abortFromCaller, { once: true });
+  const timeout = setTimeout(() => controller.abort(), timeoutMilliseconds);
+  try {
+    return await fetch(input, { ...init, signal: controller.signal });
+  } catch (reason) {
+    if (callerSignal?.aborted) {
+      throw new Error('Connection cancelled');
+    }
+    if (controller.signal.aborted) {
+      throw new Error('Connection timed out');
+    }
+    throw reason;
+  } finally {
+    clearTimeout(timeout);
+    callerSignal?.removeEventListener('abort', abortFromCaller);
+  }
+}
+
+async function withTimeout<T>(promise: Promise<T>, timeoutMilliseconds = 15_000) {
+  let timeout: ReturnType<typeof setTimeout> | undefined;
+  const timeoutPromise = new Promise<never>((_, reject) => {
+    timeout = setTimeout(() => reject(new Error('Connection timed out')), timeoutMilliseconds);
+  });
+  try {
+    return await Promise.race([promise, timeoutPromise]);
+  } finally {
+    if (timeout) clearTimeout(timeout);
+  }
+}
+
 export async function brioFetch<T>(
   connection: Pick<AgentConnection, 'url' | 'token'> & Partial<AgentConnection>,
   path: string,
@@ -300,52 +379,60 @@ export async function brioFetch<T>(
   if (connection.transport === 'relay') {
     return relayFetch<T>(connection, path, init);
   }
-  const response = await fetch(`${normalizeBaseURL(connection.url)}${path}`, {
-    ...init,
-    headers: {
-      Accept: 'application/json',
-      'Content-Type': 'application/json',
-      Authorization: `Bearer ${connection.token}`,
-      ...(init.headers ?? {}),
+  const response = await fetchWithTimeout(
+    `${normalizeBaseURL(connection.url)}${path}`,
+    {
+      ...init,
+      headers: {
+        Accept: 'application/json',
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${connection.token}`,
+        ...(init.headers ?? {}),
+      },
     },
-  });
+    requestTimeoutForPath(path),
+  );
   const text = await response.text();
-  let body: unknown = null;
-  if (text) {
-    try {
-      body = JSON.parse(text);
-    } catch {
-      body = text;
-    }
-  }
+  const body = text ? JSON.parse(text) : null;
   if (!response.ok) {
-    const errorBody = typeof body === 'object' && body ? (body as { error?: unknown; message?: unknown }) : null;
-    const message = errorBody?.error ?? errorBody?.message ?? (typeof body === 'string' ? body : null);
-    throw new Error(message ? String(message) : `Request failed: ${response.status}`);
+    const message = body?.error ?? body?.message ?? `Request failed: ${response.status}`;
+    throw new Error(message);
   }
   return body as T;
 }
 
-export function getHealth(connection: Pick<AgentConnection, 'url' | 'token'> & Partial<AgentConnection>) {
-  return brioFetch<HealthResponse>(connection, '/health');
+function requestTimeoutForPath(path: string) {
+  return path.includes('/v1/responses') || path.includes('/composer/commands/dispatch')
+    ? 5 * 60_000
+    : path.startsWith('/control/') || path.includes('/control/')
+      ? 60_000
+      : 15_000;
+}
+
+export function getHealth(
+  connection: Pick<AgentConnection, 'url' | 'token'> & Partial<AgentConnection>,
+  signal?: AbortSignal,
+) {
+  return brioFetch<HealthResponse>(connection, '/health', { signal });
 }
 
 export function getCapabilities(
   connection: Pick<AgentConnection, 'url' | 'token'> & Partial<AgentConnection>,
 ) {
-  return brioFetch<CapabilitiesResponse>(connection, '/v1/capabilities');
+  return brioFetch<CapabilitiesResponse>(connection, '/capabilities');
 }
 
-export function getComposerCapabilities(connection: AgentConnection) {
-  return brioFetch<ComposerCapabilities>(connection, '/composer/capabilities');
+export function getComposerCapabilities(connection: AgentConnection, profile?: string) {
+  return brioFetch<ComposerCapabilities>(connection, scopedPath('/composer/capabilities', profile));
 }
 
 export function createAttachmentUpload(
   connection: AgentConnection,
   value: { sessionId: string; name: string; mimeType: string; size: number },
   signal?: AbortSignal,
+  profile?: string,
 ) {
-  return brioFetch<ComposerAttachmentUpload>(connection, '/attachments', {
+  return brioFetch<ComposerAttachmentUpload>(connection, scopedPath('/attachments', profile), {
     method: 'POST',
     signal,
     body: JSON.stringify({
@@ -364,10 +451,11 @@ export function uploadAttachmentChunk(
   dataBase64: string,
   final: boolean,
   signal?: AbortSignal,
+  profile?: string,
 ) {
   return brioFetch<ComposerAttachmentUpload>(
     connection,
-    `/attachments/${encodeURIComponent(attachmentId)}/chunks/${index}`,
+    scopedPath(`/attachments/${encodeURIComponent(attachmentId)}/chunks/${index}`, profile),
     {
       method: 'PUT',
       signal,
@@ -376,30 +464,36 @@ export function uploadAttachmentChunk(
   );
 }
 
-export function deleteAttachmentUpload(connection: AgentConnection, attachmentId: string) {
+export function deleteAttachmentUpload(
+  connection: AgentConnection,
+  attachmentId: string,
+  profile?: string,
+) {
   return brioFetch<{ deleted: boolean }>(
     connection,
-    `/attachments/${encodeURIComponent(attachmentId)}`,
+    scopedPath(`/attachments/${encodeURIComponent(attachmentId)}`, profile),
     { method: 'DELETE' },
   );
 }
 
-export function getCommandCatalog(connection: AgentConnection) {
-  return brioFetch<CommandCatalog>(connection, '/composer/commands');
+export function getCommandCatalog(connection: AgentConnection, profile?: string) {
+  return brioFetch<CommandCatalog>(connection, scopedPath('/composer/commands', profile));
 }
 
-export function completeSlashCommand(connection: AgentConnection, text: string) {
-  return brioFetch<{ items: ComposerCompletion[] }>(connection, '/composer/commands/complete', {
-    method: 'POST',
-    body: JSON.stringify({ text }),
-  });
+export function completeSlashCommand(connection: AgentConnection, text: string, profile?: string) {
+  return brioFetch<{ items: ComposerCompletion[] }>(
+    connection,
+    scopedPath('/composer/commands/complete', profile),
+    { method: 'POST', body: JSON.stringify({ text }) },
+  );
 }
 
-export function completeContextReference(connection: AgentConnection, query: string) {
-  return brioFetch<{ items: ComposerCompletion[] }>(connection, '/composer/context/complete', {
-    method: 'POST',
-    body: JSON.stringify({ query }),
-  });
+export function completeContextReference(connection: AgentConnection, query: string, profile?: string) {
+  return brioFetch<{ items: ComposerCompletion[] }>(
+    connection,
+    scopedPath('/composer/context/complete', profile),
+    { method: 'POST', body: JSON.stringify({ query }) },
+  );
 }
 
 export function dispatchComposerCommand(
@@ -407,11 +501,13 @@ export function dispatchComposerCommand(
   sessionId: string,
   text: string,
   requestId: string,
+  profile?: string,
 ) {
-  return brioFetch<Record<string, unknown>>(connection, '/composer/commands/dispatch', {
-    method: 'POST',
-    body: JSON.stringify({ session_id: sessionId, text, request_id: requestId }),
-  });
+  return brioFetch<Record<string, unknown>>(
+    connection,
+    scopedPath('/composer/commands/dispatch', profile),
+    { method: 'POST', body: JSON.stringify({ session_id: sessionId, text, request_id: requestId }) },
+  );
 }
 
 export function prepareComposerPrompt(
@@ -419,18 +515,216 @@ export function prepareComposerPrompt(
   input: string,
   sessionId: string,
   attachments: string[],
+  profile?: string,
 ) {
-  return brioFetch<{ input: unknown }>(connection, '/composer/prepare', {
+  return brioFetch<{ input: unknown }>(connection, scopedPath('/composer/prepare', profile), {
     method: 'POST',
     body: JSON.stringify({ input, session_id: sessionId, attachments }),
   });
 }
 
-export function interruptComposerSession(connection: AgentConnection, sessionId: string) {
-  return brioFetch<{ ok: boolean }>(connection, '/composer/redirect', {
+export function interruptComposerSession(connection: AgentConnection, sessionId: string, profile?: string) {
+  return brioFetch<{ ok: boolean }>(connection, scopedPath('/composer/redirect', profile), {
     method: 'POST',
     body: JSON.stringify({ session_id: sessionId }),
   });
+}
+
+export function listSessions(connection: AgentConnection, limit = 100, profile?: string) {
+  return brioFetch<{ sessions: HermesSession[]; error?: string }>(
+    connection,
+    `${scopedPath('/sessions', profile)}?limit=${limit}`,
+  );
+}
+
+export function searchSessions(connection: AgentConnection, query: string, profile?: string) {
+  return brioFetch<{ results: HermesSearchResult[]; error?: string }>(
+    connection,
+    `${scopedPath('/sessions/search', profile)}?q=${encodeURIComponent(query)}&limit=100`,
+  );
+}
+
+export function getSessionMessages(connection: AgentConnection, sessionId: string, profile?: string) {
+  return brioFetch<{ messages: HermesMessage[]; error?: string }>(
+    connection,
+    scopedPath(`/sessions/${encodeURIComponent(sessionId)}/messages`, profile),
+  );
+}
+
+export function startRun(
+  connection: AgentConnection,
+  input: string,
+  options: {
+    sessionId?: string;
+    instructions?: string;
+    model?: string;
+    provider?: string;
+    modelOptions?: Record<string, unknown>;
+    profile?: string;
+    conversationHistory?: { role: string; content: string }[];
+  } = {},
+) {
+  return brioFetch<HermesRunStart>(connection, scopedPath('/runs', options.profile), {
+    method: 'POST',
+    body: JSON.stringify({
+      input,
+      ...(options.sessionId ? { session_id: options.sessionId } : {}),
+      ...(options.instructions ? { instructions: options.instructions } : {}),
+      ...(options.model ? { model: options.model } : {}),
+      ...(options.provider ? { provider: options.provider } : {}),
+      ...(options.modelOptions ? { model_options: options.modelOptions } : {}),
+      ...(options.conversationHistory
+        ? { conversation_history: options.conversationHistory }
+        : {}),
+    }),
+  });
+}
+
+export function getRun(connection: AgentConnection, runId: string, profile?: string) {
+  return brioFetch<HermesRunStatus>(connection, scopedPath(`/runs/${encodeURIComponent(runId)}`, profile));
+}
+
+export function approveRun(
+  connection: AgentConnection,
+  runId: string,
+  choice: 'once' | 'session' | 'always' | 'deny',
+  profile?: string,
+) {
+  return brioFetch<Record<string, unknown>>(
+    connection,
+    scopedPath(`/runs/${encodeURIComponent(runId)}/approval`, profile),
+    { method: 'POST', body: JSON.stringify({ choice }) },
+  );
+}
+
+export function stopRun(connection: AgentConnection, runId: string, profile?: string) {
+  return brioFetch<{ run_id: string; status: string }>(
+    connection,
+    scopedPath(`/runs/${encodeURIComponent(runId)}/stop`, profile),
+    { method: 'POST', body: '{}' },
+  );
+}
+
+export function listFiles(connection: AgentConnection, path?: string) {
+  return brioFetch<{
+    path: string;
+    entries: HermesFileEntry[];
+    roots?: string[];
+    error?: string;
+  }>(connection, `/files${path ? `?path=${encodeURIComponent(path)}` : ''}`);
+}
+
+export function readFile(connection: AgentConnection, path: string) {
+  return brioFetch<{ path: string; content: string }>(
+    connection,
+    `/files/read?path=${encodeURIComponent(path)}`,
+  );
+}
+
+export function writeFile(connection: AgentConnection, path: string, content: string) {
+  return brioFetch<{ ok: boolean }>(connection, '/files/write', {
+    method: 'PUT',
+    body: JSON.stringify({ path, content }),
+  });
+}
+
+export function getMemory(connection: AgentConnection) {
+  return brioFetch<{ memory: string; user: string }>(connection, '/memory');
+}
+
+export function updateMemory(
+  connection: AgentConnection,
+  value: { memory?: string; user?: string },
+) {
+  return brioFetch<{ ok: boolean }>(connection, '/memory', {
+    method: 'PUT',
+    body: JSON.stringify(value),
+  });
+}
+
+export function getRawConfig(connection: AgentConnection) {
+  return brioFetch<{ yaml: string; error?: string }>(connection, '/config/raw');
+}
+
+export function updateRawConfig(connection: AgentConnection, yaml: string) {
+  return brioFetch<{ ok: boolean }>(connection, '/config/raw', {
+    method: 'PUT',
+    body: JSON.stringify({ yaml }),
+  });
+}
+
+export function listSkills(connection: AgentConnection) {
+  return brioFetch<{ skills: HermesSkill[] }>(connection, '/skills');
+}
+
+export function getToolsets(connection: AgentConnection) {
+  return brioFetch<{ toolsets: Record<string, string[]>; error?: string }>(
+    connection,
+    '/tools/toolsets',
+  );
+}
+
+export function updateToolset(
+  connection: AgentConnection,
+  name: string,
+  enabled: boolean,
+  platform = 'cli',
+) {
+  return brioFetch<{ ok: boolean; platform: string; toolsets: string[] }>(
+    connection,
+    `/tools/toolsets/${encodeURIComponent(name)}`,
+    { method: 'PATCH', body: JSON.stringify({ enabled, platform }) },
+  );
+}
+
+export function getGatewayStatus(connection: AgentConnection) {
+  return brioFetch<{ running: boolean; status?: unknown; raw?: string }>(
+    connection,
+    '/gateway/status',
+  );
+}
+
+export function restartGateway(connection: AgentConnection) {
+  return brioFetch<{ ok: boolean; output?: string; error?: string }>(
+    connection,
+    '/gateway/restart',
+    { method: 'POST', body: '{}' },
+  );
+}
+
+export function getLogs(
+  connection: AgentConnection,
+  file: 'agent' | 'errors' | 'gateway' = 'agent',
+  lines = 200,
+) {
+  return brioFetch<{ file: string; lines: string[] }>(
+    connection,
+    `/logs?file=${file}&lines=${lines}`,
+  );
+}
+
+export function listJobs(connection: AgentConnection) {
+  return brioFetch<HermesJob[] | { jobs: HermesJob[] }>(connection, '/jobs/');
+}
+
+export function runJobAction(
+  connection: AgentConnection,
+  jobId: string,
+  action: 'pause' | 'resume' | 'trigger',
+) {
+  return brioFetch<Record<string, unknown>>(
+    connection,
+    `/jobs/${encodeURIComponent(jobId)}/${action}`,
+    { method: 'POST', body: '{}' },
+  );
+}
+
+export function deleteJob(connection: AgentConnection, jobId: string) {
+  return brioFetch<Record<string, unknown>>(
+    connection,
+    `/jobs/${encodeURIComponent(jobId)}`,
+    { method: 'DELETE' },
+  );
 }
 
 export function controlRPC<T>(
@@ -454,6 +748,75 @@ export function controlRPC<T>(
 
 export function listControlSessions(connection: AgentConnection, limit = 100, profile?: string) {
   return controlRPC<{ sessions: HermesControlSession[] }>(connection, 'session.list', { limit }, false, undefined, profile);
+}
+
+export async function listModelSessions(
+  connection: AgentConnection,
+  limit = 200,
+  profile?: string,
+) {
+  const result = await brioFetch<{ data?: HermesAnalyticsSession[] }>(
+    connection,
+    `${scopedPath('/api/sessions', profile)}?limit=${limit}`,
+  );
+  return { sessions: Array.isArray(result.data) ? result.data : [] };
+}
+
+export async function getModelOptions(
+  connection: AgentConnection,
+  refresh = false,
+  profile?: string,
+): Promise<HermesModelOptions> {
+  const result = await brioFetch<unknown>(
+    connection,
+    `${scopedPath('/api/model/options', profile)}${refresh ? '?refresh=1' : ''}`,
+  );
+  return normalizeModelOptions(result);
+}
+
+export function setSessionModel(
+  connection: AgentConnection,
+  sessionId: string,
+  payload: HermesSessionModelPayload,
+  profile?: string,
+) {
+  return brioFetch<HermesSessionModelLock>(
+    connection,
+    scopedPath(`/api/sessions/${encodeURIComponent(sessionId)}/model`, profile),
+    { method: 'POST', body: JSON.stringify(payload) },
+  );
+}
+
+export async function getSessionUsage(
+  connection: AgentConnection,
+  sessionId: string,
+  profile?: string,
+): Promise<NormalizedRuntimeUsage> {
+  const result = await controlRPC<unknown>(
+    connection,
+    'session.usage',
+    { session_id: sessionId },
+    false,
+    sessionId,
+    profile,
+  );
+  return normalizeLiveUsage(result);
+}
+
+export async function getSessionContextBreakdown(
+  connection: AgentConnection,
+  sessionId: string,
+  profile?: string,
+): Promise<NormalizedContextBreakdown | undefined> {
+  const result = await controlRPC<unknown>(
+    connection,
+    'session.context_breakdown',
+    { session_id: sessionId },
+    false,
+    sessionId,
+    profile,
+  );
+  return normalizeContextBreakdown(result);
 }
 
 export function executeControlCommand(
@@ -571,6 +934,71 @@ export async function getCommandCenterSnapshot(
   };
 }
 
+export function filterAgentsForControlSession(
+  agents: readonly HermesSubagent[],
+  events: readonly HermesControlEvent[],
+  runtimeSessionId: string,
+) {
+  const observed = new Set(
+    events
+      .filter((event) => event.session_id === runtimeSessionId)
+      .map((event) =>
+        typeof event.payload?.subagent_id === 'string' ? event.payload.subagent_id : '',
+      )
+      .filter(Boolean),
+  );
+  return agents
+    .filter((agent) =>
+      agent.owner_session_id
+        ? agent.owner_session_id === runtimeSessionId
+        : observed.has(agent.subagent_id),
+    )
+    .map((agent) => ({ ...agent, owner_session_id: runtimeSessionId }));
+}
+
+export function parseGoalStatus(value: string): HermesGoalStatus | null {
+  const detail = value.replace(/\r/g, '').trim();
+  const statusLine = detail.split('\n')[0]?.trim() ?? '';
+  if (!statusLine || /^No (?:active )?goal\b/i.test(statusLine)) return null;
+  let status: HermesGoalStatus['status'] | null = null;
+  if (/^⊙ Goal\b/.test(statusLine)) status = 'active';
+  else if (/^⏸ Goal\b/.test(statusLine)) status = 'paused';
+  else if (/^⏳ Goal\b/.test(statusLine)) status = 'waiting';
+  else if (/^✓ Goal done\b/.test(statusLine)) status = 'done';
+  if (!status) return null;
+
+  const marker = statusLine.indexOf('): ');
+  const metadataStart = statusLine.indexOf('(');
+  const metadata =
+    metadataStart >= 0 && marker > metadataStart
+      ? statusLine.slice(metadataStart + 1, marker)
+      : '';
+  const pausedReason = status === 'paused'
+    ? metadata.match(/\s—\s(.+)$/)?.[1]?.trim()
+    : undefined;
+  if (status === 'paused' && pausedReason && pausedReason.toLowerCase() !== 'user-paused') {
+    status = 'blocked';
+  }
+  const objective = marker >= 0
+    ? detail.slice(marker + 3).trim()
+    : detail.replace(/^\S+\s+Goal(?:\s+\w+)?\s*:?\s*/i, '').trim();
+  const turns = metadata.match(/(\d+)\s*\/\s*(\d+)\s+turns?/i);
+  const subgoals = metadata.match(/(\d+)\s+subgoals?/i);
+  const gates = metadata.match(/(\d+)\s+gates?/i);
+  return {
+    status,
+    objective,
+    turnsUsed: turns ? Number(turns[1]) : undefined,
+    maxTurns: turns ? Number(turns[2]) : undefined,
+    subgoalCount: subgoals ? Number(subgoals[1]) : 0,
+    subgoals: [],
+    gateCount: gates ? Number(gates[1]) : 0,
+    hasContract: /(?:^|[,\s])contract(?:[,\s]|$)/i.test(metadata),
+    ...(pausedReason ? { pausedReason } : {}),
+    detail,
+  };
+}
+
 function withSubgoals(goal: HermesGoalStatus | null, output: string) {
   if (!goal) return null;
   const subgoals = output
@@ -581,195 +1009,77 @@ function withSubgoals(goal: HermesGoalStatus | null, output: string) {
   return { ...goal, subgoalCount: Math.max(goal.subgoalCount, subgoals.length), subgoals };
 }
 
-export type { ResponseRequestOptions };
+export function parseHeartbeatStatus(value: string): HermesHeartbeatStatus | null {
+  const detail = value.replace(/\r/g, '').trim().split('\n')[0]?.trim() ?? '';
+  if (!detail || /^No heartbeat\b/i.test(detail)) return null;
+  const active = detail.match(/^♥ Heartbeat \(every ([^,\)]+)(?:, next in ~?(\d+)s)?(?:, fired (\d+)[×x])?\): (.+)$/i);
+  const paused = detail.match(/^⏸ Heartbeat \(paused, every ([^,\)]+)(?:, fired (\d+)[×x])?\): (.+)$/i);
+  if (active) {
+    return {
+      status: 'active',
+      interval: active[1],
+      nextInSeconds: active[2] ? Number(active[2]) : undefined,
+      fireCount: active[3] ? Number(active[3]) : 0,
+      prompt: active[4],
+      detail,
+    };
+  }
+  if (paused) {
+    return {
+      status: 'paused',
+      interval: paused[1],
+      fireCount: paused[2] ? Number(paused[2]) : 0,
+      prompt: paused[3],
+      detail,
+    };
+  }
+  return null;
+}
+
+export function aggregateRootAgentUsage(agents: readonly HermesSubagent[]) {
+  // A missing parent row usually means the bounded event window rolled it
+  // off. Treating that orphan as a root double-counts a descendant rollup.
+  const roots = agents.filter((agent) => !agent.parent_id);
+  return roots.reduce(
+    (total, agent) => ({
+      inputTokens: total.inputTokens + (agent.input_tokens ?? 0),
+      outputTokens: total.outputTokens + (agent.output_tokens ?? 0),
+      costUsd: total.costUsd + (agent.cost_usd ?? 0),
+    }),
+    { inputTokens: 0, outputTokens: 0, costUsd: 0 },
+  );
+}
 
 export async function sendResponse(
   connection: Pick<AgentConnection, 'url' | 'token'> & Partial<AgentConnection>,
   prompt: string,
-  options: ResponseRequestOptions & { profile?: string } = {},
 ) {
-  const sessionHeaders = sessionIdentityHeaders(options.sessionId);
-  return brioFetch<HermesResponse>(connection, scopedPath('/v1/responses', options.profile), {
+  return brioFetch<Record<string, unknown>>(connection, '/chat/responses', {
     method: 'POST',
-    body: JSON.stringify(responseRequestBody(prompt, options, false)),
-    ...(sessionHeaders ? { headers: sessionHeaders } : {}),
+    body: JSON.stringify({
+      model: 'hermes-agent',
+      input: prompt,
+      stream: false,
+    }),
   });
 }
 
-export async function sendResponseStream(
+export async function sendComposerResponse(
   connection: Pick<AgentConnection, 'url' | 'token'> & Partial<AgentConnection>,
   prompt: unknown,
   options: ResponseRequestOptions & {
-    onTextDelta?: (delta: string) => void;
     profile?: string;
-    signal?: AbortSignal;
     composerSessionId?: string;
     attachmentIds?: string[];
   } = {},
 ) {
-  const parser = new ResponsesSSEParser(options.onTextDelta);
-  const body = JSON.stringify(responseRequestBody(prompt, options, true));
-  const responsesPath = scopedPath('/v1/responses', options.profile);
-  const sessionHeaders = sessionIdentityHeaders(options.sessionId);
-
-  if (connection.transport === 'relay') {
-    let terminalSessionId = '';
-    await relayFetch<null>(
-      connection,
-      responsesPath,
-      {
-        method: 'POST',
-        body,
-        signal: options.signal,
-        ...(sessionHeaders ? { headers: sessionHeaders } : {}),
-      },
-      (chunk) => parser.push(chunk),
-      (headers) => {
-        terminalSessionId = headerValue(headers, SESSION_ID_HEADER)?.trim() ?? '';
-      },
-    );
-    return withFallbackSessionId(parser.finish(), terminalSessionId);
-  }
-
-  const response = await expoFetch(`${normalizeBaseURL(connection.url)}${responsesPath}`, {
+  return brioFetch<HermesResponse>(connection, scopedPath('/v1/responses', options.profile), {
     method: 'POST',
-    headers: {
-      Accept: 'text/event-stream, application/json',
-      'Content-Type': 'application/json',
-      Authorization: `Bearer ${connection.token}`,
-      ...(sessionHeaders ?? {}),
-    },
-    body,
-    signal: options.signal,
+    body: JSON.stringify(responseRequestBody(prompt, options, false)),
+    ...(options.sessionId
+      ? { headers: { 'X-Hermes-Session-Id': options.sessionId } }
+      : {}),
   });
-  const directSessionId = response.headers.get(SESSION_ID_HEADER)?.trim() ?? '';
-  const contentType = response.headers.get('Content-Type')?.toLowerCase() ?? '';
-  if (!response.ok || !contentType.includes('text/event-stream')) {
-    const text = await response.text();
-    const result = text ? (JSON.parse(text) as HermesResponse) : null;
-    if (!response.ok) {
-      const error = typeof result?.error === 'string' ? result.error : result?.error?.message;
-      throw new Error(error ?? `Request failed: ${response.status}`);
-    }
-    if (!result) throw new Error('Agent returned an empty response');
-    return withFallbackSessionId(result, directSessionId);
-  }
-
-  const reader = response.body?.getReader();
-  if (!reader) throw new Error('Streaming response body is unavailable');
-  const decoder = new TextDecoder();
-  while (true) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    parser.push(decoder.decode(value, { stream: true }));
-  }
-  parser.push(decoder.decode());
-  return withFallbackSessionId(parser.finish(), directSessionId);
-}
-
-// A session id from the body always wins; transport headers only fill the gap.
-function withFallbackSessionId(response: HermesResponse, headerSessionId: string): HermesResponse {
-  if (!response.session_id?.trim() && headerSessionId) {
-    response.session_id = headerSessionId;
-  }
-  return response;
-}
-
-export async function listHermesSessions(
-  connection: Pick<AgentConnection, 'url' | 'token'> & Partial<AgentConnection>,
-  limit = 60,
-  profile?: string,
-) {
-  const result = await brioFetch<{ data?: HermesSession[] }>(
-    connection,
-    `${scopedPath('/api/sessions', profile)}?limit=${limit}`,
-  );
-  return normalizeHermesSessions(result);
-}
-
-export async function getHermesSessionMessages(
-  connection: Pick<AgentConnection, 'url' | 'token'> & Partial<AgentConnection>,
-  sessionId: string,
-  profile?: string,
-) {
-  const result = await brioFetch<{ data?: HermesSessionMessage[] }>(
-    connection,
-    scopedPath(`/api/sessions/${encodeURIComponent(sessionId)}/messages`, profile),
-  );
-  return normalizeHermesSessionMessages(result);
-}
-
-export async function listHermesModelOptions(
-  connection: Pick<AgentConnection, 'url' | 'token'> & Partial<AgentConnection>,
-  refresh = false,
-  profile?: string,
-): Promise<HermesModelOptions> {
-  const result = await brioFetch<unknown>(
-    connection,
-    `${scopedPath('/api/model/options', profile)}${refresh ? '?refresh=1' : ''}`,
-  );
-  return normalizeModelOptions(result);
-}
-
-export async function getHermesSession(
-  connection: Pick<AgentConnection, 'url' | 'token'> & Partial<AgentConnection>,
-  sessionId: string,
-): Promise<HermesSession> {
-  if (!sessionId.trim()) {
-    throw new Error('getHermesSession requires a non-empty session id');
-  }
-  const result = await brioFetch<{ session?: HermesSession } | HermesSession>(
-    connection,
-    `/api/sessions/${encodeURIComponent(sessionId)}`,
-  );
-  const session =
-    typeof result === 'object' && result !== null && 'session' in result && result.session
-      ? result.session
-      : (result as HermesSession);
-  if (!session || typeof session !== 'object' || typeof session.id !== 'string') {
-    throw new Error(`getHermesSession received no valid session for id ${sessionId}`);
-  }
-  return session;
-}
-
-export async function setHermesSessionModel(
-  connection: Pick<AgentConnection, 'url' | 'token'> & Partial<AgentConnection>,
-  sessionId: string,
-  payload: HermesSessionModelPayload,
-): Promise<HermesSessionModelLock> {
-  if (!sessionId.trim()) {
-    throw new Error('setHermesSessionModel requires a non-empty session id');
-  }
-  return brioFetch<HermesSessionModelLock>(
-    connection,
-    `/api/sessions/${encodeURIComponent(sessionId)}/model`,
-    { method: 'POST', body: JSON.stringify(payload) },
-  );
-}
-
-// Control-RPC reads for live session telemetry. These intentionally surface
-// failures (unknown method, offline agent, ...) so the UI can mark the data
-// as unavailable instead of guessing.
-export async function getSessionUsage(
-  connection: AgentConnection,
-  runtimeSessionId: string,
-  profile?: string,
-): Promise<NormalizedRuntimeUsage> {
-  const result = await controlRPC<unknown>(connection, 'session.usage', {
-    session_id: runtimeSessionId,
-  }, false, runtimeSessionId, profile);
-  return normalizeLiveUsage(result);
-}
-
-export async function getSessionContextBreakdown(
-  connection: AgentConnection,
-  runtimeSessionId: string,
-  profile?: string,
-): Promise<NormalizedContextBreakdown | undefined> {
-  const result = await controlRPC<unknown>(connection, 'session.context_breakdown', {
-    session_id: runtimeSessionId,
-  }, false, runtimeSessionId, profile);
-  return normalizeContextBreakdown(result);
 }
 
 export function hermesResponseText(response: HermesResponse) {
@@ -782,7 +1092,7 @@ export function hermesResponseText(response: HermesResponse) {
   );
   if (parts.length) return parts.join('\n\n');
   const error = typeof response.error === 'string' ? response.error : response.error?.message;
-  return error?.trim() || 'Brio completed the request without a text response.';
+  return error?.trim() || 'Hermes completed the request without a text response.';
 }
 
 export type PairingPayload = {
@@ -794,22 +1104,99 @@ export type PairingPayload = {
   code?: string;
 };
 
+function isPairingTransport(value: unknown): value is 'direct' | 'relay' {
+  return value === 'direct' || value === 'relay';
+}
+
+function pairingPayloadFromUnknown(value: unknown): PairingPayload {
+  if (!value || typeof value !== 'object') {
+    throw new Error('Pairing details are not a valid object');
+  }
+  const candidate = value as Record<string, unknown>;
+  const url = typeof candidate.url === 'string' ? candidate.url.trim() : '';
+  const token = typeof candidate.token === 'string' ? candidate.token.trim() : '';
+  const transport = candidate.transport ?? candidate.mode ?? 'direct';
+  const code = typeof candidate.code === 'string' ? candidate.code.trim() : undefined;
+  const agentId = typeof candidate.agent_id === 'string' ? candidate.agent_id.trim() : undefined;
+
+  if (
+    candidate.transport !== undefined &&
+    candidate.mode !== undefined &&
+    candidate.transport !== candidate.mode
+  ) {
+    throw new Error('Pairing details contain conflicting connection types');
+  }
+
+  if (!url) throw new Error('Pairing details do not include an address');
+  let parsedURL: URL;
+  try {
+    parsedURL = new URL(url);
+  } catch {
+    throw new Error('Pairing details include an invalid address');
+  }
+  if (!['http:', 'https:'].includes(parsedURL.protocol) || !parsedURL.hostname) {
+    throw new Error('Pairing details must use an HTTP or HTTPS address');
+  }
+  if (parsedURL.search || parsedURL.hash) {
+    throw new Error('Pairing details include an invalid server address');
+  }
+  if (!isPairingTransport(transport)) {
+    throw new Error('Pairing details include an unsupported connection type');
+  }
+  if (transport === 'direct' && !token) {
+    throw new Error('Pairing details do not include a token');
+  }
+  if (transport === 'relay' && !code) {
+    throw new Error('Relay pairing details do not include a claim code');
+  }
+
+  return {
+    url: parsedURL.toString().replace(/\/$/, ''),
+    token,
+    mode: transport,
+    transport,
+    ...(agentId ? { agent_id: agentId } : {}),
+    ...(code ? { code } : {}),
+  };
+}
+
 export function decodePairingPayload(raw: string): PairingPayload {
   const value = raw.trim();
   if (!value) {
     throw new Error('Pairing payload is empty');
   }
-  try {
-    return JSON.parse(value) as PairingPayload;
-  } catch {
-    return JSON.parse(decodeBase64URL(value)) as PairingPayload;
+  if (value.length > 65_536) {
+    throw new Error('Pairing payload is too large');
   }
+  let decoded: unknown;
+  try {
+    decoded = JSON.parse(value);
+  } catch {
+    decoded = JSON.parse(decodeBase64URL(value));
+  }
+  return pairingPayloadFromUnknown(decoded);
 }
 
 export function extractPairingPayload(raw: string): PairingPayload {
-  const value = raw.trim();
+  let value = raw.trim();
   if (!value) {
-    throw new Error('Agent reply is empty');
+    throw new Error('Hermes reply is empty');
+  }
+  if (value.length > 65_536) {
+    throw new Error('Pairing payload is too large');
+  }
+
+  try {
+    const deepLink = new URL(value);
+    if (deepLink.protocol === 'brio:') {
+      value =
+        deepLink.searchParams.get('pairingPayload')?.trim() ??
+        deepLink.searchParams.get('payload')?.trim() ??
+        '';
+      if (!value) throw new Error('Brio pairing link does not contain pairing details');
+    }
+  } catch (reason) {
+    if (/^brio:/i.test(value)) throw reason;
   }
 
   const notReadyMatch = value.match(/^\s*NOT\s+READY\s*:\s*(.+)$/is);
@@ -826,7 +1213,7 @@ export function extractPairingPayload(raw: string): PairingPayload {
   const jsonBlock = value.match(/\{[\s\S]*\}/)?.[0];
   if (jsonBlock) {
     try {
-      return JSON.parse(jsonBlock) as PairingPayload;
+      return pairingPayloadFromUnknown(JSON.parse(jsonBlock));
     } catch {
       // Ignore and continue with label-based parsing.
     }
@@ -838,60 +1225,137 @@ export function extractPairingPayload(raw: string): PairingPayload {
   const tokenMatch = value.match(/(?:^|\n)\s*token\s*:\s*([^\s]+)/i);
 
   if (!urlMatch || !tokenMatch) {
-    throw new Error('Could not find a pairing payload or URL/token in the agent reply');
+    throw new Error('Could not find a pairing payload or URL/token in the Hermes reply');
   }
 
-  return {
+  return pairingPayloadFromUnknown({
     url: cleanConnectionValue(urlMatch[1] ?? urlMatch[0]),
     token: cleanConnectionValue(tokenMatch[1]),
     mode: 'direct',
     transport: 'direct',
-  };
+  });
 }
 
 export function connectionFromPairingPayload(payload: PairingPayload): AgentConnection {
-  if (!payload || typeof payload !== 'object') {
-    throw new Error('Pairing payload must be an object');
-  }
   const transport = payload.transport ?? payload.mode ?? 'direct';
-  if (transport !== 'direct' && transport !== 'relay') {
-    throw new Error('Pairing payload has an unsupported transport');
-  }
-  if (typeof payload.url !== 'string' || !payload.url.trim()) {
-    throw new Error('Pairing payload is missing a server URL');
-  }
-  if (transport === 'direct' && (typeof payload.token !== 'string' || !payload.token.trim())) {
-    throw new Error('Pairing payload is missing a direct connection token');
-  }
-  if (transport === 'relay' && (typeof payload.code !== 'string' || !payload.code.trim())) {
-    throw new Error('Relay pairing payload is missing a pairing code');
-  }
+  const directId = `direct_${stableConnectionHash(payload.url)}`;
   return {
-    id: payload.agent_id ?? 'self-hosted-local',
-    name: 'Brio Agent',
+    id: payload.agent_id ?? directId,
+    name: transport === 'direct' ? directConnectionName(payload.url) : 'Hermes',
     mode: 'self_hosted',
     transport,
     status: 'connecting',
     capabilities: {},
-    url: payload.url.trim(),
-    token: typeof payload.token === 'string' ? payload.token.trim() : '',
+    url: payload.url,
+    token: payload.token,
     agentId: payload.agent_id,
     pairingCode: payload.code,
   };
 }
 
+export function normalizeConnectionURL(value: string) {
+  const trimmed = value.trim().replace(/\/+$/, '');
+  if (/^https?:\/\//i.test(trimmed)) return trimmed;
+  const localHostname = /^(localhost|[^/:]+\.local)(?::\d+)?$/i.test(trimmed);
+  return `${isPrivateNetworkLiteral(trimmed) || localHostname ? 'http' : 'https'}://${trimmed}`;
+}
+
+function isPrivateNetworkLiteral(host: string) {
+  try {
+    const hostname = new URL(`http://${host}`).hostname.replace(/^\[|\]$/g, '');
+    if (hostname.includes(':')) {
+      const normalized = hostname.toLowerCase();
+      return (
+        normalized === '::1' ||
+        /^f[cd]/.test(normalized) ||
+        /^fe[89ab]/.test(normalized)
+      );
+    }
+    const octets = hostname.split('.');
+    if (
+      octets.length !== 4 ||
+      !octets.every((octet) => /^\d{1,3}$/.test(octet) && Number(octet) <= 255)
+    ) {
+      return false;
+    }
+    const [first, second] = octets.map(Number);
+    return (
+      first === 10 ||
+      first === 127 ||
+      (first === 169 && second === 254) ||
+      (first === 172 && second >= 16 && second <= 31) ||
+      (first === 192 && second === 168) ||
+      (first === 100 && second >= 64 && second <= 127)
+    );
+  } catch {
+    return false;
+  }
+}
+
+function stableConnectionHash(value: string) {
+  let hash = 2166136261;
+  for (let index = 0; index < value.length; index += 1) {
+    hash ^= value.charCodeAt(index);
+    hash = Math.imul(hash, 16777619);
+  }
+  return (hash >>> 0).toString(36);
+}
+
+function directConnectionName(value: string) {
+  try {
+    return new URL(value).hostname || 'Hermes';
+  } catch {
+    return 'Hermes';
+  }
+}
+
+export type ConnectionProgress = 'claiming' | 'checking_companion' | 'checking_hermes' | 'ready';
+
+export async function finalizeConnection(
+  connection: AgentConnection,
+  onProgress?: (progress: ConnectionProgress) => void,
+  signal?: AbortSignal,
+) {
+  if (connection.transport === 'relay') {
+    throw new Error('Development Relay pairing must be completed from the Relay screen');
+  }
+
+  onProgress?.('checking_companion');
+  const health = await withTimeout(getHealth(connection, signal));
+  if (!health.ok) {
+    throw new Error('The Brio connector did not report a healthy connection');
+  }
+  onProgress?.('checking_hermes');
+  const agentKind = health.agent_kind?.trim().toLowerCase() || 'hermes';
+  if (agentKind !== 'hermes') {
+    throw new Error(`${health.agent_name ?? agentKind} is not supported by this version of Brio`);
+  }
+  if (!(health.agent_ok ?? health.hermes_ok)) {
+    throw new Error('The Brio connector is online, but Hermes Agent is not reachable');
+  }
+  onProgress?.('ready');
+  return {
+    ...connection,
+    agentKind,
+    agentName: health.agent_name ?? 'Hermes Agent',
+    status: 'online' as const,
+  };
+}
+
 export async function createRelayDevice(
   relayURL: string,
-  email = 'dev@brio.local',
+  email: string,
   deviceName = 'Brio mobile',
+  signal?: AbortSignal,
 ) {
-  const response = await fetch(`${normalizeBaseURL(relayURL)}/auth/devices`, {
+  const response = await fetchWithTimeout(`${normalizeBaseURL(relayURL)}/auth/devices`, {
     method: 'POST',
     headers: {
       Accept: 'application/json',
       'Content-Type': 'application/json',
     },
     body: JSON.stringify({ email, device_name: deviceName }),
+    signal,
   });
   const body = await response.json();
   if (!response.ok) {
@@ -904,8 +1368,9 @@ export async function claimRelayPairing(
   relayURL: string,
   relayToken: string,
   pairingCode: string,
+  signal?: AbortSignal,
 ) {
-  const response = await fetch(
+  const response = await fetchWithTimeout(
     `${normalizeBaseURL(relayURL)}/pairings/${encodeURIComponent(pairingCode)}/claim`,
     {
       method: 'POST',
@@ -913,6 +1378,7 @@ export async function claimRelayPairing(
         Accept: 'application/json',
         Authorization: `Bearer ${relayToken}`,
       },
+      signal,
     },
   );
   const body = await response.json();
@@ -923,7 +1389,7 @@ export async function claimRelayPairing(
 }
 
 export async function listRelayAgents(relayURL: string, relayToken: string) {
-  const response = await fetch(`${normalizeBaseURL(relayURL)}/agents`, {
+  const response = await fetchWithTimeout(`${normalizeBaseURL(relayURL)}/agents`, {
     headers: {
       Accept: 'application/json',
       Authorization: `Bearer ${relayToken}`,
@@ -939,9 +1405,9 @@ export async function listRelayAgents(relayURL: string, relayToken: string) {
 export async function createRelayEnrollment(
   relayURL: string,
   relayToken: string,
-  name = 'Brio Agent',
+  name = 'Hermes',
 ) {
-  const response = await fetch(`${normalizeBaseURL(relayURL)}/enrollments`, {
+  const response = await fetchWithTimeout(`${normalizeBaseURL(relayURL)}/enrollments`, {
     method: 'POST',
     headers: {
       Accept: 'application/json',
@@ -963,7 +1429,7 @@ export async function recoverRelayAgent(
   agentID: string,
   name?: string,
 ) {
-  const response = await fetch(
+  const response = await fetchWithTimeout(
     `${normalizeBaseURL(relayURL)}/agents/${encodeURIComponent(agentID)}/recover`,
     {
       method: 'POST',
@@ -983,257 +1449,21 @@ export async function recoverRelayAgent(
 }
 
 type RelayFrame = {
-  type: 'request' | 'response' | 'stream_chunk' | 'stream_end' | 'error' | 'ping' | 'pong';
+  type: 'request' | 'response' | 'error';
   id: string;
   method?: string;
   path?: string;
   status?: number;
   headers?: Record<string, string>;
   body?: unknown;
-  data?: string;
   code?: string;
   message?: string;
 };
-
-type PendingRelayRequest = {
-  resolve: (value: unknown) => void;
-  reject: (error: Error) => void;
-  timer: ReturnType<typeof setTimeout>;
-  chunks: unknown[];
-  onChunk?: (chunk: string) => void;
-  onTerminalHeaders?: (headers: Record<string, string>) => void;
-  signal?: AbortSignal;
-  abort?: () => void;
-};
-
-const relayClients = new Map<string, RelaySocketClient>();
-
-class RelaySocketClient {
-  private readonly wsURL: string;
-  private socket: WebSocket | null = null;
-  private opening: Promise<void> | null = null;
-  private pending = new Map<string, PendingRelayRequest>();
-
-  constructor(wsURL: string) {
-    this.wsURL = wsURL;
-  }
-
-  request<T>(
-    frame: RelayFrame,
-    timeoutMs = 5 * 60 * 1000,
-    onChunk?: (chunk: string) => void,
-    onTerminalHeaders?: (headers: Record<string, string>) => void,
-    signal?: AbortSignal,
-  ): Promise<T> {
-    return this.connect().then(
-      () =>
-        new Promise<T>((resolve, reject) => {
-          if (signal?.aborted) {
-            reject(new Error('Relay request cancelled'));
-            return;
-          }
-          const socket = this.socket;
-          if (!socket || socket.readyState !== WebSocket.OPEN) {
-            reject(new Error('Relay connection is not open'));
-            return;
-          }
-
-          const timer = setTimeout(() => {
-            if (this.pending.has(frame.id)) {
-              this.clearPending(frame.id);
-              reject(new Error('Relay request timed out'));
-            }
-          }, timeoutMs);
-
-          const abort = () => {
-            if (!this.pending.has(frame.id)) return;
-            this.clearPending(frame.id);
-            reject(new Error('Relay request cancelled'));
-          };
-
-          this.pending.set(frame.id, {
-            resolve: (value) => resolve(value as T),
-            reject,
-            timer,
-            chunks: [],
-            onChunk,
-            onTerminalHeaders,
-            signal,
-            abort,
-          });
-          signal?.addEventListener('abort', abort, { once: true });
-
-          try {
-            socket.send(JSON.stringify(frame));
-          } catch (error) {
-            this.clearPending(frame.id);
-            reject(error instanceof Error ? error : new Error(String(error)));
-          }
-        }),
-    );
-  }
-
-  private connect(): Promise<void> {
-    if (this.socket?.readyState === WebSocket.OPEN) {
-      return Promise.resolve();
-    }
-    if (this.opening) {
-      return this.opening;
-    }
-
-    this.opening = new Promise<void>((resolve, reject) => {
-      const socket = new WebSocket(this.wsURL);
-      this.socket = socket;
-
-      const connectTimer = setTimeout(() => {
-        if (this.socket === socket) {
-          socket.close();
-          this.socket = null;
-        }
-        this.opening = null;
-        reject(new Error('Relay connection timed out'));
-      }, 15000);
-
-      socket.onopen = () => {
-        clearTimeout(connectTimer);
-        this.opening = null;
-        resolve();
-      };
-
-      socket.onerror = () => {
-        clearTimeout(connectTimer);
-        if (this.opening) {
-          this.opening = null;
-          reject(new Error('Relay connection failed'));
-        }
-      };
-
-      socket.onmessage = (event) => {
-        this.handleMessage(String(event.data));
-      };
-
-      socket.onclose = () => {
-        clearTimeout(connectTimer);
-        if (this.socket === socket) {
-          this.socket = null;
-        }
-        this.opening = null;
-        this.rejectAll(new Error('Relay connection closed'));
-      };
-    });
-
-    return this.opening;
-  }
-
-  private handleMessage(data: string) {
-    let frame: RelayFrame;
-    try {
-      frame = JSON.parse(data) as RelayFrame;
-    } catch {
-      return;
-    }
-
-    if (frame.type === 'ping') {
-      if (this.socket?.readyState === WebSocket.OPEN) {
-        this.socket.send(JSON.stringify({ type: 'pong', id: frame.id } satisfies RelayFrame));
-      }
-      return;
-    }
-
-    const pending = this.pending.get(frame.id);
-    if (!pending) {
-      return;
-    }
-
-    if (frame.type === 'stream_chunk') {
-      if (pending.onChunk) {
-        try {
-          pending.onChunk(String(frame.data ?? frame.body ?? ''));
-        } catch (error) {
-          this.clearPending(frame.id);
-          pending.reject(error instanceof Error ? error : new Error(String(error)));
-        }
-        return;
-      }
-      pending.chunks.push(frame.body ?? frame.data ?? null);
-      return;
-    }
-
-    this.clearPending(frame.id);
-
-    if (frame.type === 'error') {
-      pending.reject(new Error(frame.message ?? frame.code ?? 'Relay request failed'));
-      return;
-    }
-
-    if (frame.type === 'stream_end') {
-      pending.onTerminalHeaders?.(frame.headers ?? {});
-      if (pending.onChunk) {
-        pending.resolve(null);
-        return;
-      }
-      if (frame.body !== undefined) {
-        pending.resolve(frame.body);
-        return;
-      }
-      if (pending.chunks.length === 0) {
-        pending.resolve(null);
-        return;
-      }
-      if (pending.chunks.every((chunk) => typeof chunk === 'string')) {
-        const combined = pending.chunks.join('');
-        try {
-          pending.resolve(JSON.parse(combined));
-        } catch {
-          pending.reject(new Error('Relay returned streamed data that could not be decoded'));
-        }
-        return;
-      }
-      if (pending.chunks.length === 1) {
-        pending.resolve(pending.chunks[0]);
-        return;
-      }
-      pending.reject(new Error('Relay returned an unsupported streamed response'));
-      return;
-    }
-
-    if ((frame.status ?? 500) >= 400) {
-      const message =
-        typeof frame.body === 'object' && frame.body && 'error' in frame.body
-          ? String((frame.body as { error?: unknown }).error)
-          : `Request failed: ${frame.status}`;
-      pending.reject(new Error(message));
-      return;
-    }
-
-    pending.resolve(frame.body);
-  }
-
-  private clearPending(id: string) {
-    const pending = this.pending.get(id);
-    if (pending) {
-      clearTimeout(pending.timer);
-      if (pending.abort) pending.signal?.removeEventListener('abort', pending.abort);
-      this.pending.delete(id);
-    }
-  }
-
-  private rejectAll(error: Error) {
-    for (const [id, pending] of this.pending) {
-      clearTimeout(pending.timer);
-      if (pending.abort) pending.signal?.removeEventListener('abort', pending.abort);
-      pending.reject(error);
-      this.pending.delete(id);
-    }
-  }
-}
 
 function relayFetch<T>(
   connection: Pick<AgentConnection, 'url' | 'token'> & Partial<AgentConnection>,
   path: string,
   init: RequestInit,
-  onChunk?: (chunk: string) => void,
-  onTerminalHeaders?: (headers: Record<string, string>) => void,
 ): Promise<T> {
   const agentId = connection.agentId ?? connection.id;
   if (!agentId) {
@@ -1252,24 +1482,61 @@ function relayFetch<T>(
     id: frameId,
     method: init.method ?? 'GET',
     path,
-    // Caller headers ride along on top of the agent Authorization instead of
-    // being discarded (for example X-Hermes-Session-Id).
-    headers: mergeRequestHeaders(`Bearer ${connection.token}`, init.headers),
+    headers: {
+      Authorization: `Bearer ${connection.token}`,
+    },
     body,
   };
 
-  let client = relayClients.get(wsURL);
-  if (!client) {
-    client = new RelaySocketClient(wsURL);
-    relayClients.set(wsURL, client);
-  }
-  return client.request<T>(
-    requestFrame,
-    5 * 60 * 1000,
-    onChunk,
-    onTerminalHeaders,
-    init.signal ?? undefined,
-  );
+  return new Promise<T>((resolve, reject) => {
+    const socket = new WebSocket(wsURL);
+    let settled = false;
+    const finish = (callback: () => void) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timeout);
+      init.signal?.removeEventListener('abort', abortRequest);
+      socket.close();
+      callback();
+    };
+    const abortRequest = () => finish(() => reject(new Error('Connection cancelled')));
+    const timeout = setTimeout(() => {
+      finish(() => reject(new Error('Relay request timed out')));
+    }, requestTimeoutForPath(path));
+
+    if (init.signal?.aborted) {
+      abortRequest();
+      return;
+    }
+    init.signal?.addEventListener('abort', abortRequest, { once: true });
+
+    socket.onopen = () => {
+      if (settled) return;
+      socket.send(JSON.stringify(requestFrame));
+    };
+    socket.onerror = () => {
+      finish(() => reject(new Error('Relay connection failed')));
+    };
+    socket.onmessage = (event) => {
+      const frame = JSON.parse(String(event.data)) as RelayFrame;
+      if (frame.id !== frameId) {
+        return;
+      }
+      if (frame.type === 'error') {
+        finish(() => reject(new Error(frame.message ?? frame.code ?? 'Relay request failed')));
+        return;
+      }
+      if ((frame.status ?? 500) >= 400) {
+        const message =
+          typeof frame.body === 'object' && frame.body && 'error' in frame.body
+            ? String((frame.body as { error?: unknown }).error)
+            : `Request failed: ${frame.status}`;
+        finish(() => reject(new Error(message)));
+        return;
+      }
+      finish(() => resolve(frame.body as T));
+    };
+  });
 }
 
 function relayTunnelURL(baseURL: string, agentId: string, relayToken: string) {

@@ -232,7 +232,7 @@ export function parseBrioDeepLink(url: string): BrioDeepLink | null {
 export function resolveBrioDeepLink(
   link: BrioDeepLink | null | undefined,
   targetEnvironmentId: string,
-  profiles: ReadonlyArray<Pick<HermesProfile, 'name'>>,
+  profiles: readonly Pick<HermesProfile, 'name'>[],
 ): ResolvedBrioDeepLink | null {
   if (!link || !targetEnvironmentId || link.environmentId !== targetEnvironmentId) {
     return null;

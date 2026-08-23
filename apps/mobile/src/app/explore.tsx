@@ -3,8 +3,7 @@ import { ActivityIndicator, Pressable, ScrollView, StyleSheet, View } from 'reac
 import { SafeAreaView } from 'react-native-safe-area-context';
 
 import { DashboardCard, SectionLabel, StatusBadge } from '@/components/dashboard';
-import { HermesProfilesScreen } from '@/features/profiles/hermes-profiles-screen';
-import { brioFetch, getCapabilities, getHealth, isAgentHealthy, listHermesSessions } from '@/lib/brio';
+import { brioFetch, getCapabilities, getHealth } from '@/lib/brio';
 import { ThemedText } from '@/components/themed-text';
 import { ThemedView } from '@/components/themed-view';
 import { BottomTabInset, MaxContentWidth, Spacing } from '@/constants/theme';
@@ -26,15 +25,14 @@ export default function ManageScreen() {
     enabled: Boolean(connection),
   });
   const sessions = useQuery({
-    queryKey: ['sessions', connection?.url, connection?.agentId ?? connection?.id, 'default'],
-    queryFn: () => listHermesSessions(connection!, 5),
+    queryKey: ['sessions', connection?.url],
+    queryFn: () => brioFetch<{ sessions: unknown[] }>(connection!, '/sessions?limit=5'),
     enabled: Boolean(connection),
   });
-  const hasConnectorMemory = connection?.transport === 'relay';
   const memory = useQuery({
-    queryKey: ['memory', connection?.url, connection?.agentId ?? connection?.id, 'default'],
-    queryFn: () => brioFetch<{ memory: string; user: string }>(connection!, '/v1/memory'),
-    enabled: Boolean(connection) && hasConnectorMemory,
+    queryKey: ['memory', connection?.url],
+    queryFn: () => brioFetch<{ memory: string; user: string }>(connection!, '/memory'),
+    enabled: Boolean(connection),
   });
 
   if (!connection) {
@@ -58,8 +56,8 @@ export default function ManageScreen() {
           title="Health"
           loading={health.isLoading}
           rows={[
-            ['Service', isAgentHealthy(health.data) ? 'online' : 'unknown'],
-            ['Agent runtime', isAgentHealthy(health.data) ? 'online' : 'not reachable'],
+            ['Connector', health.data?.ok ? 'online' : 'unknown'],
+            ['Hermes', health.data?.hermes_ok ? 'online' : 'not reachable'],
             ['Home', health.data?.hermes_home ?? 'unknown'],
           ]}
           onRefresh={() => void health.refetch()}
@@ -69,9 +67,9 @@ export default function ManageScreen() {
           title="Capabilities"
           loading={capabilities.isLoading}
           rows={[
-            ['Responses API', capabilities.data?.features?.responses_api ? 'available' : 'unknown'],
-            ['Sessions', capabilities.data?.features?.session_resources ? 'available' : 'unknown'],
-            ['Memory writes', hasConnectorMemory ? 'available through Brio' : 'not exposed by Hermes'],
+            ['Files', capabilities.data?.companion?.files ? 'available' : 'unknown'],
+            ['Sessions', capabilities.data?.companion?.sessions ? 'available' : 'unknown'],
+            ['Gateway', capabilities.data?.companion?.gateway ? 'available' : 'unknown'],
           ]}
           onRefresh={() => void capabilities.refetch()}
         />
@@ -86,19 +84,15 @@ export default function ManageScreen() {
           onRefresh={() => void sessions.refetch()}
         />
 
-        {hasConnectorMemory ? (
-          <StatusCard
-            title="Memory"
-            loading={memory.isLoading}
-            rows={[
-              ['MEMORY.md', `${memory.data?.memory?.length ?? 0} chars`],
-              ['USER.md', `${memory.data?.user?.length ?? 0} chars`],
-            ]}
-            onRefresh={() => void memory.refetch()}
-          />
-        ) : null}
-
-        <HermesProfilesScreen connection={connection} />
+        <StatusCard
+          title="Memory"
+          loading={memory.isLoading}
+          rows={[
+            ['MEMORY.md', `${memory.data?.memory?.length ?? 0} chars`],
+            ['USER.md', `${memory.data?.user?.length ?? 0} chars`],
+          ]}
+          onRefresh={() => void memory.refetch()}
+        />
       </SafeAreaView>
     </ScrollView>
   );

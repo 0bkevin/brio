@@ -15,7 +15,6 @@ export type DashboardTheme = {
     background: string;
     midground: string;
     foreground: string;
-    accent?: string;
     warmGlow: string;
     noiseOpacity: number;
   };
@@ -56,30 +55,28 @@ const defaultLayout = {
 export const DashboardThemes = {
   default: {
     name: 'default',
-    label: 'Brio Blue',
-    description: 'Deep navy with a clear cobalt accent.',
+    label: 'Hermes Teal',
+    description: 'Classic dark teal with cream accents.',
     palette: {
-      background: '#07111f',
-      midground: '#eaf2ff',
+      background: '#041c1c',
+      midground: '#ffe6cb',
       foreground: '#ffffff',
-      accent: '#3b82f6',
-      warmGlow: 'rgba(56, 139, 253, 0.28)',
-      noiseOpacity: 0.55,
+      warmGlow: 'rgba(255, 189, 56, 0.35)',
+      noiseOpacity: 1,
     },
     typography: defaultTypography,
     layout: defaultLayout,
   },
   'default-large': {
     name: 'default-large',
-    label: 'Brio Blue Large',
-    description: 'Brio Blue with larger text and roomier spacing.',
+    label: 'Hermes Teal Large',
+    description: 'Hermes Teal with larger text and roomier spacing.',
     palette: {
-      background: '#07111f',
-      midground: '#eaf2ff',
+      background: '#041c1c',
+      midground: '#ffe6cb',
       foreground: '#ffffff',
-      accent: '#3b82f6',
-      warmGlow: 'rgba(56, 139, 253, 0.28)',
-      noiseOpacity: 0.55,
+      warmGlow: 'rgba(255, 189, 56, 0.35)',
+      noiseOpacity: 1,
     },
     typography: {
       ...defaultTypography,
@@ -216,8 +213,8 @@ export function colorsFromDashboardTheme(theme: DashboardTheme) {
     border: withAlpha(theme.palette.midground, 0.18),
     panel: withAlpha(theme.palette.midground, 0.05),
     panelStrong: withAlpha(theme.palette.midground, 0.1),
-    accent: theme.palette.accent ?? theme.palette.midground,
-    accentText: theme.palette.accent ? '#ffffff' : theme.palette.background,
+    accent: theme.palette.midground,
+    accentText: theme.palette.background,
     glow: theme.palette.warmGlow,
     success: '#4ade80',
     warning: '#ffbd38',

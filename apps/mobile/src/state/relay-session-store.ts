@@ -2,8 +2,6 @@ import * as SecureStore from 'expo-secure-store';
 import { Platform } from 'react-native';
 import { create } from 'zustand';
 
-import type { RelayEnrollmentResponse } from '@/lib/brio';
-
 type RelaySession = {
   relayURL: string;
   email: string;
@@ -11,7 +9,6 @@ type RelaySession = {
   token: string;
   userID: string;
   deviceID: string;
-  activeEnrollment?: RelayEnrollmentResponse;
 };
 
 type RelaySessionState = {

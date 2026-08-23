@@ -8,11 +8,29 @@
     "scheme": "brio",
     "userInterfaceStyle": "automatic",
     "ios": {
-      "icon": "./assets/images/icon.png",
+      "icon": "./assets/expo.icon",
+      "supportsTablet": true,
+      "infoPlist": {
+        "NSAppTransportSecurity": {
+          "NSAllowsArbitraryLoads": true
+        },
+        "NSLocalNetworkUsageDescription": "Allow Brio to connect to Hermes Agent on your local network or tailnet.",
+        "ITSAppUsesNonExemptEncryption": false
+      },
       "bundleIdentifier": "com.anonymous.brio"
     },
     "android": {
-      "predictiveBackGestureEnabled": false
+      "adaptiveIcon": {
+        "backgroundColor": "#041C1C",
+        "foregroundImage": "./assets/images/android-icon-foreground.png",
+        "backgroundImage": "./assets/images/android-icon-background.png",
+        "monochromeImage": "./assets/images/android-icon-monochrome.png"
+      },
+      "predictiveBackGestureEnabled": true,
+      "permissions": [
+        "android.permission.CAMERA"
+      ],
+      "package": "com.anonymous.brio"
     },
     "web": {
       "output": "static",
@@ -23,13 +41,15 @@
       [
         "expo-splash-screen",
         {
-          "backgroundColor": "#07111F",
-          "image": "./assets/images/brio-mark.png",
-          "imageWidth": 96,
-          "resizeMode": "contain"
+          "backgroundColor": "#041C1C",
+          "android": {
+            "image": "./assets/images/splash-icon.png",
+            "imageWidth": 76
+          }
         }
       ],
       "expo-secure-store",
+      "./plugins/with-android-cleartext",
       "expo-document-picker",
       [
         "expo-image-picker",
@@ -55,11 +75,19 @@
           },
           "android": {
             "enabled": true,
-            "singleShareMimeTypes": ["*/*"],
-            "multipleShareMimeTypes": ["*/*"]
+            "singleShareMimeTypes": [
+              "*/*"
+            ],
+            "multipleShareMimeTypes": [
+              "*/*"
+            ]
           }
         }
-      ]
+      ],
+      "expo-image",
+      "expo-web-browser",
+      "expo-font",
+      "expo-status-bar"
     ],
     "experiments": {
       "typedRoutes": true,

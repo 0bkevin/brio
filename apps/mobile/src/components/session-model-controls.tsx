@@ -26,7 +26,7 @@ import {
   type ReasoningEffortChoice,
 } from '@/lib/session-runtime';
 import type { HermesModelOptions, HermesSession, ModelOptionProvider } from '@/lib/hermes-api';
-import type { ChatModelOverride, ChatThread } from '@/state/chat-store';
+import type { ChatModelOverride, ChatThread } from '@/state/chat-thread-model';
 
 export type SessionModelControlsProps = {
   thread: ChatThread;
