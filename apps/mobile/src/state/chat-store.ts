@@ -2,6 +2,8 @@ import AsyncStorage from '@react-native-async-storage/async-storage';
 import { create } from 'zustand';
 import { createJSONStorage, persist } from 'zustand/middleware';
 
+import type { NormalizedContextBreakdown, NormalizedRuntimeUsage } from '../lib/session-runtime';
+
 export type ChatRole = 'user' | 'assistant';
 
 export type ChatMessage = {
@@ -9,6 +11,21 @@ export type ChatMessage = {
   role: ChatRole;
   content: string;
   createdAt: number;
+};
+
+// Per-thread model override. When absent the thread clearly inherits the
+// connection profile's default model.
+export type ChatModelOverride = {
+  provider: string;
+  model: string;
+  reasoningEffort?: string;
+  fast?: boolean;
+};
+
+export type ChatThreadRuntimePatch = {
+  usage?: NormalizedRuntimeUsage;
+  contextBreakdown?: NormalizedContextBreakdown | undefined;
+  runtimeSessionId?: string;
 };
 
 export type ChatThread = {
@@ -21,6 +38,10 @@ export type ChatThread = {
   lastResponseId?: string;
   importedSessionId?: string;
   needsHistorySeed?: boolean;
+  modelOverride?: ChatModelOverride;
+  usage?: NormalizedRuntimeUsage;
+  contextBreakdown?: NormalizedContextBreakdown;
+  runtimeSessionId?: string;
 };
 
 type ChatState = {
@@ -32,7 +53,14 @@ type ChatState = {
   selectThread: (id: string) => void;
   deleteThread: (id: string) => void;
   addMessage: (threadId: string, message: ChatMessage) => void;
-  completeResponse: (threadId: string, message: ChatMessage, responseId?: string) => void;
+  completeResponse: (
+    threadId: string,
+    message: ChatMessage,
+    responseId?: string,
+    runtime?: ChatThreadRuntimePatch,
+  ) => void;
+  updateThreadRuntime: (threadId: string, patch: ChatThreadRuntimePatch) => void;
+  setThreadModelOverride: (threadId: string, override: ChatModelOverride | undefined) => void;
   importThread: (connectionKey: string, sessionId: string, title: string, messages: ChatMessage[]) => string;
 };
 
@@ -92,7 +120,7 @@ export const useChatStore = create<ChatState>()(
               : thread,
           ),
         })),
-      completeResponse: (threadId, message, responseId) =>
+      completeResponse: (threadId, message, responseId, runtime) =>
         set((state) => ({
           threads: state.threads.map((thread) =>
             thread.id === threadId
@@ -102,8 +130,27 @@ export const useChatStore = create<ChatState>()(
                   messages: [...thread.messages, message],
                   lastResponseId: responseId ?? thread.lastResponseId,
                   needsHistorySeed: false,
+                  ...(runtime?.usage !== undefined ? { usage: runtime.usage } : {}),
+                  ...(runtime?.contextBreakdown !== undefined
+                    ? { contextBreakdown: runtime.contextBreakdown }
+                    : {}),
+                  ...(runtime?.runtimeSessionId !== undefined
+                    ? { runtimeSessionId: runtime.runtimeSessionId }
+                    : {}),
                 }
               : thread,
+          ),
+        })),
+      updateThreadRuntime: (threadId, patch) =>
+        set((state) => ({
+          threads: state.threads.map((thread) =>
+            thread.id === threadId ? { ...thread, ...patch } : thread,
+          ),
+        })),
+      setThreadModelOverride: (threadId, override) =>
+        set((state) => ({
+          threads: state.threads.map((thread) =>
+            thread.id === threadId ? { ...thread, modelOverride: override } : thread,
           ),
         })),
       importThread: (connectionKey, sessionId, title, messages) => {
@@ -125,6 +172,7 @@ export const useChatStore = create<ChatState>()(
           updatedAt: lastTimestamp,
           messages,
           importedSessionId: sessionId,
+          runtimeSessionId: sessionId,
           needsHistorySeed: messages.length > 0,
         };
         set((state) => ({ activeThreadId: id, threads: [thread, ...state.threads] }));

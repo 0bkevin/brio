@@ -26,3 +26,32 @@ test('surfaces failed response messages', () => {
     /provider failed/,
   );
 });
+
+test('retains the final response usage, model, and session id unchanged', () => {
+  const usage = {
+    input_tokens: 12,
+    output_tokens: 34,
+    total_tokens: 46,
+    context_used: 120,
+    context_max: 200,
+    context_percent: 60,
+    model: 'gpt-test',
+  };
+  const parser = new ResponsesSSEParser();
+  parser.push(
+    `data: {"type":"response.created","response":{"id":"resp_9","session_id":"sess_1","model":"gpt-test"}}\n\n`,
+  );
+  parser.push('data: {"type":"response.output_text.delta","delta":"Hi"}\n\n');
+  parser.push(
+    `data: {"type":"response.completed","response":{"id":"resp_9","status":"completed","session_id":"sess_1","model":"gpt-test","usage":${JSON.stringify(usage)}}}\n\n`,
+  );
+
+  assert.deepEqual(parser.finish(), {
+    id: 'resp_9',
+    status: 'completed',
+    output_text: 'Hi',
+    session_id: 'sess_1',
+    model: 'gpt-test',
+    usage,
+  });
+});

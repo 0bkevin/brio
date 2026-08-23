@@ -8,10 +8,20 @@ import {
 import {
   normalizeHermesSessionMessages,
   normalizeHermesSessions,
+  type HermesModelOptions,
   type HermesSession,
   type HermesSessionMessage,
+  type HermesSessionModelLock,
+  type HermesSessionModelPayload,
 } from './hermes-api';
 import { ResponsesSSEParser, type HermesResponse } from './responses-sse';
+import {
+  normalizeContextBreakdown,
+  normalizeLiveUsage,
+  normalizeModelOptions,
+  type NormalizedContextBreakdown,
+  type NormalizedRuntimeUsage,
+} from './session-runtime';
 
 export {
   aggregateRootAgentUsage,
@@ -20,8 +30,23 @@ export {
   parseHeartbeatStatus,
 } from './control-model';
 
+export {
+  normalizeContextBreakdown,
+  normalizeLiveUsage,
+  normalizeModelOptions,
+} from './session-runtime';
+
 export type { HermesResponse } from './responses-sse';
-export type { HermesSession, HermesSessionMessage } from './hermes-api';
+export type { NormalizedContextBreakdown, NormalizedRuntimeUsage } from './session-runtime';
+export type {
+  HermesContextBreakdown,
+  HermesLiveUsage,
+  HermesModelOptions,
+  HermesSession,
+  HermesSessionMessage,
+  HermesSessionModelLock,
+  HermesSessionModelPayload,
+} from './hermes-api';
 
 export type AgentConnection = {
   id: string;
@@ -396,14 +421,19 @@ function withSubgoals(goal: HermesGoalStatus | null, output: string) {
   return { ...goal, subgoalCount: Math.max(goal.subgoalCount, subgoals.length), subgoals };
 }
 
+export type ResponseRequestOptions = {
+  conversation?: string;
+  previousResponseId?: string;
+  conversationHistory?: { role: string; content: string }[];
+  provider?: string;
+  model?: string;
+  modelOptions?: Record<string, unknown>;
+};
+
 export async function sendResponse(
   connection: Pick<AgentConnection, 'url' | 'token'> & Partial<AgentConnection>,
   prompt: string,
-  options: {
-    conversation?: string;
-    previousResponseId?: string;
-    conversationHistory?: { role: string; content: string }[];
-  } = {},
+  options: ResponseRequestOptions = {},
 ) {
   return brioFetch<HermesResponse>(connection, '/v1/responses', {
     method: 'POST',
@@ -414,10 +444,7 @@ export async function sendResponse(
 export async function sendResponseStream(
   connection: Pick<AgentConnection, 'url' | 'token'> & Partial<AgentConnection>,
   prompt: string,
-  options: {
-    conversation?: string;
-    previousResponseId?: string;
-    conversationHistory?: { role: string; content: string }[];
+  options: ResponseRequestOptions & {
     onTextDelta?: (delta: string) => void;
   } = {},
 ) {
@@ -469,15 +496,24 @@ export async function sendResponseStream(
 
 function responseRequestBody(
   prompt: string,
-  options: {
-    conversation?: string;
-    previousResponseId?: string;
-    conversationHistory?: { role: string; content: string }[];
-  },
+  options: ResponseRequestOptions,
   stream: boolean,
 ) {
+  // A per-thread model override must ride along on every request, including
+  // retries and continuations. Without an override the profile default
+  // (`hermes-agent`) is left untouched; require_model_lock is never set here
+  // and profile config is never mutated.
+  const hasOverride = Boolean(
+    options.model?.trim() || options.provider?.trim() || options.modelOptions,
+  );
   return {
-    model: 'hermes-agent',
+    ...(hasOverride
+      ? {
+          ...(options.model?.trim() ? { model: options.model } : {}),
+          ...(options.provider?.trim() ? { provider: options.provider } : {}),
+          ...(options.modelOptions ? { model_options: options.modelOptions } : {}),
+        }
+      : { model: 'hermes-agent' }),
     input: prompt,
     stream,
     ...(options.previousResponseId
@@ -507,6 +543,76 @@ export async function getHermesSessionMessages(
     `/api/sessions/${encodeURIComponent(sessionId)}/messages`,
   );
   return normalizeHermesSessionMessages(result);
+}
+
+export async function listHermesModelOptions(
+  connection: Pick<AgentConnection, 'url' | 'token'> & Partial<AgentConnection>,
+  refresh = false,
+): Promise<HermesModelOptions> {
+  const result = await brioFetch<unknown>(
+    connection,
+    `/api/model/options${refresh ? '?refresh=1' : ''}`,
+  );
+  return normalizeModelOptions(result);
+}
+
+export async function getHermesSession(
+  connection: Pick<AgentConnection, 'url' | 'token'> & Partial<AgentConnection>,
+  sessionId: string,
+): Promise<HermesSession> {
+  if (!sessionId.trim()) {
+    throw new Error('getHermesSession requires a non-empty session id');
+  }
+  const result = await brioFetch<{ session?: HermesSession } | HermesSession>(
+    connection,
+    `/api/sessions/${encodeURIComponent(sessionId)}`,
+  );
+  const session =
+    typeof result === 'object' && result !== null && 'session' in result && result.session
+      ? result.session
+      : (result as HermesSession);
+  if (!session || typeof session !== 'object' || typeof session.id !== 'string') {
+    throw new Error(`getHermesSession received no valid session for id ${sessionId}`);
+  }
+  return session;
+}
+
+export async function setHermesSessionModel(
+  connection: Pick<AgentConnection, 'url' | 'token'> & Partial<AgentConnection>,
+  sessionId: string,
+  payload: HermesSessionModelPayload,
+): Promise<HermesSessionModelLock> {
+  if (!sessionId.trim()) {
+    throw new Error('setHermesSessionModel requires a non-empty session id');
+  }
+  return brioFetch<HermesSessionModelLock>(
+    connection,
+    `/api/sessions/${encodeURIComponent(sessionId)}/model`,
+    { method: 'POST', body: JSON.stringify(payload) },
+  );
+}
+
+// Control-RPC reads for live session telemetry. These intentionally surface
+// failures (unknown method, offline agent, ...) so the UI can mark the data
+// as unavailable instead of guessing.
+export async function getSessionUsage(
+  connection: AgentConnection,
+  runtimeSessionId: string,
+): Promise<NormalizedRuntimeUsage> {
+  const result = await controlRPC<unknown>(connection, 'session.usage', {
+    session_id: runtimeSessionId,
+  }, false, runtimeSessionId);
+  return normalizeLiveUsage(result);
+}
+
+export async function getSessionContextBreakdown(
+  connection: AgentConnection,
+  runtimeSessionId: string,
+): Promise<NormalizedContextBreakdown | undefined> {
+  const result = await controlRPC<unknown>(connection, 'session.context_breakdown', {
+    session_id: runtimeSessionId,
+  }, false, runtimeSessionId);
+  return normalizeContextBreakdown(result);
 }
 
 export function hermesResponseText(response: HermesResponse) {

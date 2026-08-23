@@ -1,6 +1,11 @@
+import type { HermesLiveUsage } from './hermes-api';
+
 export type HermesResponse = {
   id?: string;
   status?: string;
+  model?: string;
+  usage?: HermesLiveUsage;
+  session_id?: string;
   output?: {
     type?: string;
     role?: string;

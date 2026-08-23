@@ -55,7 +55,11 @@ func TestRoutePath(t *testing.T) {
 		{path: "/api/jobs/job_1", kind: RouteForward, forwardTo: "/api/jobs/job_1"},
 		{path: "/api/jobs/job_1/pause", kind: RouteForward, forwardTo: "/api/jobs/job_1/pause"},
 		{path: "/api/sessions", kind: RouteForward, forwardTo: "/api/sessions"},
+		{path: "/api/sessions/sess_1", kind: RouteForward, forwardTo: "/api/sessions/sess_1"},
+		{path: "/api/sessions/search", kind: RouteForward, forwardTo: "/api/sessions/search"},
 		{path: "/api/sessions/sess_1/messages", kind: RouteForward, forwardTo: "/api/sessions/sess_1/messages"},
+		{path: "/api/sessions/sess_1/model", kind: RouteForward, forwardTo: "/api/sessions/sess_1/model"},
+		{path: "/api/model/options", kind: RouteForward, forwardTo: "/api/model/options"},
 		{path: "/v1/memory", kind: RouteLocal, localName: "memory"},
 		{path: "/memory", kind: RouteLocal, localName: "memory"},
 
@@ -71,9 +75,12 @@ func TestRoutePath(t *testing.T) {
 		{path: "/v1/sessions/search", kind: RouteUnknown},
 		{path: "/v1/sessions/sess_1", kind: RouteUnknown},
 		{path: "/v1/sessions/sess_1/messages/extra", kind: RouteUnknown},
-		{path: "/api/sessions/search", kind: RouteUnknown},
-		{path: "/api/sessions/sess_1", kind: RouteUnknown},
 		{path: "/api/sessions/sess_1/messages/extra", kind: RouteUnknown},
+		{path: "/api/sessions/sess_1/model/extra", kind: RouteUnknown},
+		{path: "/api/sessions/sess_1/models", kind: RouteUnknown},
+		{path: "/api/sessions/sess_1/", kind: RouteUnknown},
+		{path: "/api/model", kind: RouteUnknown},
+		{path: "/api/model/options/extra", kind: RouteUnknown},
 		{path: "/v1/unknown", kind: RouteUnknown},
 		{path: "/", kind: RouteUnknown},
 	}
@@ -145,12 +152,25 @@ func TestServeMapsLegacyAliases(t *testing.T) {
 	collectFrames(context.Background(), t, client, tunnel.Frame{
 		Type: "request", ID: "a5", Method: http.MethodGet, Path: "/api/sessions/session_1/messages?order=latest",
 	})
+	collectFrames(context.Background(), t, client, tunnel.Frame{
+		Type: "request", ID: "a6", Method: http.MethodGet, Path: "/api/model/options",
+	})
+	collectFrames(context.Background(), t, client, tunnel.Frame{
+		Type: "request", ID: "a7", Method: http.MethodGet, Path: "/api/sessions/session_1",
+	})
+	collectFrames(context.Background(), t, client, tunnel.Frame{
+		Type: "request", ID: "a8", Method: http.MethodPost, Path: "/api/sessions/session_1/model",
+		Body: map[string]string{"model": "hermes-large"},
+	})
 	for _, want := range []string{
 		"POST /v1/responses",
 		"GET /v1/capabilities",
 		"GET /api/jobs",
 		"GET /api/sessions",
 		"GET /api/sessions/session_1/messages",
+		"GET /api/model/options",
+		"GET /api/sessions/session_1",
+		"POST /api/sessions/session_1/model",
 	} {
 		if _, ok := seen[want]; !ok {
 			t.Fatalf("alias was not forwarded as %q; seen = %v", want, seen)

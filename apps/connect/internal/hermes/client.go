@@ -86,24 +86,43 @@ func RoutePath(path string) Route {
 		return Route{Kind: RouteLocal, Name: "control-events"}
 	case "/api/sessions":
 		return Route{Kind: RouteForward, Path: path}
+	case "/api/model/options":
+		return Route{Kind: RouteForward, Path: path}
 	}
 	switch {
 	case strings.HasPrefix(path, "/v1/runs"), strings.HasPrefix(path, "/api/jobs"):
 		return Route{Kind: RouteForward, Path: path}
 	}
-	if isSessionMessagesPath(path) {
+	if isSessionMessagesPath(path) || isSessionDetailPath(path) || isSessionModelPath(path) {
 		return Route{Kind: RouteForward, Path: path}
 	}
 	return Route{Kind: RouteUnknown}
 }
 
 func isSessionMessagesPath(path string) bool {
+	return isSessionTailPath(path, "messages")
+}
+
+func isSessionDetailPath(path string) bool {
+	const prefix = "/api/sessions/"
+	if !strings.HasPrefix(path, prefix) {
+		return false
+	}
+	id := strings.TrimPrefix(path, prefix)
+	return id != "" && !strings.Contains(id, "/")
+}
+
+func isSessionModelPath(path string) bool {
+	return isSessionTailPath(path, "model")
+}
+
+func isSessionTailPath(path string, tail string) bool {
 	const prefix = "/api/sessions/"
 	if !strings.HasPrefix(path, prefix) {
 		return false
 	}
 	id, suffix, ok := strings.Cut(strings.TrimPrefix(path, prefix), "/")
-	return ok && suffix == "messages" && id != "" && !strings.Contains(id, "/")
+	return ok && suffix == tail && id != "" && !strings.Contains(id, "/")
 }
 
 func (c *Client) httpClient() *http.Client {
