@@ -25,7 +25,10 @@ import (
 )
 
 const (
-	pendingRequestTTL          = 6 * time.Minute
+	// Expire relay state before Mobile's five-minute request deadline. This
+	// gives the caller a structured terminal frame and avoids retaining work
+	// after the client has already abandoned it.
+	pendingRequestTTL          = 4*time.Minute + 30*time.Second
 	maxPendingRequestsPerAgent = 1024
 	maxPendingRequestsPerPeer  = 256
 	maxRelayFrameIDLength      = 128
@@ -37,6 +40,8 @@ const (
 	maxPairingCodeLength       = 64
 	requestBodyReadTimeout     = 10 * time.Second
 	credentialMutationTimeout  = 10 * time.Second
+	peerPingInterval           = 30 * time.Second
+	peerPingTimeout            = 10 * time.Second
 )
 
 const (
@@ -145,6 +150,7 @@ func Run(ctx context.Context, cfg Config) error {
 		r.Get("/devices", a.listDevices)
 		r.Delete("/devices/{id}", a.revokeDevice)
 		r.Get("/agents", a.listAgents)
+		r.Delete("/agents/{id}", a.unlinkAgent)
 		r.Post("/enrollments", a.rateLimit("enrollment-create", a.createEnrollment))
 		r.Post("/agents/{id}/recover", a.rateLimit("agent-recovery", a.recoverAgent))
 		r.Post("/pairings/{code}/claim", a.rateLimit("pairing-claim", a.claimPairing))
@@ -212,6 +218,10 @@ func newHub() *hub {
 func requestLogger(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		wrapped := middleware.NewWrapResponseWriter(w, r.ProtoMajor)
+		requestID := middleware.GetReqID(r.Context())
+		if requestID != "" {
+			wrapped.Header().Set("X-Request-ID", requestID)
+		}
 		if r.Method != http.MethodGet && r.Method != http.MethodHead {
 			responseController := http.NewResponseController(wrapped)
 			if err := responseController.SetReadDeadline(time.Now().Add(requestBodyReadTimeout)); err == nil {
@@ -221,7 +231,7 @@ func requestLogger(next http.Handler) http.Handler {
 		started := time.Now()
 		next.ServeHTTP(wrapped, r)
 		slog.Info("relay request",
-			"request_id", middleware.GetReqID(r.Context()),
+			"request_id", requestID,
 			"method", r.Method,
 			"path", safeRequestLogPath(r.URL.EscapedPath()),
 			"status", wrapped.Status(),
@@ -243,6 +253,8 @@ func (a *app) cors(next http.Handler) http.Handler {
 		}
 		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, PATCH, DELETE, OPTIONS")
 		w.Header().Set("Access-Control-Allow-Headers", "Accept, Authorization, Content-Type, X-Brio-Registration-Key")
+		w.Header().Set("Access-Control-Expose-Headers", "Retry-After, X-Request-ID")
+		w.Header().Set("Access-Control-Max-Age", "86400")
 		w.Header().Set("Vary", "Origin")
 		if r.Method == http.MethodOptions {
 			w.WriteHeader(http.StatusNoContent)
@@ -377,6 +389,31 @@ func (a *app) listAgents(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"agents": agents})
+}
+
+func (a *app) unlinkAgent(w http.ResponseWriter, r *http.Request) {
+	auth := authFromContext(r.Context())
+	agentID := strings.TrimSpace(chi.URLParam(r, "id"))
+	if agentID == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "agent id is required"})
+		return
+	}
+	if !fieldLengthAllowed(w, "agent id", agentID, maxAgentIDLength) || !agentIDCharactersAllowed(w, agentID) {
+		return
+	}
+	mutationCtx, cancel := context.WithTimeout(r.Context(), credentialMutationTimeout)
+	defer cancel()
+	a.peerMu.Lock()
+	agent, err := a.store.UnlinkAgent(mutationCtx, auth.User.ID, agentID)
+	if err == nil {
+		a.hub.disconnectAgent(agentID)
+	}
+	a.peerMu.Unlock()
+	if err != nil {
+		writeStoreError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"agent": agent})
 }
 
 func (a *app) createEnrollment(w http.ResponseWriter, r *http.Request) {
@@ -616,6 +653,10 @@ func (a *app) tunnel(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer a.removePeer(p)
+	slog.Info("relay tunnel connected", "agent_id", p.agentID, "peer_id", p.id, "role", p.role)
+	defer func() {
+		slog.Info("relay tunnel disconnected", "agent_id", p.agentID, "peer_id", p.id, "role", p.role, "connected_for", time.Since(p.joined))
+	}()
 
 	ctx := r.Context()
 	go p.writeLoop(ctx)
@@ -647,13 +688,9 @@ func (a *app) disconnectAllPeers() {
 
 func (a *app) addPeer(ctx context.Context, p *peer) {
 	a.peerMu.Lock()
-	a.addPeerLocked(p)
+	a.hub.replaceSession(p)
 	a.peerMu.Unlock()
 	a.updateAgentPresence(ctx, p)
-}
-
-func (a *app) addPeerLocked(p *peer) {
-	a.hub.add(p)
 }
 
 func (a *app) removePeer(p *peer) {
@@ -688,7 +725,7 @@ func (a *app) revalidateAndAddPeer(ctx context.Context, p *peer, token string) e
 		return err
 	}
 
-	a.addPeerLocked(p)
+	a.hub.replaceSession(p)
 	a.peerMu.Unlock()
 	a.updateAgentPresence(ctx, p)
 	return nil
@@ -710,7 +747,7 @@ func (a *app) updateAgentPresence(ctx context.Context, p *peer) {
 	a.peerMu.Unlock()
 	touchCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
-	if err := a.store.TouchAgent(touchCtx, p.agentID, status); err != nil {
+	if err := a.store.TouchAgent(touchCtx, p.agentID, status); err != nil && !errors.Is(err, store.ErrNotFound) {
 		slog.Error("could not update relay agent presence", "agent_id", p.agentID, "status", status, "error_type", fmt.Sprintf("%T", err))
 	}
 }
@@ -804,6 +841,44 @@ func (h *hub) disconnectCompanions(agentID string) {
 	h.disconnectMatching(func(p *peer) bool {
 		return p.role == "companion" && p.agentID == agentID
 	})
+}
+
+func (h *hub) disconnectAgent(agentID string) {
+	if agentID == "" {
+		return
+	}
+	h.disconnectMatching(func(p *peer) bool {
+		return p.agentID == agentID
+	})
+}
+
+// replaceSession keeps one active connector for an agent and one active
+// Mobile socket for a device/agent pair. Reconnect overlap is normal, but old
+// sockets must not keep consuming queues or receive newly routed work.
+func (h *hub) replaceSession(next *peer) {
+	h.mu.Lock()
+	var replaced []*peer
+	for current := range h.agents[next.agentID] {
+		matchesCompanion := next.role == "companion" && current.role == "companion"
+		matchesMobile := next.role == "mobile" && current.role == "mobile" &&
+			next.deviceID != "" && current.deviceID == next.deviceID
+		if matchesCompanion || matchesMobile {
+			replaced = append(replaced, current)
+		}
+	}
+	for _, current := range replaced {
+		h.removeLocked(current)
+	}
+	if h.agents[next.agentID] == nil {
+		h.agents[next.agentID] = map[*peer]bool{}
+	}
+	h.agents[next.agentID][next] = true
+	h.mu.Unlock()
+	for _, current := range replaced {
+		if current.conn != nil {
+			_ = current.conn.CloseNow()
+		}
+	}
 }
 
 func (h *hub) disconnectMatching(matches func(*peer) bool) {
@@ -993,13 +1068,31 @@ func (h *hub) enqueueLocked(p *peer, data []byte) bool {
 }
 
 func (p *peer) writeLoop(ctx context.Context) {
-	for data := range p.send {
-		writeCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
-		err := p.conn.Write(writeCtx, websocket.MessageText, data)
-		cancel()
-		if err != nil {
-			_ = p.conn.CloseNow()
+	ticker := time.NewTicker(peerPingInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
 			return
+		case data, ok := <-p.send:
+			if !ok {
+				return
+			}
+			writeCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+			err := p.conn.Write(writeCtx, websocket.MessageText, data)
+			cancel()
+			if err != nil {
+				_ = p.conn.CloseNow()
+				return
+			}
+		case <-ticker.C:
+			pingCtx, cancel := context.WithTimeout(ctx, peerPingTimeout)
+			err := p.conn.Ping(pingCtx)
+			cancel()
+			if err != nil {
+				_ = p.conn.CloseNow()
+				return
+			}
 		}
 	}
 }
@@ -1235,7 +1328,10 @@ func agentIDCharactersAllowed(w http.ResponseWriter, value string) bool {
 }
 
 func writeJSON(w http.ResponseWriter, status int, payload any) {
+	w.Header().Set("Cache-Control", "no-store")
 	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Pragma", "no-cache")
+	w.Header().Set("X-Content-Type-Options", "nosniff")
 	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(payload)
 }

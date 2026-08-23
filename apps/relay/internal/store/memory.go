@@ -183,9 +183,9 @@ func (s *MemoryStore) UpsertAgent(ctx context.Context, agentID string, name stri
 func (s *MemoryStore) TouchAgent(ctx context.Context, agentID string, status string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	agent := s.agents[agentID]
-	if agent.ID == "" {
-		agent = Agent{ID: agentID, Name: "Hermes", Mode: "self_hosted", CreatedAt: time.Now().UTC()}
+	agent, ok := s.agents[agentID]
+	if !ok {
+		return ErrNotFound
 	}
 	now := time.Now().UTC()
 	agent.Status = status
@@ -360,6 +360,26 @@ func (s *MemoryStore) ListAgents(ctx context.Context, userID string) ([]Agent, e
 		return out[i].CreatedAt.After(out[j].CreatedAt)
 	})
 	return out, nil
+}
+
+func (s *MemoryStore) UnlinkAgent(ctx context.Context, userID string, agentID string) (Agent, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	agent, ok := s.agents[agentID]
+	if !ok {
+		return Agent{}, ErrNotFound
+	}
+	if agent.OwnerUserID == nil || *agent.OwnerUserID != userID {
+		return Agent{}, ErrUnauthorized
+	}
+	delete(s.agents, agentID)
+	delete(s.agentToken, agentID)
+	for codeHash, pairing := range s.pairings {
+		if pairing.AgentID == agentID {
+			delete(s.pairings, codeHash)
+		}
+	}
+	return agent, nil
 }
 
 func (s *MemoryStore) UserCanAccessAgent(ctx context.Context, userID string, agentID string) (bool, error) {

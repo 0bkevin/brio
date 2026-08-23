@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"time"
 
@@ -14,25 +15,19 @@ type PostgresStore struct {
 	pool *pgxpool.Pool
 }
 
-func NewPostgresStore(ctx context.Context, databaseURL string) (*PostgresStore, error) {
-	pool, err := pgxpool.New(ctx, databaseURL)
-	if err != nil {
-		return nil, err
-	}
-	s := &PostgresStore{pool: pool}
-	if err := s.migrate(ctx); err != nil {
-		pool.Close()
-		return nil, err
-	}
-	return s, nil
+type postgresMigration struct {
+	version int
+	name    string
+	sql     string
 }
 
-func (s *PostgresStore) Close() {
-	s.pool.Close()
-}
+const postgresMigrationLockID int64 = 0x4252494f52454c59
 
-func (s *PostgresStore) migrate(ctx context.Context) error {
-	_, err := s.pool.Exec(ctx, `
+var postgresMigrations = []postgresMigration{
+	{
+		version: 1,
+		name:    "baseline_control_plane",
+		sql: `
 CREATE TABLE IF NOT EXISTS users (
   id TEXT PRIMARY KEY,
   email TEXT,
@@ -105,8 +100,89 @@ WHERE users.id = legacy_unverified_users.id
   AND legacy_unverified_users.principal_rank = 1;
 CREATE UNIQUE INDEX IF NOT EXISTS idx_users_identity ON users(identity_issuer, identity_subject)
   WHERE identity_issuer IS NOT NULL AND identity_subject IS NOT NULL;
-`)
-	return err
+`,
+	},
+}
+
+func NewPostgresStore(ctx context.Context, databaseURL string) (*PostgresStore, error) {
+	pool, err := pgxpool.New(ctx, databaseURL)
+	if err != nil {
+		return nil, err
+	}
+	s := &PostgresStore{pool: pool}
+	if err := s.migrate(ctx); err != nil {
+		pool.Close()
+		return nil, err
+	}
+	return s, nil
+}
+
+func (s *PostgresStore) Close() {
+	s.pool.Close()
+}
+
+func (s *PostgresStore) migrate(ctx context.Context) error {
+	if err := validatePostgresMigrations(postgresMigrations); err != nil {
+		return err
+	}
+	if _, err := s.pool.Exec(ctx, `
+CREATE TABLE IF NOT EXISTS brio_schema_migrations (
+  version INTEGER PRIMARY KEY,
+  name TEXT NOT NULL,
+  applied_at TIMESTAMPTZ NOT NULL DEFAULT now()
+)
+`); err != nil {
+		return fmt.Errorf("create schema migration ledger: %w", err)
+	}
+	for _, migration := range postgresMigrations {
+		if err := s.applyMigration(ctx, migration); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func validatePostgresMigrations(migrations []postgresMigration) error {
+	previous := 0
+	for _, migration := range migrations {
+		if migration.version <= previous || strings.TrimSpace(migration.name) == "" || strings.TrimSpace(migration.sql) == "" {
+			return fmt.Errorf("invalid postgres migration version %d (%q)", migration.version, migration.name)
+		}
+		previous = migration.version
+	}
+	return nil
+}
+
+func (s *PostgresStore) applyMigration(ctx context.Context, migration postgresMigration) error {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("begin postgres migration %d (%s): %w", migration.version, migration.name, err)
+	}
+	defer tx.Rollback(ctx)
+	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock($1)`, postgresMigrationLockID); err != nil {
+		return fmt.Errorf("lock postgres migrations: %w", err)
+	}
+	var appliedName string
+	err = tx.QueryRow(ctx, `SELECT name FROM brio_schema_migrations WHERE version = $1`, migration.version).Scan(&appliedName)
+	if err == nil {
+		if appliedName != migration.name {
+			return fmt.Errorf("postgres migration %d is recorded as %q, expected %q", migration.version, appliedName, migration.name)
+		}
+		return tx.Commit(ctx)
+	}
+	if !errors.Is(err, pgx.ErrNoRows) {
+		return fmt.Errorf("read postgres migration %d: %w", migration.version, err)
+	}
+	if _, err := tx.Exec(ctx, migration.sql); err != nil {
+		return fmt.Errorf("apply postgres migration %d (%s): %w", migration.version, migration.name, err)
+	}
+	if _, err := tx.Exec(ctx, `INSERT INTO brio_schema_migrations (version, name) VALUES ($1, $2)`, migration.version, migration.name); err != nil {
+		return fmt.Errorf("record postgres migration %d (%s): %w", migration.version, migration.name, err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("commit postgres migration %d (%s): %w", migration.version, migration.name, err)
+	}
+	return nil
 }
 
 func (s *PostgresStore) UpsertIdentity(ctx context.Context, issuer string, subject string, email string) (User, error) {
@@ -297,12 +373,18 @@ RETURNING id, owner_user_id, name, mode, status, last_seen_at, created_at
 }
 
 func (s *PostgresStore) TouchAgent(ctx context.Context, agentID string, status string) error {
-	_, err := s.pool.Exec(ctx, `
-INSERT INTO agents (id, name, status, last_seen_at)
-VALUES ($1, 'Hermes', $2, now())
-ON CONFLICT (id) DO UPDATE SET status = EXCLUDED.status, last_seen_at = now()
+	result, err := s.pool.Exec(ctx, `
+UPDATE agents
+SET status = $2, last_seen_at = now()
+WHERE id = $1
 `, agentID, status)
-	return err
+	if err != nil {
+		return err
+	}
+	if result.RowsAffected() == 0 {
+		return ErrNotFound
+	}
+	return nil
 }
 
 func (s *PostgresStore) CreateEnrollment(ctx context.Context, userID string, name string, ttl time.Duration) (Enrollment, error) {
@@ -629,6 +711,46 @@ ORDER BY created_at DESC
 		out = append(out, agent)
 	}
 	return out, rows.Err()
+}
+
+func (s *PostgresStore) UnlinkAgent(ctx context.Context, userID string, agentID string) (Agent, error) {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return Agent{}, err
+	}
+	defer tx.Rollback(ctx)
+
+	var agent Agent
+	err = tx.QueryRow(ctx, `
+SELECT id, owner_user_id, name, mode, status, last_seen_at, created_at
+FROM agents
+WHERE id = $1
+FOR UPDATE
+`, agentID).Scan(
+		&agent.ID,
+		&agent.OwnerUserID,
+		&agent.Name,
+		&agent.Mode,
+		&agent.Status,
+		&agent.LastSeenAt,
+		&agent.CreatedAt,
+	)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return Agent{}, ErrNotFound
+	}
+	if err != nil {
+		return Agent{}, err
+	}
+	if agent.OwnerUserID == nil || *agent.OwnerUserID != userID {
+		return Agent{}, ErrUnauthorized
+	}
+	if _, err := tx.Exec(ctx, `DELETE FROM agents WHERE id = $1`, agentID); err != nil {
+		return Agent{}, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return Agent{}, err
+	}
+	return agent, nil
 }
 
 func (s *PostgresStore) UserCanAccessAgent(ctx context.Context, userID string, agentID string) (bool, error) {

@@ -70,6 +70,16 @@ INSERT INTO %s.agents (id, owner_user_id, name) VALUES ('agent_legacy', 'usr_leg
 		t.Fatalf("migrate legacy store: %v", err)
 	}
 	defer s.Close()
+	if err := s.migrate(ctx); err != nil {
+		t.Fatalf("rerun recorded migrations: %v", err)
+	}
+	var appliedMigrations int
+	if err := s.pool.QueryRow(ctx, `SELECT count(*) FROM brio_schema_migrations`).Scan(&appliedMigrations); err != nil {
+		t.Fatalf("read migration ledger: %v", err)
+	}
+	if appliedMigrations != len(postgresMigrations) {
+		t.Fatalf("applied migrations = %d, want %d", appliedMigrations, len(postgresMigrations))
+	}
 
 	user, _, _, err := s.CreateDeviceToken(ctx, "OWNER@example.com", "Migrated phone")
 	if err != nil {
@@ -165,5 +175,19 @@ func TestPostgresStoreControlPlaneAndPairingParity(t *testing.T) {
 	}
 	if claimed.Status != "offline" || claimed.LastSeenAt != nil {
 		t.Fatalf("pairing claim marked agent online before tunnel connection: %+v", claimed)
+	}
+
+	unlinked, err := s.UnlinkAgent(ctx, user.ID, agentID)
+	if err != nil {
+		t.Fatalf("unlink enrolled agent: %v", err)
+	}
+	if unlinked.ID != agentID {
+		t.Fatalf("unexpected unlinked agent: %+v", unlinked)
+	}
+	if err := s.AuthenticateCompanion(ctx, agentID, companionToken); err != ErrUnauthorized {
+		t.Fatalf("unlinked companion credential error = %v, want unauthorized", err)
+	}
+	if allowed, err := s.UserCanAccessAgent(ctx, user.ID, agentID); err != nil || allowed {
+		t.Fatalf("unlinked agent access = %v, err = %v", allowed, err)
 	}
 }

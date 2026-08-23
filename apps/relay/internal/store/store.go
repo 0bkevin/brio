@@ -88,6 +88,7 @@ type Store interface {
 	GetPairing(ctx context.Context, code string) (Pairing, error)
 	ClaimPairing(ctx context.Context, code string, userID string) (Agent, error)
 	ListAgents(ctx context.Context, userID string) ([]Agent, error)
+	UnlinkAgent(ctx context.Context, userID string, agentID string) (Agent, error)
 	UserCanAccessAgent(ctx context.Context, userID string, agentID string) (bool, error)
 }
 

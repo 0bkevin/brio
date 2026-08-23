@@ -34,6 +34,10 @@ a fixed set of request paths to Hermes' local API server
 Postgres is optional. The relay uses in-memory development storage when
 `BRIO_DATABASE_URL` is unset.
 
+The relay reliability and security invariants, their T3 Connect sources, and
+the remaining single-replica/data-path limitations are documented in
+[`docs/relay-practices.md`](docs/relay-practices.md).
+
 ## Quick Start
 
 ```bash
