@@ -10,6 +10,14 @@ import { AppText, AppTextInput, Button, Card, EmptyState, StatusDot } from '@/co
 import { T3Radius, T3Spacing, T3Typography } from '@/constants/t3-theme';
 import { useT3Theme } from '@/hooks/use-t3-theme';
 import {
+  DEFAULT_PROFILE_NAME,
+  environmentId,
+  isNamedProfile,
+  listProfiles,
+  profileName,
+  type HermesProfile,
+} from '@/lib/profiles';
+import {
   aggregateRootAgentUsage,
   controlRPC,
   executeControlCommand,
@@ -28,10 +36,27 @@ export function HermesCommandCenterScreen({ connection }: { connection: AgentCon
   const colors = useT3Theme();
   const router = useRouter();
   const queryClient = useQueryClient();
+  const agentId = environmentId(connection);
   const environments = [connection];
-  const [environmentId, setEnvironmentId] = useState(connection.id);
-  const activeConnection =
-    environments.find((item) => item.id === environmentId) ?? connection;
+  const [environmentIdState, setEnvironmentId] = useState(connection.id);
+  const activeEnvironment =
+    environments.find((item) => item.id === environmentIdState) ?? connection;
+
+  // Hermes profile selection. Profiles live inside one environment; the
+  // switcher re-scopes every query below without touching the connection.
+  const profilesQuery = useQuery({
+    queryKey: ['profiles', activeEnvironment.url, agentId],
+    queryFn: () => listProfiles(activeEnvironment),
+    staleTime: 30_000,
+    retry: false,
+  });
+  const availableProfiles: HermesProfile[] = profilesQuery.data?.profiles ?? [];
+  const [requestedProfile, setRequestedProfile] = useState('');
+  const activeProfile = availableProfiles.some((profile) => profile.name === requestedProfile)
+    ? profileName(requestedProfile)
+    : profilesQuery.data
+      ? profileName(profilesQuery.data.active)
+      : DEFAULT_PROFILE_NAME;
   const [selectedSessionId, setSelectedSessionId] = useState('');
   const [goalText, setGoalText] = useState('');
   const [subgoalText, setSubgoalText] = useState('');
@@ -42,41 +67,44 @@ export function HermesCommandCenterScreen({ connection }: { connection: AgentCon
   const [steerText, setSteerText] = useState('');
 
   const sessions = useQuery({
-    queryKey: ['control-sessions', activeConnection.id, activeConnection.url],
-    queryFn: () => listControlSessions(activeConnection),
+    queryKey: ['control-sessions', activeEnvironment.id, activeEnvironment.url, activeProfile],
+    queryFn: () => listControlSessions(activeEnvironment, 100, isNamedProfile(activeProfile) ? activeProfile : undefined),
     refetchInterval: 15_000,
+    retry: false,
   });
   const sessionId = sessions.data?.sessions.some((session) => session.id === selectedSessionId)
     ? selectedSessionId
     : sessions.data?.sessions[0]?.id ?? '';
 
   const snapshot = useQuery({
-    queryKey: ['command-center', activeConnection.id, activeConnection.url, sessionId],
-    queryFn: () => getCommandCenterSnapshot(activeConnection, sessionId),
+    queryKey: ['command-center', activeEnvironment.id, activeEnvironment.url, sessionId, activeProfile],
+    queryFn: () => getCommandCenterSnapshot(activeEnvironment, sessionId, isNamedProfile(activeProfile) ? activeProfile : undefined),
     enabled: Boolean(sessionId),
     refetchInterval: 5_000,
+    retry: false,
   });
   const refresh = async () => {
     await Promise.all([sessions.refetch(), snapshot.refetch()]);
   };
   const invalidate = async () => {
     await queryClient.invalidateQueries({
-      queryKey: ['command-center', activeConnection.id, activeConnection.url, sessionId],
+      queryKey: ['command-center', activeEnvironment.id, activeEnvironment.url, sessionId, activeProfile],
     });
   };
 
   const command = useMutation({
     mutationFn: (value: { command: string; confirm?: boolean }) =>
-      executeControlCommand(activeConnection, sessionId, value.command, value.confirm),
+      executeControlCommand(activeEnvironment, sessionId, value.command, value.confirm, isNamedProfile(activeProfile) ? activeProfile : undefined),
     onSuccess: invalidate,
   });
   const rpc = useMutation({
     mutationFn: (value: { method: string; params?: Record<string, unknown>; confirm?: boolean }) =>
-      controlRPC(activeConnection, value.method, value.params ?? {}, value.confirm),
+      controlRPC(activeEnvironment, value.method, value.params ?? {}, value.confirm, undefined, isNamedProfile(activeProfile) ? activeProfile : undefined),
     onSuccess: invalidate,
   });
   const background = useMutation({
-    mutationFn: (text: string) => startBackgroundTask(activeConnection, sessionId, text),
+    mutationFn: (text: string) =>
+      startBackgroundTask(activeEnvironment, sessionId, text, isNamedProfile(activeProfile) ? activeProfile : undefined),
     onSuccess: async () => {
       setBackgroundPrompt('');
       await invalidate();
@@ -118,7 +146,7 @@ export function HermesCommandCenterScreen({ connection }: { connection: AgentCon
             <StatusDot status={snapshot.isError ? 'error' : snapshot.isFetching ? 'busy' : 'online'} />
             <View style={styles.flex}>
               <AppText style={styles.title}>Command Center</AppText>
-              <AppText style={[styles.caption, { color: colors.muted }]}>{activeConnection.name} · backend-owned state</AppText>
+              <AppText style={[styles.caption, { color: colors.muted }]}>{activeEnvironment.name} · backend-owned state</AppText>
             </View>
             <Pressable
               accessibilityLabel="Refresh Command Center"
@@ -137,7 +165,7 @@ export function HermesCommandCenterScreen({ connection }: { connection: AgentCon
                     style={({ pressed }) => [
                       styles.environmentChip,
                       {
-                        borderColor: environment.id === activeConnection.id ? colors.foreground : colors.border,
+                        borderColor: environment.id === activeEnvironment.id ? colors.foreground : colors.border,
                         opacity: pressed ? 0.65 : 1,
                       },
                     ]}>
@@ -145,6 +173,33 @@ export function HermesCommandCenterScreen({ connection }: { connection: AgentCon
                     <AppText numberOfLines={1} style={styles.chipText}>{environment.name}</AppText>
                   </Pressable>
                 ))}
+              </View>
+            </ScrollView>
+          ) : null}
+          {availableProfiles.length > 1 ? (
+            <ScrollView horizontal showsHorizontalScrollIndicator={false}>
+              <View style={styles.chips}>
+                {availableProfiles.map((profile) => {
+                  const active = profile.name === activeProfile;
+                  return (
+                    <Pressable
+                      accessibilityLabel={`Control profile ${profile.name}`}
+                      accessibilityRole="button"
+                      accessibilityState={{ selected: active }}
+                      key={profile.name}
+                      onPress={() => setRequestedProfile(profile.name)}
+                      style={({ pressed }) => [
+                        styles.environmentChip,
+                        {
+                          borderColor: active ? colors.primary : colors.border,
+                          opacity: pressed ? 0.65 : 1,
+                        },
+                      ]}>
+                      <StatusDot status={profile.gateway_running ? 'online' : 'offline'} />
+                      <AppText numberOfLines={1} style={styles.chipText}>{profile.name}</AppText>
+                    </Pressable>
+                  );
+                })}
               </View>
             </ScrollView>
           ) : null}

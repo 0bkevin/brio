@@ -3,6 +3,7 @@ import { ActivityIndicator, Pressable, ScrollView, StyleSheet, View } from 'reac
 import { SafeAreaView } from 'react-native-safe-area-context';
 
 import { DashboardCard, SectionLabel, StatusBadge } from '@/components/dashboard';
+import { HermesProfilesScreen } from '@/features/profiles/hermes-profiles-screen';
 import { brioFetch, getCapabilities, getHealth, isAgentHealthy, listHermesSessions } from '@/lib/brio';
 import { ThemedText } from '@/components/themed-text';
 import { ThemedView } from '@/components/themed-view';
@@ -25,13 +26,13 @@ export default function ManageScreen() {
     enabled: Boolean(connection),
   });
   const sessions = useQuery({
-    queryKey: ['sessions', connection?.url],
+    queryKey: ['sessions', connection?.url, connection?.agentId ?? connection?.id, 'default'],
     queryFn: () => listHermesSessions(connection!, 5),
     enabled: Boolean(connection),
   });
   const hasConnectorMemory = connection?.transport === 'relay';
   const memory = useQuery({
-    queryKey: ['memory', connection?.url],
+    queryKey: ['memory', connection?.url, connection?.agentId ?? connection?.id, 'default'],
     queryFn: () => brioFetch<{ memory: string; user: string }>(connection!, '/v1/memory'),
     enabled: Boolean(connection) && hasConnectorMemory,
   });
@@ -96,6 +97,8 @@ export default function ManageScreen() {
             onRefresh={() => void memory.refetch()}
           />
         ) : null}
+
+        <HermesProfilesScreen connection={connection} />
       </SafeAreaView>
     </ScrollView>
   );

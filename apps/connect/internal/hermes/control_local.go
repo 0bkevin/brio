@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 
@@ -24,18 +25,13 @@ func (c *Client) serveControl(
 	if method != wantMethod {
 		return emit(methodNotAllowed(frame.ID, method, frame.Path))
 	}
-
-	var body bytes.Reader
-	if frame.Body != nil {
-		payload, err := json.Marshal(frame.Body)
-		if err != nil {
-			return emit(errorFrame(frame.ID, "BAD_REQUEST", err.Error()))
-		}
-		body = *bytes.NewReader(payload)
+	commandCenter, err := c.commandCenterFor(route.Profile)
+	if err != nil {
+		return emit(errorFrame(frame.ID, "PROFILE_CONTROL_UNAVAILABLE", err.Error()))
 	}
-	req := httptest.NewRequest(method, frame.Path, &body).WithContext(ctx)
+
+	req := httptest.NewRequest(method, frame.Path, bodyReader(frame.Body)).WithContext(ctx)
 	recorder := httptest.NewRecorder()
-	commandCenter := c.commandCenter()
 	switch route.Name {
 	case "control-rpc":
 		commandCenter.controlRPC(recorder, req)
@@ -46,12 +42,28 @@ func (c *Client) serveControl(
 	case "control-events":
 		commandCenter.controlEvents(recorder, req)
 	}
+	return emit(recorderFrame(frame.ID, recorder))
+}
 
+// bodyReader converts a decoded frame body back into a JSON request body.
+func bodyReader(frameBody any) io.Reader {
+	if frameBody == nil {
+		return http.NoBody
+	}
+	payload, err := json.Marshal(frameBody)
+	if err != nil {
+		return http.NoBody
+	}
+	return bytes.NewReader(payload)
+}
+
+// recorderFrame converts one httptest response into a tunnel response frame.
+func recorderFrame(id string, recorder *httptest.ResponseRecorder) tunnel.Frame {
 	response := recorder.Result()
 	defer response.Body.Close()
 	var responseBody any
 	if err := json.NewDecoder(response.Body).Decode(&responseBody); err != nil {
-		responseBody = map[string]any{"error": "Brio produced an invalid control response"}
+		responseBody = map[string]any{"error": "Brio produced an invalid local response"}
 	}
-	return emit(responseFrame(frame.ID, response.StatusCode, responseBody))
+	return responseFrame(id, response.StatusCode, responseBody)
 }
