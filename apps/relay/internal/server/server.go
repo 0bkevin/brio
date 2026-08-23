@@ -27,6 +27,7 @@ type Config struct {
 	DatabaseURL           string
 	AllowedOrigins        []string
 	DeviceRegistrationKey string
+	InsecureDevMode       bool
 }
 
 type hub struct {
@@ -42,12 +43,13 @@ type pendingRequest struct {
 }
 
 type peer struct {
-	id      string
-	agentID string
-	role    string
-	conn    *websocket.Conn
-	send    chan []byte
-	joined  time.Time
+	id       string
+	agentID  string
+	deviceID string
+	role     string
+	conn     *websocket.Conn
+	send     chan []byte
+	joined   time.Time
 }
 
 type app struct {
@@ -70,6 +72,9 @@ func Run(ctx context.Context, cfg Config) error {
 	}
 	defer st.Close()
 	a := &app{cfg: cfg, hub: newHub(), store: st}
+	if cfg.InsecureDevMode {
+		slog.Warn("relay insecure development mode is enabled; email identities are unverified and browser origins are unrestricted")
+	}
 	go a.hub.pruneLoop(ctx)
 	router := chi.NewRouter()
 	router.Use(middleware.RequestID)
@@ -140,18 +145,11 @@ func requestLogger(next http.Handler) http.Handler {
 func (a *app) cors(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		origin := r.Header.Get("Origin")
-		if origin == "" || originAllowed(origin, a.cfg.AllowedOrigins) {
-			if origin != "" {
-				w.Header().Set("Access-Control-Allow-Origin", origin)
-			} else {
-				w.Header().Set("Access-Control-Allow-Origin", "*")
-			}
-		} else {
+		if origin != "" && !originAllowed(origin, a.cfg.AllowedOrigins, a.cfg.InsecureDevMode) {
 			writeJSON(w, http.StatusForbidden, map[string]any{"error": "origin is not allowed"})
 			return
 		}
-		if len(a.cfg.AllowedOrigins) == 0 {
-			origin = "*"
+		if origin != "" {
 			w.Header().Set("Access-Control-Allow-Origin", origin)
 		}
 		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, PATCH, DELETE, OPTIONS")
@@ -180,6 +178,7 @@ func (a *app) health(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{
 		"service":          "brio-relay",
 		"ok":               true,
+		"auth_mode":        a.authMode(),
 		"agents":           agents,
 		"peers":            peers,
 		"pending_requests": pending,
@@ -187,6 +186,12 @@ func (a *app) health(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *app) createDevice(w http.ResponseWriter, r *http.Request) {
+	if a.cfg.DeviceRegistrationKey == "" && !a.cfg.InsecureDevMode {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]any{
+			"error": "verified account authentication is not configured; unverified email sign-in is disabled",
+		})
+		return
+	}
 	if a.cfg.DeviceRegistrationKey != "" && !secretEqual(deviceRegistrationKey(r), a.cfg.DeviceRegistrationKey) {
 		writeJSON(w, http.StatusUnauthorized, map[string]any{"error": "device registration is not authorized"})
 		return
@@ -229,6 +234,7 @@ func (a *app) revokeDevice(w http.ResponseWriter, r *http.Request) {
 		writeStoreError(w, err)
 		return
 	}
+	a.hub.disconnectDevice(device.ID)
 	writeJSON(w, http.StatusOK, map[string]any{"device": device})
 }
 
@@ -281,6 +287,7 @@ func (a *app) claimEnrollment(w http.ResponseWriter, r *http.Request) {
 		writeStoreError(w, err)
 		return
 	}
+	a.hub.disconnectCompanions(agent.ID)
 	writeJSON(w, http.StatusCreated, map[string]any{
 		"agent":       agent,
 		"relay_token": relayToken,
@@ -308,6 +315,7 @@ func (a *app) recoverAgent(w http.ResponseWriter, r *http.Request) {
 		writeStoreError(w, err)
 		return
 	}
+	a.hub.disconnectCompanions(agentID)
 	writeJSON(w, http.StatusCreated, p)
 }
 
@@ -333,6 +341,7 @@ func (a *app) createPairing(w http.ResponseWriter, r *http.Request) {
 		writeStoreError(w, err)
 		return
 	}
+	a.hub.disconnectCompanions(body.AgentID)
 	writeJSON(w, http.StatusCreated, p)
 }
 
@@ -368,6 +377,7 @@ func (a *app) tunnel(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "agent id is required"})
 		return
 	}
+	deviceID := ""
 	if role == "mobile" {
 		token := r.URL.Query().Get("token")
 		if token == "" {
@@ -388,6 +398,7 @@ func (a *app) tunnel(w http.ResponseWriter, r *http.Request) {
 			writeJSON(w, http.StatusForbidden, map[string]any{"error": "device cannot access agent"})
 			return
 		}
+		deviceID = auth.Device.ID
 	} else {
 		token := r.URL.Query().Get("token")
 		if token == "" {
@@ -399,18 +410,19 @@ func (a *app) tunnel(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	conn, err := websocket.Accept(w, r, websocketAcceptOptions(a.cfg.AllowedOrigins))
+	conn, err := websocket.Accept(w, r, websocketAcceptOptions(a.cfg.AllowedOrigins, a.cfg.InsecureDevMode))
 	if err != nil {
 		return
 	}
 	conn.SetReadLimit(12 * 1024 * 1024)
 	p := &peer{
-		id:      role + "_" + store.RandomCode(24),
-		agentID: agentID,
-		role:    role,
-		conn:    conn,
-		send:    make(chan []byte, 64),
-		joined:  time.Now().UTC(),
+		id:       role + "_" + store.RandomCode(24),
+		agentID:  agentID,
+		deviceID: deviceID,
+		role:     role,
+		conn:     conn,
+		send:     make(chan []byte, 64),
+		joined:   time.Now().UTC(),
 	}
 	a.addPeer(r.Context(), p)
 	defer a.removePeer(p)
@@ -492,6 +504,42 @@ func (h *hub) hasCompanion(agentID string) bool {
 		}
 	}
 	return false
+}
+
+func (h *hub) disconnectDevice(deviceID string) {
+	if deviceID == "" {
+		return
+	}
+	for _, p := range h.matchingPeers(func(p *peer) bool {
+		return p.role == "mobile" && p.deviceID == deviceID
+	}) {
+		h.remove(p)
+	}
+}
+
+func (h *hub) disconnectCompanions(agentID string) {
+	if agentID == "" {
+		return
+	}
+	for _, p := range h.matchingPeers(func(p *peer) bool {
+		return p.role == "companion" && p.agentID == agentID
+	}) {
+		h.remove(p)
+	}
+}
+
+func (h *hub) matchingPeers(matches func(*peer) bool) []*peer {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	var peers []*peer
+	for _, set := range h.agents {
+		for p := range set {
+			if matches(p) {
+				peers = append(peers, p)
+			}
+		}
+	}
+	return peers
 }
 
 func (h *hub) route(from *peer, data []byte) {
@@ -659,16 +707,16 @@ func mustJSON(v any) []byte {
 	return data
 }
 
-func originAllowed(origin string, allowed []string) bool {
+func originAllowed(origin string, allowed []string, insecureDevMode bool) bool {
 	if len(allowed) == 0 {
-		return true
+		return insecureDevMode
 	}
 	normalizedOrigin := normalizeOrigin(origin)
 	originHost := originHostPattern(origin)
 	for _, item := range allowed {
 		item = strings.TrimSpace(item)
 		if item == "*" {
-			return true
+			return insecureDevMode
 		}
 		if strings.Contains(item, "://") {
 			if normalizeOrigin(item) == normalizedOrigin {
@@ -683,11 +731,21 @@ func originAllowed(origin string, allowed []string) bool {
 	return false
 }
 
-func websocketAcceptOptions(allowed []string) *websocket.AcceptOptions {
-	if len(allowed) == 0 || containsWildcardOrigin(allowed) {
+func websocketAcceptOptions(allowed []string, insecureDevMode bool) *websocket.AcceptOptions {
+	if insecureDevMode && (len(allowed) == 0 || containsWildcardOrigin(allowed)) {
 		return &websocket.AcceptOptions{InsecureSkipVerify: true}
 	}
 	return &websocket.AcceptOptions{OriginPatterns: websocketOriginPatterns(allowed)}
+}
+
+func (a *app) authMode() string {
+	if a.cfg.DeviceRegistrationKey != "" {
+		return "registration_key"
+	}
+	if a.cfg.InsecureDevMode {
+		return "insecure_development"
+	}
+	return "disabled"
 }
 
 func websocketOriginPatterns(allowed []string) []string {

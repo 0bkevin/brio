@@ -232,8 +232,9 @@ Common values:
 
 - `BRIO_RELAY_ADDR` - relay bind address, default `127.0.0.1:8082`.
 - `BRIO_DATABASE_URL` - optional Postgres URL for relay persistence.
-- `BRIO_RELAY_ALLOWED_ORIGINS` - optional comma-separated browser origins allowed for relay CORS and WebSocket upgrades. If unset, development mode allows all origins.
-- `BRIO_DEVICE_REGISTRATION_KEY` - optional secret required on `POST /auth/devices` through `Authorization: Bearer ...` or `X-Brio-Registration-Key`. Use this only as a deployment guard until the hosted account-auth flow replaces development device registration.
+- `BRIO_INSECURE_DEV_MODE` - explicitly enables unverified email sign-in and unrestricted browser origins. `make dev-relay` sets the equivalent CLI flag; never enable it on a deployed relay.
+- `BRIO_RELAY_ALLOWED_ORIGINS` - comma-separated browser origins allowed for relay CORS and WebSocket upgrades. Browser origins are denied when this is unset unless insecure development mode is explicitly enabled; origin-less native clients continue to work.
+- `BRIO_DEVICE_REGISTRATION_KEY` - interim secret required on `POST /auth/devices` through `Authorization: Bearer ...` or `X-Brio-Registration-Key`. With neither this key nor insecure development mode configured, device registration fails closed. Do not embed this key in a public app build; replace it with the hosted account-auth flow.
 - `HERMES_CONTROL_BASE` - `hermes serve` base URL, default `http://127.0.0.1:9119`.
 - `HERMES_CONTROL_TOKEN` - session token shared with `hermes serve` through `HERMES_DASHBOARD_SESSION_TOKEN`.
 

@@ -34,6 +34,7 @@ func serveCommand() *cobra.Command {
 	cmd.Flags().StringVar(&cfg.DatabaseURL, "database-url", envDefault("BRIO_DATABASE_URL", ""), "Postgres database URL")
 	cmd.Flags().StringSliceVar(&cfg.AllowedOrigins, "allowed-origin", envList("BRIO_RELAY_ALLOWED_ORIGINS"), "allowed browser origin for CORS and WebSocket upgrades; repeatable")
 	cmd.Flags().StringVar(&cfg.DeviceRegistrationKey, "device-registration-key", envDefault("BRIO_DEVICE_REGISTRATION_KEY", ""), "optional key required to create relay device tokens")
+	cmd.Flags().BoolVar(&cfg.InsecureDevMode, "insecure-dev-mode", envBool("BRIO_INSECURE_DEV_MODE"), "enable unverified email sign-in and unrestricted browser origins for local development")
 	return cmd
 }
 
@@ -57,4 +58,13 @@ func envList(key string) []string {
 		}
 	}
 	return out
+}
+
+func envBool(key string) bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv(key))) {
+	case "1", "true", "yes", "on":
+		return true
+	default:
+		return false
+	}
 }

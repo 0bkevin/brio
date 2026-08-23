@@ -232,15 +232,117 @@ func TestHubPrunesExpiredPendingRequests(t *testing.T) {
 	}
 }
 
+func TestHubDisconnectDeviceRemovesOnlyThatDevicesMobilePeers(t *testing.T) {
+	h := newHub()
+	revoked := testPeer("mobile", "agent-1")
+	revoked.deviceID = "device-revoked"
+	other := testPeer("mobile", "agent-1")
+	other.deviceID = "device-other"
+	companion := testPeer("companion", "agent-1")
+	h.add(revoked)
+	h.add(other)
+	h.add(companion)
+
+	h.disconnectDevice("device-revoked")
+
+	if peerConnected(h, revoked) {
+		t.Fatal("revoked device peer remained connected")
+	}
+	if !peerConnected(h, other) {
+		t.Fatal("another device peer was disconnected")
+	}
+	if !peerConnected(h, companion) {
+		t.Fatal("companion peer was disconnected with the device")
+	}
+}
+
+func TestHubDisconnectCompanionsRotatesOnlyTargetAgent(t *testing.T) {
+	h := newHub()
+	target := testPeer("companion", "agent-1")
+	other := testPeer("companion", "agent-2")
+	mobile := testPeer("mobile", "agent-1")
+	h.add(target)
+	h.add(other)
+	h.add(mobile)
+
+	h.disconnectCompanions("agent-1")
+
+	if peerConnected(h, target) {
+		t.Fatal("target companion remained connected after credential rotation")
+	}
+	if !peerConnected(h, other) {
+		t.Fatal("another agent's companion was disconnected")
+	}
+	if !peerConnected(h, mobile) {
+		t.Fatal("mobile peer was disconnected during companion rotation")
+	}
+}
+
+func TestCreateDeviceRequiresExplicitAuthenticationMode(t *testing.T) {
+	body := `{"email":"owner@example.com","device_name":"Phone"}`
+
+	production := &app{cfg: Config{}, hub: newHub(), store: store.NewMemoryStore()}
+	req := httptest.NewRequest(http.MethodPost, "/auth/devices", strings.NewReader(body))
+	recorder := httptest.NewRecorder()
+	production.createDevice(recorder, req)
+	if recorder.Code != http.StatusServiceUnavailable {
+		t.Fatalf("production status = %d, want %d", recorder.Code, http.StatusServiceUnavailable)
+	}
+
+	development := &app{cfg: Config{InsecureDevMode: true}, hub: newHub(), store: store.NewMemoryStore()}
+	req = httptest.NewRequest(http.MethodPost, "/auth/devices", strings.NewReader(body))
+	recorder = httptest.NewRecorder()
+	development.createDevice(recorder, req)
+	if recorder.Code != http.StatusCreated {
+		t.Fatalf("development status = %d, want %d: %s", recorder.Code, http.StatusCreated, recorder.Body.String())
+	}
+}
+
+func TestCreateDeviceRequiresConfiguredRegistrationKey(t *testing.T) {
+	a := &app{
+		cfg:   Config{DeviceRegistrationKey: "registration-secret"},
+		hub:   newHub(),
+		store: store.NewMemoryStore(),
+	}
+	body := `{"email":"owner@example.com","device_name":"Phone"}`
+
+	req := httptest.NewRequest(http.MethodPost, "/auth/devices", strings.NewReader(body))
+	recorder := httptest.NewRecorder()
+	a.createDevice(recorder, req)
+	if recorder.Code != http.StatusUnauthorized {
+		t.Fatalf("missing-key status = %d, want %d", recorder.Code, http.StatusUnauthorized)
+	}
+
+	req = httptest.NewRequest(http.MethodPost, "/auth/devices", strings.NewReader(body))
+	req.Header.Set("X-Brio-Registration-Key", "registration-secret")
+	recorder = httptest.NewRecorder()
+	a.createDevice(recorder, req)
+	if recorder.Code != http.StatusCreated {
+		t.Fatalf("valid-key status = %d, want %d: %s", recorder.Code, http.StatusCreated, recorder.Body.String())
+	}
+}
+
 func TestOriginAllowedNormalizesFullOriginsAndHostPatterns(t *testing.T) {
-	if !originAllowed("https://app.brio.dev", []string{"https://app.brio.dev/"}) {
+	if !originAllowed("https://app.brio.dev", []string{"https://app.brio.dev/"}, false) {
 		t.Fatal("expected exact full origin with trailing slash to be allowed")
 	}
-	if originAllowed("http://app.brio.dev", []string{"https://app.brio.dev"}) {
+	if originAllowed("http://app.brio.dev", []string{"https://app.brio.dev"}, false) {
 		t.Fatal("expected mismatched origin scheme to be rejected")
 	}
-	if !originAllowed("https://preview.brio.dev", []string{"*.brio.dev"}) {
+	if !originAllowed("https://preview.brio.dev", []string{"*.brio.dev"}, false) {
 		t.Fatal("expected host pattern to be allowed")
+	}
+}
+
+func TestOriginPolicyFailsClosedUnlessDevelopmentIsExplicit(t *testing.T) {
+	if originAllowed("https://untrusted.example", nil, false) {
+		t.Fatal("empty production allowlist accepted a browser origin")
+	}
+	if !originAllowed("https://localhost.example", nil, true) {
+		t.Fatal("explicit development mode did not accept a browser origin")
+	}
+	if originAllowed("https://untrusted.example", []string{"*"}, false) {
+		t.Fatal("production wildcard accepted a browser origin")
 	}
 }
 
@@ -282,6 +384,27 @@ func TestCORSAllowsConfiguredOrigin(t *testing.T) {
 	}
 	if got := recorder.Header().Get("Access-Control-Allow-Origin"); got != "https://app.brio.dev" {
 		t.Fatalf("allow origin = %q", got)
+	}
+}
+
+func TestCORSRejectsBrowserOriginWhenProductionAllowlistIsEmpty(t *testing.T) {
+	called := false
+	a := &app{cfg: Config{}}
+	handler := a.cors(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		called = true
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	req := httptest.NewRequest(http.MethodGet, "/health", nil)
+	req.Header.Set("Origin", "https://untrusted.example")
+	recorder := httptest.NewRecorder()
+
+	handler.ServeHTTP(recorder, req)
+
+	if called {
+		t.Fatal("browser request reached handler without a production allowlist")
+	}
+	if recorder.Code != http.StatusForbidden {
+		t.Fatalf("status = %d, want %d", recorder.Code, http.StatusForbidden)
 	}
 }
 
@@ -328,10 +451,10 @@ func TestWebsocketOriginPatternsUseHostsFromConfiguredOrigins(t *testing.T) {
 		t.Fatalf("websocket origin patterns = %#v, want %#v", got, want)
 	}
 
-	if opts := websocketAcceptOptions(nil); opts == nil || !opts.InsecureSkipVerify {
-		t.Fatal("empty allowed origins should explicitly allow development WebSocket origins")
+	if opts := websocketAcceptOptions(nil, false); opts == nil || opts.InsecureSkipVerify {
+		t.Fatal("empty production allowlist should retain WebSocket origin verification")
 	}
-	if opts := websocketAcceptOptions([]string{"*"}); opts == nil || !opts.InsecureSkipVerify {
+	if opts := websocketAcceptOptions([]string{"*"}, true); opts == nil || !opts.InsecureSkipVerify {
 		t.Fatal("wildcard allowed origin should explicitly allow all WebSocket origins")
 	}
 }
@@ -368,6 +491,12 @@ func assertNoFrame(t *testing.T, p *peer) {
 		t.Fatalf("unexpected frame: %s", string(data))
 	default:
 	}
+}
+
+func peerConnected(h *hub, target *peer) bool {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.agents[target.agentID][target]
 }
 
 type touchStore struct {
