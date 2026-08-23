@@ -16,13 +16,17 @@ import { SafeAreaView } from 'react-native-safe-area-context';
 
 import { ThemedText } from '@/components/themed-text';
 import { ComposerControls } from '@/components/composer-controls';
+import { SessionModelControls } from '@/components/session-model-controls';
 import { Spacing } from '@/constants/theme';
 import { useTheme } from '@/hooks/use-theme';
 import {
   getHermesSessionMessages,
+  getSessionContextBreakdown,
+  getSessionUsage,
   hermesResponseText,
   interruptComposerSession,
   isAgentHealthy,
+  listHermesModelOptions,
   listHermesSessions,
   dispatchComposerCommand,
   prepareComposerPrompt,
@@ -32,7 +36,20 @@ import {
   type HealthResponse,
   type HermesSession,
 } from '@/lib/brio';
-import { createChatId, useChatStore, type ChatMessage, type ChatThread } from '@/state/chat-store';
+import {
+  buildRuntimeModelOptions,
+  modelIncompatibilities,
+  normalizeLiveUsage,
+  selectedCapabilities,
+  type NormalizedContextBreakdown,
+  type NormalizedRuntimeUsage,
+} from '@/lib/session-runtime';
+import {
+  createChatId,
+  useChatStore,
+  type ChatMessage,
+  type ChatThread,
+} from '@/state/chat-store';
 import { EMPTY_PROMPT_QUEUE, type QueuedPrompt } from '@/state/composer-store-model';
 import { useComposerStore } from '@/state/composer-store';
 
@@ -72,6 +89,8 @@ export function ChatWorkspace({
   const deleteThread = useChatStore((state) => state.deleteThread);
   const addMessage = useChatStore((state) => state.addMessage);
   const completeResponse = useChatStore((state) => state.completeResponse);
+  const updateThreadRuntime = useChatStore((state) => state.updateThreadRuntime);
+  const setThreadModelOverride = useChatStore((state) => state.setThreadModelOverride);
   const importThread = useChatStore((state) => state.importThread);
   const [showThreads, setShowThreads] = useState(false);
   const [search, setSearch] = useState('');
@@ -79,6 +98,8 @@ export function ChatWorkspace({
   const [streamingText, setStreamingText] = useState('');
   const [sendError, setSendError] = useState('');
   const [importingId, setImportingId] = useState<string | null>(null);
+  const [sendStartedAt, setSendStartedAt] = useState<number | null>(null);
+  const [elapsedLabel, setElapsedLabel] = useState('');
   const connectionKey = `${connection.transport}:${connection.url}:${connection.agentId ?? connection.id}`;
   const connectionThreads = useMemo(
     () => threads.filter((thread) => thread.connectionKey === connectionKey),
@@ -87,8 +108,15 @@ export function ChatWorkspace({
 
   const sessions = useQuery({
     queryKey: ['hermes-sessions', connection.url, connection.agentId ?? connection.id],
-    queryFn: () => listHermesSessions(connection),
+    queryFn: () => listHermesSessions(connection, 200),
     refetchInterval: 15000,
+  });
+
+  const modelOptions = useQuery({
+    queryKey: ['hermes-model-options', connection.url, connection.agentId ?? connection.id],
+    queryFn: () => listHermesModelOptions(connection),
+    staleTime: 5 * 60_000,
+    retry: 1,
   });
 
   useEffect(() => {
@@ -153,6 +181,81 @@ export function ChatWorkspace({
     void ensureSessionId(activeThread.id, activeThread.importedSessionId || activeThread.id);
   }, [activeThread, composerHydrated, ensureSessionId]);
 
+  // Live elapsed duration while a prompt is in flight. The label starts in
+  // deliverPrompt and resets there too; this effect only ticks it forward.
+  useEffect(() => {
+    if (!sending || !sendStartedAt) return;
+    const tick = () => {
+      const seconds = Math.max(0, Math.floor((Date.now() - sendStartedAt) / 1000));
+      setElapsedLabel(seconds < 60 ? `${seconds}s` : `${Math.floor(seconds / 60)}m ${seconds % 60}s`);
+    };
+    const timer = setInterval(tick, 1000);
+    return () => clearInterval(timer);
+  }, [sending, sendStartedAt]);
+
+  // Poll live usage/context for the active runtime session: frequently while
+  // sending, then at a modest idle interval. Each RPC is caught separately so
+  // one failing never blocks or erases the other's successful result; failures
+  // simply leave the panel showing Unavailable and never break the chat.
+  const pollThreadId = activeThread?.id;
+  const runtimeSessionId = activeThread?.runtimeSessionId ?? null;
+  useEffect(() => {
+    if (!pollThreadId || !runtimeSessionId) return;
+    let cancelled = false;
+    const refresh = async () => {
+      const patch: { usage?: NormalizedRuntimeUsage; contextBreakdown?: NormalizedContextBreakdown } = {};
+      try {
+        patch.usage = await getSessionUsage(connection, runtimeSessionId);
+      } catch {
+        // Usage RPC unavailable this round; keep prior data untouched.
+      }
+      try {
+        patch.contextBreakdown = await getSessionContextBreakdown(connection, runtimeSessionId);
+      } catch {
+        // Context RPC unavailable this round; keep prior data untouched.
+      }
+      if (!cancelled && (patch.usage !== undefined || 'contextBreakdown' in patch)) {
+        updateThreadRuntime(pollThreadId, patch);
+      }
+    };
+    void refresh();
+    const interval = setInterval(() => void refresh(), sending ? 2000 : 30000);
+    return () => {
+      cancelled = true;
+      clearInterval(interval);
+    };
+  }, [connection, pollThreadId, runtimeSessionId, sending, updateThreadRuntime]);
+
+  // Capability checks use the effective selection: the thread override if
+  // present, otherwise the model.options root profile default. Unknown
+  // capabilities permit sending; an explicit false blocks. Tool support is
+  // always required for agent turns; vision is only required when the prompt
+  // actually carries attachments (each queued prompt uses its own snapshot).
+  const effectiveSelection = useMemo(() => {
+    const override = activeThread?.modelOverride;
+    return {
+      provider: override?.provider ?? modelOptions.data?.provider ?? null,
+      model: override?.model ?? modelOptions.data?.model ?? null,
+    };
+  }, [activeThread?.modelOverride, modelOptions.data]);
+  const capabilityBlockers = useCallback(
+    (attachmentCount: number) => {
+      if (!effectiveSelection.provider || !effectiveSelection.model) return [];
+      const caps = selectedCapabilities(
+        modelOptions.data ?? { model: null, provider: null, providers: [] },
+        effectiveSelection.provider,
+        effectiveSelection.model,
+      );
+      return modelIncompatibilities(caps, { vision: attachmentCount > 0, tools: true });
+    },
+    [effectiveSelection, modelOptions.data],
+  );
+  const draftBlockers = useMemo(
+    () => capabilityBlockers(attachments.length),
+    [attachments.length, capabilityBlockers],
+  );
+  const sendBlocked = draftBlockers.length > 0;
+
   function openThread(id: string) {
     selectThread(id);
     setShowThreads(false);
@@ -193,6 +296,20 @@ export function ChatWorkspace({
   }
 
   const deliverPrompt = useCallback(async (queuedPrompt: QueuedPrompt, thread: ChatThread) => {
+    // Compatibility gate runs before any state changes or network activity:
+    // a blocked prompt is failed using its own attachment snapshot and never
+    // produces a Hermes request.
+    const promptBlockers = capabilityBlockers(queuedPrompt.attachments.length);
+    if (promptBlockers.length > 0) {
+      const message = blockerNotice(
+        promptBlockers,
+        effectiveSelection.provider,
+        effectiveSelection.model,
+      );
+      setSendError(message);
+      await failPrompt(thread.id, queuedPrompt.id, message);
+      return;
+    }
     const content = queuedPrompt.text.trim();
     const threadId = thread.id;
     const composerSessionId = useComposerStore.getState().sessionIds[threadId] || thread.importedSessionId || threadId;
@@ -200,9 +317,20 @@ export function ChatWorkspace({
       role: message.role,
       content: message.content,
     }));
+    // The override and session identity are frozen from the snapshot this
+    // prompt was claimed with; a mid-flight override change must not leak in.
+    const snapshotOverride = thread.modelOverride;
+    const runtimeOverrides = {
+      provider: snapshotOverride?.provider,
+      model: snapshotOverride?.model,
+      modelOptions: buildRuntimeModelOptions(snapshotOverride),
+      sessionId: thread.runtimeSessionId ?? thread.id,
+    };
     setSendError('');
     setSending(true);
     setStreamingText('');
+    setSendStartedAt(Date.now());
+    setElapsedLabel('0s');
     streamingTextRef.current = '';
     const controller = new AbortController();
     activeRequest.current = controller;
@@ -215,6 +343,8 @@ export function ChatWorkspace({
     try {
       let responseText = '';
       let responseId: string | undefined;
+      let responseUsage: unknown;
+      let responseSessionId: string | undefined;
       if (content.startsWith('/') && queuedPrompt.attachments.length === 0) {
         const command = await dispatchComposerCommand(connection, composerSessionId, content, queuedPrompt.id);
         responseText = commandResponseText(command);
@@ -234,6 +364,7 @@ export function ChatWorkspace({
               thread.needsHistorySeed || (!thread.lastResponseId && history.length)
                 ? history
                 : undefined,
+            ...runtimeOverrides,
             onTextDelta,
             signal: controller.signal,
             composerSessionId: connectorExpandsComposer ? composerSessionId : undefined,
@@ -246,6 +377,7 @@ export function ChatWorkspace({
           response = await sendResponseStream(connection, responseInput, {
             conversation: composerSessionId,
             conversationHistory: history,
+            ...runtimeOverrides,
             onTextDelta,
             signal: controller.signal,
             composerSessionId: connectorExpandsComposer ? composerSessionId : undefined,
@@ -254,6 +386,8 @@ export function ChatWorkspace({
         }
         responseText = hermesResponseText(response);
         responseId = response.id;
+        responseUsage = response.usage;
+        responseSessionId = response.session_id?.trim() || undefined;
       }
       addMessage(threadId, {
         id: createChatId('message'),
@@ -270,6 +404,10 @@ export function ChatWorkspace({
           createdAt: Date.now(),
         },
         responseId,
+        {
+          ...(responseUsage ? { usage: normalizeLiveUsage(responseUsage) } : {}),
+          runtimeSessionId: responseSessionId,
+        },
       );
       await finalizeAccepted(threadId, threadId, queuedPrompt.id);
       await Promise.all(queuedPrompt.attachments.map((attachment) =>
@@ -308,19 +446,31 @@ export function ChatWorkspace({
       if (activeRequest.current === controller) activeRequest.current = null;
       setSending(false);
       setStreamingText('');
+      setSendStartedAt(null);
+      setElapsedLabel('');
       streamingTextRef.current = '';
     }
-  }, [addMessage, completeResponse, connection, failPrompt, finalizeAccepted, sessions]);
+  }, [addMessage, capabilityBlockers, completeResponse, connection, effectiveSelection, failPrompt, finalizeAccepted, sessions]);
 
   useEffect(() => {
     if (!composerHydrated || !activeThread || sending || queuePaused) return;
+    // Block before claim: the head of the queue is gated with its own
+    // attachment snapshot; deliverPrompt re-checks before any Hermes request.
+    const nextPending = queue.find((item) => item.state === 'pending');
+    if (nextPending && capabilityBlockers(nextPending.attachments.length).length > 0) return;
     void claimNext(composerKey).then((nextPrompt) => {
       if (nextPrompt) void deliverPrompt(nextPrompt, activeThread);
     });
-  }, [activeThread, claimNext, composerHydrated, composerKey, deliverPrompt, queue, queuePaused, sending]);
+  }, [activeThread, capabilityBlockers, claimNext, composerHydrated, composerKey, deliverPrompt, queue, queuePaused, sending]);
 
   async function submitPrompt(deliveryMode: 'queue' | 'redirect' = 'queue') {
     if ((!prompt.trim() && attachments.length === 0) || !composerHydrated || !activeThread) return;
+    // Block before enqueue: the draft's own attachments decide the vision gate.
+    const blockers = capabilityBlockers(attachments.length);
+    if (blockers.length > 0) {
+      setSendError(blockerNotice(blockers, effectiveSelection.provider, effectiveSelection.model));
+      return;
+    }
     const queued = await enqueueDraft(activeThread.id, deliveryMode);
     if (!queued || deliveryMode !== 'redirect' || !sending) return;
     const current = queue.find((item) => item.state === 'sending');
@@ -432,7 +582,7 @@ export function ChatWorkspace({
                     createdAt: 0,
                   }}
                 />
-              ) : sending ? <ThinkingBubble /> : null}
+              ) : sending ? <ThinkingBubble elapsedLabel={elapsedLabel} /> : null}
             </ScrollView>
 
             <View style={[styles.composerArea, !wide && styles.composerAreaMobile]}>
@@ -453,6 +603,21 @@ export function ChatWorkspace({
                 <View style={[styles.errorBanner, { backgroundColor: colors.backgroundSelected }]}>
                   <ThemedText style={{ color: colors.danger }} type="small">
                     {sendError || composerStorageError}
+                  </ThemedText>
+                </View>
+              ) : null}
+              <SessionModelControls
+                onOverrideChange={(override) => setThreadModelOverride(activeThread.id, override)}
+                options={modelOptions.data}
+                optionsError={Boolean(modelOptions.error)}
+                optionsLoading={modelOptions.isLoading}
+                sessions={sessions.data?.sessions}
+                thread={activeThread}
+              />
+              {sendBlocked ? (
+                <View style={[styles.errorBanner, { backgroundColor: colors.backgroundSelected }]}>
+                  <ThemedText style={{ color: colors.warning }} type="small">
+                    {blockerNotice(draftBlockers, effectiveSelection.provider, effectiveSelection.model)}
                   </ThemedText>
                 </View>
               ) : null}
@@ -871,7 +1036,7 @@ function MessageBubble({ message }: { message: ChatMessage }) {
   );
 }
 
-function ThinkingBubble() {
+function ThinkingBubble({ elapsedLabel }: { elapsedLabel?: string }) {
   const colors = useTheme();
   return (
     <View style={styles.messageRow}>
@@ -880,7 +1045,9 @@ function ThinkingBubble() {
       </View>
       <View style={styles.thinkingRow}>
         <ActivityIndicator color={colors.textSecondary} size="small" />
-        <ThemedText themeColor="textSecondary" type="small">Brio is working…</ThemedText>
+        <ThemedText themeColor="textSecondary" type="small">
+          Brio is working…{elapsedLabel ? ` · ${elapsedLabel}` : ''}
+        </ThemedText>
       </View>
     </View>
   );
@@ -921,6 +1088,17 @@ function commandResponseText(value: Record<string, unknown>) {
 
 function hasContextReference(value: string) {
   return /@(file|folder|git|url|session):\S+|@(diff|staged)(?:\b|$)/.test(value);
+}
+
+function blockerNotice(
+  blockers: string[],
+  provider: string | null,
+  model: string | null,
+) {
+  const unsupported = blockers
+    .map((blocker) => (blocker === 'tools' ? 'tool calling' : 'image attachments'))
+    .join(' or ');
+  return `${provider}/${model} does not support ${unsupported}, which Brio agent turns require. Pick another model to send messages.`;
 }
 
 function normalizeTimestamp(value: number) {

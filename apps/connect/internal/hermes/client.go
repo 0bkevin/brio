@@ -106,6 +106,8 @@ func RoutePath(path string) Route {
 		return Route{Kind: RouteLocal, Path: path, Name: "composer-attachments"}
 	case "/api/sessions":
 		return Route{Kind: RouteForward, Path: path}
+	case "/api/model/options":
+		return Route{Kind: RouteForward, Path: path}
 	}
 	switch {
 	case strings.HasPrefix(path, "/attachments/"):
@@ -113,19 +115,36 @@ func RoutePath(path string) Route {
 	case strings.HasPrefix(path, "/v1/runs"), strings.HasPrefix(path, "/api/jobs"):
 		return Route{Kind: RouteForward, Path: path}
 	}
-	if isSessionMessagesPath(path) {
+	if isSessionMessagesPath(path) || isSessionDetailPath(path) || isSessionModelPath(path) {
 		return Route{Kind: RouteForward, Path: path}
 	}
 	return Route{Kind: RouteUnknown}
 }
 
 func isSessionMessagesPath(path string) bool {
+	return isSessionTailPath(path, "messages")
+}
+
+func isSessionDetailPath(path string) bool {
+	const prefix = "/api/sessions/"
+	if !strings.HasPrefix(path, prefix) {
+		return false
+	}
+	id := strings.TrimPrefix(path, prefix)
+	return id != "" && !strings.Contains(id, "/")
+}
+
+func isSessionModelPath(path string) bool {
+	return isSessionTailPath(path, "model")
+}
+
+func isSessionTailPath(path string, tail string) bool {
 	const prefix = "/api/sessions/"
 	if !strings.HasPrefix(path, prefix) {
 		return false
 	}
 	id, suffix, ok := strings.Cut(strings.TrimPrefix(path, prefix), "/")
-	return ok && suffix == "messages" && id != "" && !strings.Contains(id, "/")
+	return ok && suffix == tail && id != "" && !strings.Contains(id, "/")
 }
 
 func (c *Client) httpClient() *http.Client {
@@ -281,12 +300,22 @@ func streamEventStream(id string, resp *http.Response, emit func(tunnel.Frame) e
 					Type:    "stream_end",
 					ID:      id,
 					Status:  resp.StatusCode,
-					Headers: map[string]string{"Content-Type": resp.Header.Get("Content-Type")},
+					Headers: terminalStreamHeaders(resp),
 				})
 			}
 			return emit(errorFrame(id, "LOCAL_READ_FAILED", readErr.Error()))
 		}
 	}
+}
+
+// terminalStreamHeaders carries the content type plus the stable runtime
+// session identity so the mobile client can continue the session later.
+func terminalStreamHeaders(resp *http.Response) map[string]string {
+	headers := map[string]string{"Content-Type": resp.Header.Get("Content-Type")}
+	if sessionID := resp.Header.Get("X-Hermes-Session-Id"); sessionID != "" {
+		headers["X-Hermes-Session-Id"] = sessionID
+	}
+	return headers
 }
 
 func errorFrame(id string, code string, message string) tunnel.Frame {

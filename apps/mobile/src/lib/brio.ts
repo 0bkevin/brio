@@ -8,10 +8,28 @@ import {
 import {
   normalizeHermesSessionMessages,
   normalizeHermesSessions,
+  SESSION_ID_HEADER,
+  headerValue,
+  mergeRequestHeaders,
+  sessionIdentityHeaders,
+  type HermesModelOptions,
   type HermesSession,
   type HermesSessionMessage,
+  type HermesSessionModelLock,
+  type HermesSessionModelPayload,
 } from './hermes-api';
 import { ResponsesSSEParser, type HermesResponse } from './responses-sse';
+import {
+  responseRequestBody,
+  type ResponseRequestOptions,
+} from './response-request';
+import {
+  normalizeContextBreakdown,
+  normalizeLiveUsage,
+  normalizeModelOptions,
+  type NormalizedContextBreakdown,
+  type NormalizedRuntimeUsage,
+} from './session-runtime';
 
 export {
   aggregateRootAgentUsage,
@@ -20,8 +38,23 @@ export {
   parseHeartbeatStatus,
 } from './control-model';
 
+export {
+  normalizeContextBreakdown,
+  normalizeLiveUsage,
+  normalizeModelOptions,
+} from './session-runtime';
+
 export type { HermesResponse } from './responses-sse';
-export type { HermesSession, HermesSessionMessage } from './hermes-api';
+export type { NormalizedContextBreakdown, NormalizedRuntimeUsage } from './session-runtime';
+export type {
+  HermesContextBreakdown,
+  HermesLiveUsage,
+  HermesModelOptions,
+  HermesSession,
+  HermesSessionMessage,
+  HermesSessionModelLock,
+  HermesSessionModelPayload,
+} from './hermes-api';
 
 export type AgentConnection = {
   id: string;
@@ -538,28 +571,25 @@ function withSubgoals(goal: HermesGoalStatus | null, output: string) {
   return { ...goal, subgoalCount: Math.max(goal.subgoalCount, subgoals.length), subgoals };
 }
 
+export type { ResponseRequestOptions };
+
 export async function sendResponse(
   connection: Pick<AgentConnection, 'url' | 'token'> & Partial<AgentConnection>,
   prompt: string,
-  options: {
-    conversation?: string;
-    previousResponseId?: string;
-    conversationHistory?: { role: string; content: string }[];
-  } = {},
+  options: ResponseRequestOptions = {},
 ) {
+  const sessionHeaders = sessionIdentityHeaders(options.sessionId);
   return brioFetch<HermesResponse>(connection, '/v1/responses', {
     method: 'POST',
     body: JSON.stringify(responseRequestBody(prompt, options, false)),
+    ...(sessionHeaders ? { headers: sessionHeaders } : {}),
   });
 }
 
 export async function sendResponseStream(
   connection: Pick<AgentConnection, 'url' | 'token'> & Partial<AgentConnection>,
   prompt: unknown,
-  options: {
-    conversation?: string;
-    previousResponseId?: string;
-    conversationHistory?: { role: string; content: string }[];
+  options: ResponseRequestOptions & {
     onTextDelta?: (delta: string) => void;
     signal?: AbortSignal;
     composerSessionId?: string;
@@ -568,15 +598,25 @@ export async function sendResponseStream(
 ) {
   const parser = new ResponsesSSEParser(options.onTextDelta);
   const body = JSON.stringify(responseRequestBody(prompt, options, true));
+  const sessionHeaders = sessionIdentityHeaders(options.sessionId);
 
   if (connection.transport === 'relay') {
+    let terminalSessionId = '';
     await relayFetch<null>(
       connection,
       '/v1/responses',
-      { method: 'POST', body, signal: options.signal },
+      {
+        method: 'POST',
+        body,
+        signal: options.signal,
+        ...(sessionHeaders ? { headers: sessionHeaders } : {}),
+      },
       (chunk) => parser.push(chunk),
+      (headers) => {
+        terminalSessionId = headerValue(headers, SESSION_ID_HEADER)?.trim() ?? '';
+      },
     );
-    return parser.finish();
+    return withFallbackSessionId(parser.finish(), terminalSessionId);
   }
 
   const response = await expoFetch(`${normalizeBaseURL(connection.url)}/v1/responses`, {
@@ -585,10 +625,12 @@ export async function sendResponseStream(
       Accept: 'text/event-stream, application/json',
       'Content-Type': 'application/json',
       Authorization: `Bearer ${connection.token}`,
+      ...(sessionHeaders ?? {}),
     },
     body,
     signal: options.signal,
   });
+  const directSessionId = response.headers.get(SESSION_ID_HEADER)?.trim() ?? '';
   const contentType = response.headers.get('Content-Type')?.toLowerCase() ?? '';
   if (!response.ok || !contentType.includes('text/event-stream')) {
     const text = await response.text();
@@ -598,7 +640,7 @@ export async function sendResponseStream(
       throw new Error(error ?? `Request failed: ${response.status}`);
     }
     if (!result) throw new Error('Agent returned an empty response');
-    return result;
+    return withFallbackSessionId(result, directSessionId);
   }
 
   const reader = response.body?.getReader();
@@ -610,34 +652,15 @@ export async function sendResponseStream(
     parser.push(decoder.decode(value, { stream: true }));
   }
   parser.push(decoder.decode());
-  return parser.finish();
+  return withFallbackSessionId(parser.finish(), directSessionId);
 }
 
-function responseRequestBody(
-  prompt: unknown,
-  options: {
-    conversation?: string;
-    previousResponseId?: string;
-    conversationHistory?: { role: string; content: string }[];
-    composerSessionId?: string;
-    attachmentIds?: string[];
-  },
-  stream: boolean,
-) {
-  return {
-    model: 'hermes-agent',
-    input: prompt,
-    stream,
-    ...(options.composerSessionId ? { brio_session_id: options.composerSessionId } : {}),
-    ...(options.attachmentIds?.length ? { brio_attachments: options.attachmentIds } : {}),
-    ...(options.previousResponseId
-      ? { previous_response_id: options.previousResponseId }
-      : options.conversationHistory?.length
-        ? { conversation: options.conversation, conversation_history: options.conversationHistory }
-        : options.conversation
-          ? { conversation: options.conversation }
-          : {}),
-  };
+// A session id from the body always wins; transport headers only fill the gap.
+function withFallbackSessionId(response: HermesResponse, headerSessionId: string): HermesResponse {
+  if (!response.session_id?.trim() && headerSessionId) {
+    response.session_id = headerSessionId;
+  }
+  return response;
 }
 
 export async function listHermesSessions(
@@ -657,6 +680,76 @@ export async function getHermesSessionMessages(
     `/api/sessions/${encodeURIComponent(sessionId)}/messages`,
   );
   return normalizeHermesSessionMessages(result);
+}
+
+export async function listHermesModelOptions(
+  connection: Pick<AgentConnection, 'url' | 'token'> & Partial<AgentConnection>,
+  refresh = false,
+): Promise<HermesModelOptions> {
+  const result = await brioFetch<unknown>(
+    connection,
+    `/api/model/options${refresh ? '?refresh=1' : ''}`,
+  );
+  return normalizeModelOptions(result);
+}
+
+export async function getHermesSession(
+  connection: Pick<AgentConnection, 'url' | 'token'> & Partial<AgentConnection>,
+  sessionId: string,
+): Promise<HermesSession> {
+  if (!sessionId.trim()) {
+    throw new Error('getHermesSession requires a non-empty session id');
+  }
+  const result = await brioFetch<{ session?: HermesSession } | HermesSession>(
+    connection,
+    `/api/sessions/${encodeURIComponent(sessionId)}`,
+  );
+  const session =
+    typeof result === 'object' && result !== null && 'session' in result && result.session
+      ? result.session
+      : (result as HermesSession);
+  if (!session || typeof session !== 'object' || typeof session.id !== 'string') {
+    throw new Error(`getHermesSession received no valid session for id ${sessionId}`);
+  }
+  return session;
+}
+
+export async function setHermesSessionModel(
+  connection: Pick<AgentConnection, 'url' | 'token'> & Partial<AgentConnection>,
+  sessionId: string,
+  payload: HermesSessionModelPayload,
+): Promise<HermesSessionModelLock> {
+  if (!sessionId.trim()) {
+    throw new Error('setHermesSessionModel requires a non-empty session id');
+  }
+  return brioFetch<HermesSessionModelLock>(
+    connection,
+    `/api/sessions/${encodeURIComponent(sessionId)}/model`,
+    { method: 'POST', body: JSON.stringify(payload) },
+  );
+}
+
+// Control-RPC reads for live session telemetry. These intentionally surface
+// failures (unknown method, offline agent, ...) so the UI can mark the data
+// as unavailable instead of guessing.
+export async function getSessionUsage(
+  connection: AgentConnection,
+  runtimeSessionId: string,
+): Promise<NormalizedRuntimeUsage> {
+  const result = await controlRPC<unknown>(connection, 'session.usage', {
+    session_id: runtimeSessionId,
+  }, false, runtimeSessionId);
+  return normalizeLiveUsage(result);
+}
+
+export async function getSessionContextBreakdown(
+  connection: AgentConnection,
+  runtimeSessionId: string,
+): Promise<NormalizedContextBreakdown | undefined> {
+  const result = await controlRPC<unknown>(connection, 'session.context_breakdown', {
+    session_id: runtimeSessionId,
+  }, false, runtimeSessionId);
+  return normalizeContextBreakdown(result);
 }
 
 export function hermesResponseText(response: HermesResponse) {
@@ -888,6 +981,7 @@ type PendingRelayRequest = {
   timer: ReturnType<typeof setTimeout>;
   chunks: unknown[];
   onChunk?: (chunk: string) => void;
+  onTerminalHeaders?: (headers: Record<string, string>) => void;
   signal?: AbortSignal;
   abort?: () => void;
 };
@@ -908,6 +1002,7 @@ class RelaySocketClient {
     frame: RelayFrame,
     timeoutMs = 5 * 60 * 1000,
     onChunk?: (chunk: string) => void,
+    onTerminalHeaders?: (headers: Record<string, string>) => void,
     signal?: AbortSignal,
   ): Promise<T> {
     return this.connect().then(
@@ -942,6 +1037,7 @@ class RelaySocketClient {
             timer,
             chunks: [],
             onChunk,
+            onTerminalHeaders,
             signal,
             abort,
           });
@@ -1051,6 +1147,7 @@ class RelaySocketClient {
     }
 
     if (frame.type === 'stream_end') {
+      pending.onTerminalHeaders?.(frame.headers ?? {});
       if (pending.onChunk) {
         pending.resolve(null);
         return;
@@ -1116,6 +1213,7 @@ function relayFetch<T>(
   path: string,
   init: RequestInit,
   onChunk?: (chunk: string) => void,
+  onTerminalHeaders?: (headers: Record<string, string>) => void,
 ): Promise<T> {
   const agentId = connection.agentId ?? connection.id;
   if (!agentId) {
@@ -1134,9 +1232,9 @@ function relayFetch<T>(
     id: frameId,
     method: init.method ?? 'GET',
     path,
-    headers: {
-      Authorization: `Bearer ${connection.token}`,
-    },
+    // Caller headers ride along on top of the agent Authorization instead of
+    // being discarded (for example X-Hermes-Session-Id).
+    headers: mergeRequestHeaders(`Bearer ${connection.token}`, init.headers),
     body,
   };
 
@@ -1145,7 +1243,13 @@ function relayFetch<T>(
     client = new RelaySocketClient(wsURL);
     relayClients.set(wsURL, client);
   }
-  return client.request<T>(requestFrame, 5 * 60 * 1000, onChunk, init.signal ?? undefined);
+  return client.request<T>(
+    requestFrame,
+    5 * 60 * 1000,
+    onChunk,
+    onTerminalHeaders,
+    init.signal ?? undefined,
+  );
 }
 
 function relayTunnelURL(baseURL: string, agentId: string, relayToken: string) {
