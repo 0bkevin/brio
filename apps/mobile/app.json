@@ -29,7 +29,37 @@
           "resizeMode": "contain"
         }
       ],
-      "expo-secure-store"
+      "expo-secure-store",
+      "expo-document-picker",
+      [
+        "expo-image-picker",
+        {
+          "photosPermission": "Allow Brio to attach photos as Hermes context.",
+          "cameraPermission": "Allow Brio to take a photo and attach it as Hermes context.",
+          "microphonePermission": false
+        }
+      ],
+      [
+        "expo-sharing",
+        {
+          "ios": {
+            "enabled": true,
+            "activationRule": {
+              "supportsAttachmentsWithMaxCount": 10,
+              "supportsFileWithMaxCount": 10,
+              "supportsImageWithMaxCount": 10,
+              "supportsText": true,
+              "supportsWebPageWithMaxCount": 1,
+              "supportsWebUrlWithMaxCount": 1
+            }
+          },
+          "android": {
+            "enabled": true,
+            "singleShareMimeTypes": ["*/*"],
+            "multipleShareMimeTypes": ["*/*"]
+          }
+        }
+      ]
     ],
     "experiments": {
       "typedRoutes": true,

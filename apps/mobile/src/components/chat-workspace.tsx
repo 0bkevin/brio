@@ -15,13 +15,18 @@ import {
 import { SafeAreaView } from 'react-native-safe-area-context';
 
 import { ThemedText } from '@/components/themed-text';
+import { ComposerControls } from '@/components/composer-controls';
 import { Spacing } from '@/constants/theme';
 import { useTheme } from '@/hooks/use-theme';
 import {
   getHermesSessionMessages,
   hermesResponseText,
+  interruptComposerSession,
   isAgentHealthy,
   listHermesSessions,
+  dispatchComposerCommand,
+  prepareComposerPrompt,
+  deleteAttachmentUpload,
   sendResponseStream,
   type AgentConnection,
   type HealthResponse,
@@ -56,6 +61,9 @@ export function ChatWorkspace({
   const { width } = useWindowDimensions();
   const wide = width >= 920;
   const scrollRef = useRef<ScrollView>(null);
+  const activeRequest = useRef<AbortController | null>(null);
+  const redirectOutcomes = useRef(new Map<string, Promise<boolean>>());
+  const streamingTextRef = useRef('');
   const hydrated = useChatStore((state) => state.hydrated);
   const threads = useChatStore((state) => state.threads);
   const activeThreadId = useChatStore((state) => state.activeThreadId);
@@ -92,15 +100,26 @@ export function ChatWorkspace({
   const composerKey = activeThread?.id ?? '';
   const composerHydrated = useComposerStore((state) => state.hydrated);
   const prompt = useComposerStore((state) => state.drafts[composerKey] ?? '');
+  const attachments = useComposerStore((state) => state.attachments[composerKey] ?? []);
   const queue = useComposerStore((state) => state.queues[composerKey] ?? EMPTY_PROMPT_QUEUE);
   const queuePaused = useComposerStore((state) => Boolean(state.paused[composerKey]));
+  const promptHistory = useComposerStore((state) => state.promptHistory[composerKey] ?? []);
+  const draftRevisions = useComposerStore((state) => state.draftRevisions[composerKey]);
+  const composerStorageError = useComposerStore((state) => state.storageError);
+  const sessionId = useComposerStore((state) => state.sessionIds[composerKey]) || activeThread?.importedSessionId || composerKey;
   const setDraft = useComposerStore((state) => state.setDraft);
+  const ensureSessionId = useComposerStore((state) => state.ensureSessionId);
+  const addAttachment = useComposerStore((state) => state.addAttachment);
+  const removeAttachment = useComposerStore((state) => state.removeAttachment);
   const enqueueDraft = useComposerStore((state) => state.enqueueDraft);
+  const undoDraft = useComposerStore((state) => state.undoDraft);
+  const redoDraft = useComposerStore((state) => state.redoDraft);
   const claimNext = useComposerStore((state) => state.claimNext);
-  const acknowledgePrompt = useComposerStore((state) => state.acknowledge);
+  const finalizeAccepted = useComposerStore((state) => state.finalizeAccepted);
   const failPrompt = useComposerStore((state) => state.fail);
   const retryPrompt = useComposerStore((state) => state.retry);
   const removePrompt = useComposerStore((state) => state.remove);
+  const editPrompt = useComposerStore((state) => state.edit);
   const movePrompt = useComposerStore((state) => state.move);
   const setQueuePaused = useComposerStore((state) => state.setPaused);
   const sortedThreads = useMemo(
@@ -128,6 +147,11 @@ export function ChatWorkspace({
     const timer = setTimeout(() => scrollRef.current?.scrollToEnd({ animated: true }), 80);
     return () => clearTimeout(timer);
   }, [activeThread?.messages.length, sending, streamingText]);
+
+  useEffect(() => {
+    if (!composerHydrated || !activeThread) return;
+    void ensureSessionId(activeThread.id, activeThread.importedSessionId || activeThread.id);
+  }, [activeThread, composerHydrated, ensureSessionId]);
 
   function openThread(id: string) {
     selectThread(id);
@@ -171,6 +195,7 @@ export function ChatWorkspace({
   const deliverPrompt = useCallback(async (queuedPrompt: QueuedPrompt, thread: ChatThread) => {
     const content = queuedPrompt.text.trim();
     const threadId = thread.id;
+    const composerSessionId = useComposerStore.getState().sessionIds[threadId] || thread.importedSessionId || threadId;
     const history = thread.messages.map((message) => ({
       role: message.role,
       content: message.content,
@@ -178,36 +203,62 @@ export function ChatWorkspace({
     setSendError('');
     setSending(true);
     setStreamingText('');
+    streamingTextRef.current = '';
+    const controller = new AbortController();
+    activeRequest.current = controller;
 
     const onTextDelta = (delta: string) => {
+      streamingTextRef.current += delta;
       setStreamingText((current) => current + delta);
     };
 
     try {
-      let response;
-      try {
-        response = await sendResponseStream(connection, content, {
-          conversation: threadId,
-          previousResponseId: thread.lastResponseId,
-          conversationHistory:
-            thread.needsHistorySeed || (!thread.lastResponseId && history.length)
-              ? history
-              : undefined,
-          onTextDelta,
-        });
-      } catch (error) {
-        if (!thread.lastResponseId) throw error;
-        setStreamingText('');
-        response = await sendResponseStream(connection, content, {
-          conversation: threadId,
-          conversationHistory: history,
-          onTextDelta,
-        });
+      let responseText = '';
+      let responseId: string | undefined;
+      if (content.startsWith('/') && queuedPrompt.attachments.length === 0) {
+        const command = await dispatchComposerCommand(connection, composerSessionId, content, queuedPrompt.id);
+        responseText = commandResponseText(command);
+      } else {
+        const attachmentIds = queuedPrompt.attachments.map((attachment) => attachment.id);
+        const connectorExpandsComposer = connection.transport === 'relay';
+        const requiresDirectPreparation = attachmentIds.length > 0 || hasContextReference(content);
+        const responseInput = !connectorExpandsComposer && requiresDirectPreparation
+          ? (await prepareComposerPrompt(connection, content, composerSessionId, attachmentIds)).input
+          : content;
+        let response;
+        try {
+          response = await sendResponseStream(connection, responseInput, {
+            conversation: composerSessionId,
+            previousResponseId: thread.lastResponseId,
+            conversationHistory:
+              thread.needsHistorySeed || (!thread.lastResponseId && history.length)
+                ? history
+                : undefined,
+            onTextDelta,
+            signal: controller.signal,
+            composerSessionId: connectorExpandsComposer ? composerSessionId : undefined,
+            attachmentIds: connectorExpandsComposer ? attachmentIds : undefined,
+          });
+        } catch (error) {
+          if (!thread.lastResponseId || controller.signal.aborted) throw error;
+          streamingTextRef.current = '';
+          setStreamingText('');
+          response = await sendResponseStream(connection, responseInput, {
+            conversation: composerSessionId,
+            conversationHistory: history,
+            onTextDelta,
+            signal: controller.signal,
+            composerSessionId: connectorExpandsComposer ? composerSessionId : undefined,
+            attachmentIds: connectorExpandsComposer ? attachmentIds : undefined,
+          });
+        }
+        responseText = hermesResponseText(response);
+        responseId = response.id;
       }
       addMessage(threadId, {
         id: createChatId('message'),
         role: 'user',
-        content,
+        content: displayPrompt(queuedPrompt),
         createdAt: queuedPrompt.createdAt,
       });
       completeResponse(
@@ -215,22 +266,51 @@ export function ChatWorkspace({
         {
           id: createChatId('message'),
           role: 'assistant',
-          content: hermesResponseText(response),
+          content: responseText,
           createdAt: Date.now(),
         },
-        response.id,
+        responseId,
       );
-      await acknowledgePrompt(threadId, queuedPrompt.id);
+      await finalizeAccepted(threadId, threadId, queuedPrompt.id);
+      await Promise.all(queuedPrompt.attachments.map((attachment) =>
+        deleteAttachmentUpload(connection, attachment.id).catch(() => undefined),
+      ));
       void sessions.refetch();
     } catch (error) {
+      const redirectOutcome = redirectOutcomes.current.get(queuedPrompt.id);
+      if (redirectOutcome && await redirectOutcome) {
+        redirectOutcomes.current.delete(queuedPrompt.id);
+        addMessage(threadId, {
+          id: createChatId('message'),
+          role: 'user',
+          content: displayPrompt(queuedPrompt),
+          createdAt: queuedPrompt.createdAt,
+        });
+        if (streamingTextRef.current.trim()) {
+          completeResponse(threadId, {
+            id: createChatId('message'),
+            role: 'assistant',
+            content: `${streamingTextRef.current.trim()}\n\n[Interrupted by redirect]`,
+            createdAt: Date.now(),
+          });
+        }
+        await finalizeAccepted(threadId, threadId, queuedPrompt.id);
+        await Promise.all(queuedPrompt.attachments.map((attachment) =>
+          deleteAttachmentUpload(connection, attachment.id).catch(() => undefined),
+        ));
+        void sessions.refetch();
+        return;
+      }
       const message = error instanceof Error ? error.message : 'Brio could not complete the request';
       setSendError(message);
       await failPrompt(threadId, queuedPrompt.id, message);
     } finally {
+      if (activeRequest.current === controller) activeRequest.current = null;
       setSending(false);
       setStreamingText('');
+      streamingTextRef.current = '';
     }
-  }, [acknowledgePrompt, addMessage, completeResponse, connection, failPrompt, sessions]);
+  }, [addMessage, completeResponse, connection, failPrompt, finalizeAccepted, sessions]);
 
   useEffect(() => {
     if (!composerHydrated || !activeThread || sending || queuePaused) return;
@@ -239,16 +319,41 @@ export function ChatWorkspace({
     });
   }, [activeThread, claimNext, composerHydrated, composerKey, deliverPrompt, queue, queuePaused, sending]);
 
-  async function submitPrompt(value = prompt) {
-    const content = value.trim();
-    if (!content || !composerHydrated || !activeThread) return;
-    await enqueueDraft(activeThread.id, content);
+  async function submitPrompt(deliveryMode: 'queue' | 'redirect' = 'queue') {
+    if ((!prompt.trim() && attachments.length === 0) || !composerHydrated || !activeThread) return;
+    const queued = await enqueueDraft(activeThread.id, deliveryMode);
+    if (!queued || deliveryMode !== 'redirect' || !sending) return;
+    const current = queue.find((item) => item.state === 'sending');
+    if (!current) return;
+    let settleRedirect: (accepted: boolean) => void = () => undefined;
+    const redirectOutcome = new Promise<boolean>((resolve) => { settleRedirect = resolve; });
+    redirectOutcomes.current.set(current.id, redirectOutcome);
+    try {
+      await interruptComposerSession(connection, sessionId);
+      settleRedirect(true);
+      activeRequest.current?.abort();
+    } catch (error) {
+      settleRedirect(false);
+      redirectOutcomes.current.delete(current.id);
+      // The run may have completed naturally while the interrupt was in
+      // flight. In that case the redirect remains a normal queued prompt.
+      if (!activeRequest.current) return;
+      const message = error instanceof Error ? error.message : 'Could not redirect the active run';
+      setSendError(message);
+      await failPrompt(activeThread.id, queued.id, message);
+    }
   }
 
   function editQueuedPrompt(queuedPrompt: QueuedPrompt) {
-    if (!activeThread || prompt.trim()) return;
-    setDraft(activeThread.id, queuedPrompt.text);
-    void removePrompt(activeThread.id, queuedPrompt.id);
+    if (!activeThread || prompt.trim() || attachments.length) return;
+    void editPrompt(activeThread.id, queuedPrompt.id);
+  }
+
+  async function deleteQueuedPrompt(queuedPrompt: QueuedPrompt) {
+    if (!activeThread || !(await removePrompt(activeThread.id, queuedPrompt.id))) return;
+    await Promise.all(queuedPrompt.attachments.map((attachment) =>
+      deleteAttachmentUpload(connection, attachment.id).catch(() => undefined),
+    ));
   }
 
   if (!hydrated || !activeThread) {
@@ -334,55 +439,40 @@ export function ChatWorkspace({
               {queue.length > 0 ? (
                 <PromptQueue
                   activePromptId={sending ? queue.find((item) => item.state === 'sending')?.id : undefined}
-                  draftOccupied={Boolean(prompt.trim())}
+                  draftOccupied={Boolean(prompt.trim()) || attachments.length > 0}
                   onEdit={editQueuedPrompt}
                   onMove={(promptId, offset) => void movePrompt(composerKey, promptId, offset)}
                   onPause={() => void setQueuePaused(composerKey, !queuePaused)}
-                  onRemove={(promptId) => void removePrompt(composerKey, promptId)}
+                  onRemove={(queuedPrompt) => void deleteQueuedPrompt(queuedPrompt)}
                   onRetry={(promptId) => void retryPrompt(composerKey, promptId)}
                   paused={queuePaused}
                   prompts={queue}
                 />
               ) : null}
-              {sendError ? (
+              {sendError || composerStorageError ? (
                 <View style={[styles.errorBanner, { backgroundColor: colors.backgroundSelected }]}>
                   <ThemedText style={{ color: colors.danger }} type="small">
-                    {sendError}
+                    {sendError || composerStorageError}
                   </ThemedText>
                 </View>
               ) : null}
-              <View style={[styles.composer, { backgroundColor: colors.panelStrong, borderColor: colors.border }]}>
-                <TextInput
-                  accessibilityLabel="Message Brio"
-                  maxLength={20000}
-                  multiline
-                  onChangeText={(value) => setDraft(composerKey, value)}
-                  placeholder={sending ? 'Queue a follow-up…' : 'Message Brio…'}
-                  placeholderTextColor={colors.textTertiary}
-                  style={[styles.composerInput, { color: colors.text }]}
-                  textAlignVertical="top"
-                  value={prompt}
-                />
-                <Pressable
-                  accessibilityLabel="Send message"
-                  disabled={!composerHydrated || !prompt.trim()}
-                  onPress={() => void submitPrompt()}
-                  style={({ pressed }) => [
-                    styles.sendButton,
-                    {
-                      backgroundColor: prompt.trim() && composerHydrated ? colors.accent : colors.backgroundSelected,
-                      opacity: pressed ? 0.72 : 1,
-                    },
-                  ]}>
-                  <ThemedText
-                    style={{
-                      color: prompt.trim() && composerHydrated ? colors.accentText : colors.textDisabled,
-                      fontSize: 20,
-                    }}>
-                    ↑
-                  </ThemedText>
-                </Pressable>
-              </View>
+              <ComposerControls
+                active={sending}
+                attachments={attachments}
+                canRedo={Boolean(draftRevisions?.future.length)}
+                canUndo={Boolean(draftRevisions?.past.length)}
+                connection={connection}
+                draft={prompt}
+                history={promptHistory}
+                hydrated={composerHydrated}
+                onAddAttachment={(attachment) => addAttachment(composerKey, attachment)}
+                onDraftChange={(value) => setDraft(composerKey, value)}
+                onRedo={() => redoDraft(composerKey)}
+                onRemoveAttachment={(attachmentId) => removeAttachment(composerKey, attachmentId)}
+                onSend={(mode) => void submitPrompt(mode)}
+                onUndo={() => undoDraft(composerKey)}
+                sessionId={sessionId}
+              />
               {wide ? (
                 <ThemedText style={styles.composerHint} themeColor="textTertiary" type="small">
                   Brio can make mistakes. Review important work.
@@ -412,7 +502,7 @@ function PromptQueue({
   onEdit: (prompt: QueuedPrompt) => void;
   onMove: (promptId: string, offset: -1 | 1) => void;
   onPause: () => void;
-  onRemove: (promptId: string) => void;
+  onRemove: (prompt: QueuedPrompt) => void;
   onRetry: (promptId: string) => void;
   paused: boolean;
   prompts: QueuedPrompt[];
@@ -447,7 +537,7 @@ function PromptQueue({
           return (
             <View key={queuedPrompt.id} style={[styles.queueItem, { borderColor: colors.border }]}>
               <View style={styles.queueCopy}>
-                <ThemedText numberOfLines={2} type="smallBold">{queuedPrompt.text}</ThemedText>
+                <ThemedText numberOfLines={2} type="smallBold">{displayPrompt(queuedPrompt)}</ThemedText>
                 <ThemedText numberOfLines={2} themeColor="textTertiary" type="small">{status}</ThemedText>
               </View>
               {!sending ? (
@@ -475,7 +565,7 @@ function PromptQueue({
                       onPress={() => onEdit(queuedPrompt)}
                     />
                   ) : null}
-                  <QueueAction label="Delete" onPress={() => onRemove(queuedPrompt.id)} tone="danger" />
+                  <QueueAction label="Delete" onPress={() => onRemove(queuedPrompt)} tone="danger" />
                 </View>
               ) : null}
             </View>
@@ -811,6 +901,28 @@ function IconButton({ label, onPress, symbol }: { label: string; onPress: () => 
   );
 }
 
+function displayPrompt(prompt: QueuedPrompt) {
+  const attachmentNames = prompt.attachments.map((attachment) => `📎 ${attachment.name}`);
+  return [prompt.deliveryMode === 'redirect' ? '↪ Redirect' : '', prompt.text.trim(), ...attachmentNames]
+    .filter(Boolean)
+    .join('\n');
+}
+
+function commandResponseText(value: Record<string, unknown>) {
+  for (const key of ['output', 'message', 'notice', 'display']) {
+    if (typeof value[key] === 'string' && value[key].trim()) return value[key].trim();
+  }
+  const nested = value.result;
+  if (nested && typeof nested === 'object' && !Array.isArray(nested)) {
+    return commandResponseText(nested as Record<string, unknown>);
+  }
+  return 'Hermes completed the command.';
+}
+
+function hasContextReference(value: string) {
+  return /@(file|folder|git|url|session):\S+|@(diff|staged)(?:\b|$)/.test(value);
+}
+
 function normalizeTimestamp(value: number) {
   return value < 10_000_000_000 ? value * 1000 : value;
 }
@@ -887,8 +999,5 @@ const styles = StyleSheet.create({
   queueCopy: { flex: 1, gap: 2, minWidth: 0 },
   queueActions: { alignItems: 'center', flexDirection: 'row', flexWrap: 'wrap', gap: Spacing.two, justifyContent: 'flex-end' },
   errorBanner: { borderRadius: 10, marginBottom: Spacing.two, paddingHorizontal: Spacing.three, paddingVertical: Spacing.two },
-  composer: { alignItems: 'flex-end', borderRadius: 18, borderWidth: StyleSheet.hairlineWidth, flexDirection: 'row', gap: Spacing.two, minHeight: 58, padding: Spacing.two, paddingLeft: Spacing.three },
-  composerInput: { flex: 1, fontSize: 16, lineHeight: 23, maxHeight: 150, minHeight: 40, outlineStyle: 'none', paddingBottom: 8, paddingTop: 8 } as never,
-  sendButton: { alignItems: 'center', borderRadius: 13, height: 42, justifyContent: 'center', width: 42 },
   composerHint: { marginTop: Spacing.one, textAlign: 'center' },
 });
