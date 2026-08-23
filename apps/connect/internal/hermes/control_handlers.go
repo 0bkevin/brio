@@ -694,6 +694,15 @@ func decodeJSONBody(r *http.Request, target any) error {
 	if len(data) > 64*1024 {
 		return fmt.Errorf("request body is too large")
 	}
+	if err := decodeStrictJSON(data, target); err != nil {
+		return err
+	}
+	return nil
+}
+
+// decodeStrictJSON decodes exactly one JSON value into target, rejecting
+// unknown fields and trailing content.
+func decodeStrictJSON(data []byte, target any) error {
 	decoder := json.NewDecoder(strings.NewReader(string(data)))
 	decoder.DisallowUnknownFields()
 	if err := decoder.Decode(target); err != nil {

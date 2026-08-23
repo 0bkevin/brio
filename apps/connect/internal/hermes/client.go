@@ -1,15 +1,23 @@
 // Package hermes routes tunnel request frames: a fixed set of paths is
 // forwarded to the stock Hermes API server with the local API key, memory is
 // served from the Hermes home directory, and everything else is rejected.
+// Every route can additionally be scoped to a Hermes profile through the
+// `/p/<profile>/...` prefix: forwarded requests keep their prefix upstream
+// (multiplexed gateway semantics) and authenticate with that profile's own
+// credentials, while local routes operate on the profile's home directory.
 package hermes
 
 import (
 	"bufio"
 	"bytes"
 	"context"
+	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
+	"path/filepath"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -22,19 +30,32 @@ type Client struct {
 	// BaseURL is the Hermes API server base URL (for example
 	// http://127.0.0.1:8642).
 	BaseURL string
-	// APIKey is the API_SERVER_KEY bearer used for forwarded requests.
+	// APIKey is the API_SERVER_KEY bearer used for default-scope requests.
 	APIKey string
 	// Home is the Hermes home directory (~/.hermes).
 	Home string
-	// ControlBaseURL is the Hermes serve JSON-RPC endpoint.
+	// ControlBaseURL is the Hermes serve JSON-RPC endpoint for the machine.
 	ControlBaseURL string
 	// ControlToken authenticates the Hermes serve WebSocket session.
 	ControlToken string
+	// ControlOverrides maps a named profile to its dedicated `hermes serve`
+	// control endpoint. The default scope always uses ControlBaseURL and
+	// ControlToken.
+	ControlOverrides map[string]ControlEndpoint
 
 	HTTP *http.Client
 
-	controlOnce sync.Once
-	controlApp  *app
+	controlOnce  sync.Once
+	controlApp   *app
+	profileApps  sync.Map // profile name -> *app
+	profilesOnce sync.Once
+	profileMgr   *ProfileManager
+}
+
+// ControlEndpoint points at one `hermes serve` control plane instance.
+type ControlEndpoint struct {
+	BaseURL string
+	Token   string
 }
 
 const (
@@ -60,13 +81,23 @@ type Route struct {
 	Kind RouteKind
 	// Path is the forwarded path after legacy alias mapping.
 	Path string
-	// Name identifies the local handler ("memory").
+	// Name identifies the local handler ("memory", "profiles", ...).
 	Name string
+	// Profile scopes the request to a Hermes profile via /p/<profile>/...
+	// routing. Empty means the default/unscoped home.
+	Profile string
 }
 
 // RoutePath maps a request path (without query string) to a route. Legacy
-// companion-era aliases are mapped to their /v1 equivalents.
+// companion-era aliases are mapped to their /v1 equivalents. A `/p/<profile>`
+// prefix scopes the remaining path to that profile while keeping the
+// remainder's leading slash intact so it classifies like any other request.
 func RoutePath(path string) Route {
+	if profile, rest, ok := splitProfilePrefix(path); ok {
+		route := RoutePath(rest)
+		route.Profile = profile
+		return route
+	}
 	switch path {
 	case "/health":
 		return Route{Kind: RouteForward, Path: "/health"}
@@ -84,10 +115,14 @@ func RoutePath(path string) Route {
 		return Route{Kind: RouteLocal, Name: "control-background"}
 	case "/control/events":
 		return Route{Kind: RouteLocal, Name: "control-events"}
-	case "/api/sessions":
-		return Route{Kind: RouteForward, Path: path}
+	case "/api/profiles":
+		return Route{Kind: RouteLocal, Name: "profiles"}
 	}
 	switch {
+	case strings.HasPrefix(path, "/api/profiles/"):
+		return Route{Kind: RouteLocal, Name: "profiles"}
+	case path == "/api/sessions":
+		return Route{Kind: RouteForward, Path: path}
 	case strings.HasPrefix(path, "/v1/runs"), strings.HasPrefix(path, "/api/jobs"):
 		return Route{Kind: RouteForward, Path: path}
 	}
@@ -95,6 +130,28 @@ func RoutePath(path string) Route {
 		return Route{Kind: RouteForward, Path: path}
 	}
 	return Route{Kind: RouteUnknown}
+}
+
+// splitProfilePrefix recognizes `/p/<name>` and `/p/<name>/...` prefixes for
+// NAMED profiles. The remaining path keeps its leading slash so it can be
+// routed exactly like an unprefixed request. `default` is rejected as a
+// prefix target because unprefixed requests already address the stock home;
+// unknown names are rejected later against the real filesystem in Serve.
+func splitProfilePrefix(path string) (string, string, bool) {
+	const prefix = "/p/"
+	if !strings.HasPrefix(path, prefix) {
+		return "", "", false
+	}
+	rest := strings.TrimPrefix(path, prefix)
+	name, remainder, _ := strings.Cut(rest, "/")
+	if name == "" || name == DefaultProfileName {
+		return "", "", false
+	}
+	validated, err := ValidateProfileName(name)
+	if err != nil {
+		return "", "", false
+	}
+	return validated, "/" + remainder, true
 }
 
 func isSessionMessagesPath(path string) bool {
@@ -113,6 +170,39 @@ func (c *Client) httpClient() *http.Client {
 	return &http.Client{Timeout: forwardTimeout}
 }
 
+// profileManager lazily binds the profile manager to this client's home. An
+// already-injected manager (tests) is preserved.
+func (c *Client) profileManager() *ProfileManager {
+	c.profilesOnce.Do(func() {
+		if c.profileMgr == nil {
+			c.profileMgr = newProfileManager(c.Home)
+		}
+	})
+	return c.profileMgr
+}
+
+// homeFor resolves the Hermes home backing a profile name.
+func (c *Client) homeFor(profile string) string {
+	if profile == "" || profile == DefaultProfileName {
+		return c.Home
+	}
+	dir, err := c.profileManager().dirFor(profile)
+	if err != nil {
+		return filepath.Join(c.Home, profilesDirName, profile)
+	}
+	return dir
+}
+
+// apiKeyFor resolves the API server key for a request scope. Named profiles
+// authenticate with their own .env; the default scope keeps the
+// connector-wide key. Credentials are never shared across profiles.
+func (c *Client) apiKeyFor(profile string) string {
+	if profile == "" || profile == DefaultProfileName {
+		return c.APIKey
+	}
+	return dotEnvValue(filepath.Join(c.homeFor(profile), envFileName), "API_SERVER_KEY")
+}
+
 func (c *Client) commandCenter() *app {
 	c.controlOnce.Do(func() {
 		c.controlApp = &app{control: newControlClient(Config{
@@ -123,11 +213,39 @@ func (c *Client) commandCenter() *app {
 	return c.controlApp
 }
 
-// Close stops the persistent Hermes control connection and heartbeat worker.
+// commandCenterFor returns the control app serving one profile. Named
+// profiles require a dedicated `hermes serve` endpoint configured for them;
+// without one the request fails closed instead of mixing another profile's
+// control state. Instances are cached per profile.
+func (c *Client) commandCenterFor(profile string) (*app, error) {
+	if profile == "" || profile == DefaultProfileName {
+		return c.commandCenter(), nil
+	}
+	override, ok := c.ControlOverrides[profile]
+	if !ok || strings.TrimSpace(override.BaseURL) == "" {
+		return nil, errors.New("this profile has no dedicated hermes serve control endpoint; start one for it and set HERMES_CONTROL_BASE_" + controlEnvSuffix(profile))
+	}
+	if cached, ok := c.profileApps.Load(profile); ok {
+		return cached.(*app), nil
+	}
+	profileApp := &app{control: newControlClient(Config{
+		HermesControlURL:   override.BaseURL,
+		HermesControlToken: override.Token,
+	}, c.httpClient())}
+	actual, _ := c.profileApps.LoadOrStore(profile, profileApp)
+	return actual.(*app), nil
+}
+
+// Close stops every persistent Hermes control connection and heartbeat
+// worker, including per-profile instances.
 func (c *Client) Close() {
 	if c.controlApp != nil {
 		c.controlApp.control.Close()
 	}
+	c.profileApps.Range(func(_, value any) bool {
+		value.(*app).control.Close()
+		return true
+	})
 }
 
 // Serve handles one tunnel request frame and emits response, stream, or
@@ -142,9 +260,14 @@ func (c *Client) Serve(ctx context.Context, frame tunnel.Frame, emit func(tunnel
 	}
 	path, query, _ := strings.Cut(frame.Path, "?")
 	route := RoutePath(path)
+	// Profile prefixes are verified against the real filesystem before any
+	// work happens: unknown profiles never reach the upstream server.
+	if route.Profile != "" && !c.profileManager().Exists(route.Profile) {
+		return emit(errorFrame(frame.ID, "PROFILE_NOT_FOUND", "unknown profile: "+route.Profile))
+	}
 	switch route.Kind {
 	case RouteForward:
-		return c.forward(ctx, frame, method, route.Path, query, emit)
+		return c.forward(ctx, frame, method, route, query, emit)
 	case RouteLocal:
 		return c.serveLocal(ctx, frame, method, route, query, emit)
 	default:
@@ -152,7 +275,7 @@ func (c *Client) Serve(ctx context.Context, frame tunnel.Frame, emit func(tunnel
 	}
 }
 
-func (c *Client) forward(ctx context.Context, frame tunnel.Frame, method string, path string, query string, emit func(tunnel.Frame) error) error {
+func (c *Client) forward(ctx context.Context, frame tunnel.Frame, method string, route Route, query string, emit func(tunnel.Frame) error) error {
 	var requestBody io.Reader = http.NoBody
 	if frame.Body != nil {
 		payload, err := json.Marshal(frame.Body)
@@ -161,7 +284,13 @@ func (c *Client) forward(ctx context.Context, frame tunnel.Frame, method string,
 		}
 		requestBody = bytes.NewReader(payload)
 	}
-	target := strings.TrimRight(c.BaseURL, "/") + path
+	// Profile-prefixed requests keep their upstream prefix so a multiplexing
+	// gateway listener routes them to the right profile. The default scope
+	// forwards unprefixed exactly as before.
+	target := strings.TrimRight(c.BaseURL, "/") + route.Path
+	if route.Profile != "" {
+		target = strings.TrimRight(c.BaseURL, "/") + "/p/" + route.Profile + route.Path
+	}
 	if query != "" {
 		target += "?" + query
 	}
@@ -181,10 +310,16 @@ func (c *Client) forward(ctx context.Context, frame tunnel.Frame, method string,
 	if frame.Body != nil && req.Header.Get("Content-Type") == "" {
 		req.Header.Set("Content-Type", "application/json")
 	}
-	// The local API key always replaces whatever credentials the frame
-	// carried.
-	if c.APIKey != "" {
-		req.Header.Set("Authorization", "Bearer "+c.APIKey)
+	// The scoped API key always replaces whatever credentials the frame
+	// carried. Named profiles use their own API_SERVER_KEY and fail closed
+	// when it is absent instead of falling back to the connector-wide key.
+	apiKey := c.apiKeyFor(route.Profile)
+	if route.Profile != "" && apiKey == "" {
+		return emit(errorFrame(frame.ID, "PROFILE_UNAUTHENTICATED",
+			"profile "+route.Profile+" has no API_SERVER_KEY in its .env; configure it before sending profile-scoped API requests"))
+	}
+	if apiKey != "" {
+		req.Header.Set("Authorization", "Bearer "+apiKey)
 	}
 	resp, err := c.httpClient().Do(req)
 	if err != nil {
@@ -270,4 +405,56 @@ func responseFrame(id string, status int, body any) tunnel.Frame {
 		Headers: map[string]string{"Content-Type": "application/json"},
 		Body:    body,
 	}
+}
+
+// simpleProfileNameRe matches legacy-compatible profile names whose env-key
+// suffix needs no versioning.
+var simpleProfileNameRe = regexp.MustCompile(`^[a-z0-9]+$`)
+
+// controlEnvSuffix maps a profile name to a state-file variable suffix.
+//
+// Versioned scheme:
+//   - Simple names ([a-z0-9]+): raw uppercase (CODER). Identical to the
+//     legacy scheme, so existing configurations keep working. A profile
+//     literally named v1coder encodes to V1CODER and round-trips.
+//   - Names containing '-' or '_': "V1_" (a delimiter that cannot appear in
+//     a legacy simple key) followed by lowercase hex of the UTF-8 bytes
+//     (research-bot → V1_72657365617263682d626f74). The V1_ prefix cannot
+//     collide with a simple name such as v1coder (V1CODER). Legacy raw keys
+//     for separator names were ambiguous across writers and are REJECTED by
+//     the decoder instead of silently misrouted.
+func controlEnvSuffix(profile string) string {
+	if simpleProfileNameRe.MatchString(profile) {
+		return strings.ToUpper(profile)
+	}
+	return "V1_" + hex.EncodeToString([]byte(profile))
+}
+
+// ControlEnvSuffix is the exported form used by the CLI state-file reader so
+// writer and reader can never drift apart.
+func ControlEnvSuffix(profile string) string { return controlEnvSuffix(profile) }
+
+// DecodeControlEnvSuffix inverts ControlEnvSuffix. Only "V1_" versioned
+// payloads and raw uppercase simple names decode; ambiguous legacy raw
+// separator keys are refused rather than guessed.
+func DecodeControlEnvSuffix(suffix string) (string, bool) {
+	if strings.HasPrefix(suffix, "V1_") {
+		raw, err := hex.DecodeString(strings.ToLower(strings.TrimPrefix(suffix, "V1_")))
+		if err != nil {
+			return "", false
+		}
+		profile := string(raw)
+		if _, err := ValidateProfileName(profile); err != nil {
+			return "", false
+		}
+		return profile, true
+	}
+	lowered := strings.ToLower(suffix)
+	if simpleProfileNameRe.MatchString(lowered) && strings.ToUpper(lowered) == suffix {
+		if _, err := ValidateProfileName(lowered); err != nil {
+			return "", false
+		}
+		return lowered, true
+	}
+	return "", false
 }

@@ -2,38 +2,29 @@ import AsyncStorage from '@react-native-async-storage/async-storage';
 import { create } from 'zustand';
 import { createJSONStorage, persist } from 'zustand/middleware';
 
-export type ChatRole = 'user' | 'assistant';
+import { profileName } from '@/lib/profiles';
+import { threadProfileName, type ChatMessage, type ChatThread } from '@/state/chat-thread-model';
 
-export type ChatMessage = {
-  id: string;
-  role: ChatRole;
-  content: string;
-  createdAt: number;
-};
-
-export type ChatThread = {
-  id: string;
-  connectionKey?: string;
-  title: string;
-  createdAt: number;
-  updatedAt: number;
-  messages: ChatMessage[];
-  lastResponseId?: string;
-  importedSessionId?: string;
-  needsHistorySeed?: boolean;
-};
+export type { ChatMessage, ChatRole, ChatThread } from '@/state/chat-thread-model';
+export { threadMatchesScope, threadProfileName } from '@/state/chat-thread-model';
 
 type ChatState = {
   hydrated: boolean;
   activeThreadId: string | null;
   threads: ChatThread[];
   setHydrated: (hydrated: boolean) => void;
-  createThread: (connectionKey: string) => string;
+  createThread: (connectionKey: string, profile?: string) => string;
   selectThread: (id: string) => void;
   deleteThread: (id: string) => void;
   addMessage: (threadId: string, message: ChatMessage) => void;
   completeResponse: (threadId: string, message: ChatMessage, responseId?: string) => void;
-  importThread: (connectionKey: string, sessionId: string, title: string, messages: ChatMessage[]) => string;
+  importThread: (
+    connectionKey: string,
+    sessionId: string,
+    title: string,
+    messages: ChatMessage[],
+    profile?: string,
+  ) => string;
 };
 
 export function createChatId(prefix: string) {
@@ -54,12 +45,13 @@ export const useChatStore = create<ChatState>()(
       activeThreadId: null,
       threads: [],
       setHydrated: (hydrated) => set({ hydrated }),
-      createThread: (connectionKey) => {
+      createThread: (connectionKey, profile) => {
         const now = Date.now();
         const id = createChatId('thread');
         const thread: ChatThread = {
           id,
           connectionKey,
+          profile: profileName(profile),
           title: 'New conversation',
           createdAt: now,
           updatedAt: now,
@@ -106,9 +98,13 @@ export const useChatStore = create<ChatState>()(
               : thread,
           ),
         })),
-      importThread: (connectionKey, sessionId, title, messages) => {
+      importThread: (connectionKey, sessionId, title, messages, profile) => {
+        const scopedProfile = profileName(profile);
         const existing = get().threads.find(
-          (thread) => thread.connectionKey === connectionKey && thread.importedSessionId === sessionId,
+          (thread) =>
+            thread.connectionKey === connectionKey &&
+            threadProfileName(thread) === scopedProfile &&
+            thread.importedSessionId === sessionId,
         );
         if (existing) {
           set({ activeThreadId: existing.id });
@@ -120,6 +116,7 @@ export const useChatStore = create<ChatState>()(
         const thread: ChatThread = {
           id,
           connectionKey,
+          profile: scopedProfile,
           title: title || titleFromMessage(messages.find((message) => message.role === 'user')?.content ?? ''),
           createdAt: messages[0]?.createdAt ?? now,
           updatedAt: lastTimestamp,

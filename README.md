@@ -115,14 +115,93 @@ Everything rides the relay tunnel. Per request frame:
   stream into the terminal Responses API object.
 - Served locally by brio from `~/.hermes`:
   `/v1/memory` GET/PUT (legacy `/memory`) with atomic 0600 writes to
-  `memories/MEMORY.md` and `USER.md`. `HERMES_HOME` is respected.
+  `memories/MEMORY.md` and `USER.md`. `HERMES_HOME` is respected. The same
+  routes under `/p/<profile>/...`, plus the full `/api/profiles*` management
+  surface, operate on that profile's home instead.
 - Served by brio through the official `hermes serve` control connection:
   `/control/rpc`, `/control/command`, `/control/background`, and
   `/control/events`. These require `HERMES_CONTROL_TOKEN` (or
   `HERMES_DASHBOARD_SESSION_TOKEN`) and default to
-  `HERMES_CONTROL_BASE=http://127.0.0.1:9119`.
+  `HERMES_CONTROL_BASE=http://127.0.0.1:9119`. Under `/p/<profile>/...` they
+  require a per-profile control override (see Hermes Profiles).
 - Everything else returns a 404-style error frame. The old file/config/
   gateway/skills/tools/logs endpoints are intentionally gone.
+
+## Hermes Profiles
+
+One Brio environment (a connected machine) can host many Hermes profiles —
+isolated agents with their own config, keys, memory, sessions, and gateway.
+Identity is always the triple `environmentId + profileName (+ sessionId)`;
+threads, composer drafts, relay caches, and deep links are keyed per profile
+so nothing is ever reused between two agents on the same machine.
+
+Brio operates on the REAL Hermes profile layout (hermes_cli/profiles.py):
+the sticky selection lives in `<home>/active_profile`, per-profile metadata
+in `<profile>/profile.yaml`, gateway runtime state in
+`<profile>/gateway_state.json`, and name validation/reserved aliases match
+Hermes exactly. Reads are served from the filesystem; every mutation is
+delegated to the installed stock `hermes` CLI with `HERMES_HOME` scoped to
+the connector home, behind an injectable runner — so bundled-skill seeding,
+standard directories, wrapper command aliases, managed gateway services,
+Honcho host migration, s6 registration, and future Hermes invariants stay
+authoritative rather than re-implemented in parallel.
+
+The Manage tab exposes:
+
+- list/show, create (blank / `--clone` / `--clone-all` / `--clone-from`),
+  use (sticky default), describe, rename, delete — mirroring `hermes
+  profile` semantics including typed-name confirmation at Brio's boundary;
+  rename/delete update or remove command aliases and managed services
+  because the CLI performs them natively. Failed creates validate before
+  anything is invoked, leaving no orphan directory.
+- SOUL.md/description editing plus a per-profile setup command.
+- Gateway Start/Stop/Restart per profile through real
+  `hermes [-p <name>] gateway <action>` semantics; multiplex conflicts
+  surface verbatim as Hermes errors (the multiplexer is owned by the
+  default gateway).
+- Export/import of real Hermes archives via the CLI (`profile export` /
+  `profile import`), which are credential-free by design; previews list
+  files and env var NAMES only. Importing is two-phase: the preview issues a
+  `preview_token` bound to the exact sanitized payload + target, and apply
+  must echo it; archives that carry `.env`/`.env.*`/`auth.json` additionally
+  require an explicit `allow_secrets` consent checkbox (values never leave
+  the machine). Replacement imports are not offered — existing targets are
+  rejected, matching stock Hermes.
+- Profile distributions from git URLs (`file://`, github shorthand,
+  https/ssh, `#ref` pins for branches/tags/commits) or local checkouts: a
+  safe staged preview parses `distribution.yaml` (name, version,
+  hermes_requires, env_requires, distribution_owned), rejects symlinks,
+  honors Hermes' hard USER_OWNED_EXCLUDE set (memories, sessions,
+  .env/auth.json, state databases, caches, ...) and bounded file/size
+  budgets, issues its own `preview_token` digest over the staged tree, and
+  apply verifies that digest before running `hermes profile install`
+  against the same validated tree. The original URL/path (including #ref)
+  is preserved as the installed manifest's source so future updates re-pull
+  correctly.
+
+Profile-scoped requests use the `/p/<profile>/...` prefix: chat, sessions,
+runs, and jobs authenticate with that profile's own `API_SERVER_KEY`
+(fail-closed when missing), unknown profiles get 404s before any upstream
+call, and memory endpoints read/write that profile's home. Cross-profile
+session importing pins the conversation to its source profile. Deep links
+(`brio://chat?agent=&profile=&session=`) resolve to exactly one environment,
+switch its profile, and open the named session; links for other
+environments are dropped.
+
+Per-profile Command Center support requires a dedicated `hermes serve` for
+that profile; configure it in `~/.brio/connect.env` as
+`HERMES_CONTROL_BASE_<ENCODED>`. Simple `[a-z0-9]+` names keep the legacy
+raw uppercase key (`CODER`); separator names use a versioned form —
+`research-bot` → `V1_72657365617263682d626f74` (V1_ plus hex) — and
+ambiguous legacy raw keys like `RESEARCH_BOT` or `RESEARCH_HBOT` are
+rejected rather than misrouted. Without an override, profile-scoped control
+requests fail closed instead of mixing another profile's control state.
+
+Operational notes: archive transfers cap the raw export at 6 MiB so the
+base64-encoded frame (~8 MiB) always fits inside the connector's 10 MiB
+response frame limit; larger machines should copy `hermes profile export`
+output directly. The hermes CLI and git must be installed on the agent
+machine for mutations and git-URL distributions.
 
 ## Direct Connections
 

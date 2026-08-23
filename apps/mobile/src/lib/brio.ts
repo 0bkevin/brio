@@ -12,6 +12,9 @@ import {
   type HermesSessionMessage,
 } from './hermes-api';
 import { ResponsesSSEParser, type HermesResponse } from './responses-sse';
+// Import the dependency-free model module: profiles.ts re-exports it, but
+// importing from there would create a brio <-> profiles cycle.
+import { scopedPath } from './profiles-model';
 
 export {
   aggregateRootAgentUsage,
@@ -261,8 +264,9 @@ export function controlRPC<T>(
   params: Record<string, unknown> = {},
   confirm = false,
   runtimeSessionId?: string,
+  profile?: string,
 ) {
-  return brioFetch<T>(connection, '/control/rpc', {
+  return brioFetch<T>(connection, scopedPath('/control/rpc', profile), {
     method: 'POST',
     body: JSON.stringify({
       method,
@@ -273,8 +277,8 @@ export function controlRPC<T>(
   });
 }
 
-export function listControlSessions(connection: AgentConnection, limit = 100) {
-  return controlRPC<{ sessions: HermesControlSession[] }>(connection, 'session.list', { limit });
+export function listControlSessions(connection: AgentConnection, limit = 100, profile?: string) {
+  return controlRPC<{ sessions: HermesControlSession[] }>(connection, 'session.list', { limit }, false, undefined, profile);
 }
 
 export function executeControlCommand(
@@ -282,13 +286,14 @@ export function executeControlCommand(
   sessionId: string,
   command: string,
   confirm = false,
+  profile?: string,
 ) {
   return brioFetch<{
     result: { output?: string; notice?: string; type?: string };
     kickoff?: Record<string, unknown>;
     runtime_session_id?: string;
     heartbeat?: HermesHeartbeatStatus | null;
-  }>(connection, '/control/command', {
+  }>(connection, scopedPath('/control/command', profile), {
     method: 'POST',
     body: JSON.stringify({ session_id: sessionId, command, ...(confirm ? { confirm: true } : {}) }),
   });
@@ -298,8 +303,9 @@ export function startBackgroundTask(
   connection: AgentConnection,
   sessionId: string,
   text: string,
+  profile?: string,
 ) {
-  return brioFetch<{ task_id: string }>(connection, '/control/background', {
+  return brioFetch<{ task_id: string }>(connection, scopedPath('/control/background', profile), {
     method: 'POST',
     body: JSON.stringify({ session_id: sessionId, text }),
   });
@@ -309,6 +315,7 @@ export function listControlEvents(
   connection: AgentConnection,
   after = 0,
   session?: { storedSessionId: string; runtimeSessionId: string },
+  profile?: string,
 ) {
   const sessionQuery = session
     ? `&stored_session_id=${encodeURIComponent(session.storedSessionId)}&runtime_session_id=${encodeURIComponent(session.runtimeSessionId)}`
@@ -319,18 +326,21 @@ export function listControlEvents(
     background_tasks?: HermesBackgroundTask[];
   }>(
     connection,
-    `/control/events?after=${Math.max(0, Math.floor(after))}${sessionQuery}`,
+    `${scopedPath('/control/events', profile)}?after=${Math.max(0, Math.floor(after))}${sessionQuery}`,
   );
 }
 
 export async function getCommandCenterSnapshot(
   connection: AgentConnection,
   sessionId: string,
+  profile?: string,
 ): Promise<HermesCommandCenterSnapshot> {
   const heartbeatCommand = await executeControlCommand(
     connection,
     sessionId,
     'heartbeat status',
+    false,
+    profile,
   );
   const runtimeSessionId = heartbeatCommand.runtime_session_id?.trim() || sessionId;
   // Hermes owns one slash worker per live session. Keep its commands ordered;
@@ -338,28 +348,28 @@ export async function getCommandCenterSnapshot(
   const goalResult = await controlRPC<{ output?: string }>(connection, 'slash.exec', {
     session_id: runtimeSessionId,
     command: 'goal status',
-  });
+  }, false, undefined, profile);
   const subgoalResult = await controlRPC<{ output?: string }>(connection, 'slash.exec', {
     session_id: runtimeSessionId,
     command: 'subgoal',
-  });
+  }, false, undefined, profile);
   const [delegation, processes, sessionStatus, eventResult] = await Promise.all([
       controlRPC<{
         active?: HermesSubagent[];
         paused?: boolean;
         max_spawn_depth?: number;
         max_concurrent_children?: number;
-      }>(connection, 'delegation.status', {}, false, runtimeSessionId),
+      }>(connection, 'delegation.status', {}, false, runtimeSessionId, profile),
       controlRPC<{ processes?: HermesBackgroundProcess[] }>(connection, 'process.list', {
         session_id: runtimeSessionId,
-      }),
+      }, false, undefined, profile),
       controlRPC<{ output?: string }>(connection, 'session.status', {
         session_id: runtimeSessionId,
-      }),
+      }, false, undefined, profile),
       listControlEvents(connection, 0, {
         storedSessionId: sessionId,
         runtimeSessionId,
-      }),
+      }, profile),
   ]);
 
   const scopedAgents = filterAgentsForControlSession(
@@ -403,9 +413,10 @@ export async function sendResponse(
     conversation?: string;
     previousResponseId?: string;
     conversationHistory?: { role: string; content: string }[];
+    profile?: string;
   } = {},
 ) {
-  return brioFetch<HermesResponse>(connection, '/v1/responses', {
+  return brioFetch<HermesResponse>(connection, scopedPath('/v1/responses', options.profile), {
     method: 'POST',
     body: JSON.stringify(responseRequestBody(prompt, options, false)),
   });
@@ -419,22 +430,24 @@ export async function sendResponseStream(
     previousResponseId?: string;
     conversationHistory?: { role: string; content: string }[];
     onTextDelta?: (delta: string) => void;
+    profile?: string;
   } = {},
 ) {
   const parser = new ResponsesSSEParser(options.onTextDelta);
   const body = JSON.stringify(responseRequestBody(prompt, options, true));
+  const responsesPath = scopedPath('/v1/responses', options.profile);
 
   if (connection.transport === 'relay') {
     await relayFetch<null>(
       connection,
-      '/v1/responses',
+      responsesPath,
       { method: 'POST', body },
       (chunk) => parser.push(chunk),
     );
     return parser.finish();
   }
 
-  const response = await expoFetch(`${normalizeBaseURL(connection.url)}/v1/responses`, {
+  const response = await expoFetch(`${normalizeBaseURL(connection.url)}${responsesPath}`, {
     method: 'POST',
     headers: {
       Accept: 'text/event-stream, application/json',
@@ -493,18 +506,23 @@ function responseRequestBody(
 export async function listHermesSessions(
   connection: Pick<AgentConnection, 'url' | 'token'> & Partial<AgentConnection>,
   limit = 60,
+  profile?: string,
 ) {
-  const result = await brioFetch<{ data?: HermesSession[] }>(connection, `/api/sessions?limit=${limit}`);
+  const result = await brioFetch<{ data?: HermesSession[] }>(
+    connection,
+    `${scopedPath('/api/sessions', profile)}?limit=${limit}`,
+  );
   return normalizeHermesSessions(result);
 }
 
 export async function getHermesSessionMessages(
   connection: Pick<AgentConnection, 'url' | 'token'> & Partial<AgentConnection>,
   sessionId: string,
+  profile?: string,
 ) {
   const result = await brioFetch<{ data?: HermesSessionMessage[] }>(
     connection,
-    `/api/sessions/${encodeURIComponent(sessionId)}/messages`,
+    scopedPath(`/api/sessions/${encodeURIComponent(sessionId)}/messages`, profile),
   );
   return normalizeHermesSessionMessages(result);
 }

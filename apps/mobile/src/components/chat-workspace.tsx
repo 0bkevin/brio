@@ -27,15 +27,33 @@ import {
   type HealthResponse,
   type HermesSession,
 } from '@/lib/brio';
-import { createChatId, useChatStore, type ChatMessage, type ChatThread } from '@/state/chat-store';
+import {
+  DEFAULT_PROFILE_NAME,
+  environmentId,
+  environmentKey,
+  isNamedProfile,
+  listProfiles,
+  profileName,
+  resolveBrioDeepLink,
+  type HermesProfile,
+} from '@/lib/profiles';
+import { createChatId, threadMatchesScope, useChatStore, type ChatMessage, type ChatThread } from '@/state/chat-store';
 import { EMPTY_PROMPT_QUEUE, type QueuedPrompt } from '@/state/composer-store-model';
 import { useComposerStore } from '@/state/composer-store';
+import { useDeepLinkStore } from '@/state/deep-link-store';
+import { useProfileStore } from '@/state/profile-store';
 
 const SUGGESTIONS = [
   ['Plan my day', 'Help me plan today. Ask what matters, then turn it into a realistic, prioritized plan.'],
   ['Explore an idea', 'I have an idea I want to think through. Help me clarify it and find the strongest next step.'],
   ['Work on a project', 'Help me make meaningful progress on a project. Start by asking for the goal and current state.'],
 ] as const;
+
+type StreamState = {
+  sending: boolean;
+  text: string;
+  error?: string;
+};
 
 type ChatWorkspaceProps = {
   connection: AgentConnection;
@@ -67,26 +85,140 @@ export function ChatWorkspace({
   const importThread = useChatStore((state) => state.importThread);
   const [showThreads, setShowThreads] = useState(false);
   const [search, setSearch] = useState('');
-  const [sending, setSending] = useState(false);
-  const [streamingText, setStreamingText] = useState('');
-  const [sendError, setSendError] = useState('');
   const [importingId, setImportingId] = useState<string | null>(null);
-  const connectionKey = `${connection.transport}:${connection.url}:${connection.agentId ?? connection.id}`;
+  // Streaming state lives per thread so two conversations on different
+  // Hermes profiles can stream at the same time without clobbering each
+  // other's transcript or error banner.
+  const [streams, setStreams] = useState<Record<string, StreamState>>({});
+  const connectionBaseKey = environmentKey(connection);
+  const agentId = environmentId(connection);
+
+  // Hermes profile selection for this environment. The connector's profile
+  // surface decides whether switching is offered at all.
+  const storedProfiles = useProfileStore((state) => state.activeProfiles);
+  const setActiveProfileStored = useProfileStore((state) => state.setActiveProfile);
+  const profilesQuery = useQuery({
+    queryKey: ['profiles', connection.url, agentId],
+    queryFn: () => listProfiles(connection),
+    staleTime: 30_000,
+    retry: false,
+  });
+  const availableProfiles: HermesProfile[] = useMemo(
+    () => profilesQuery.data?.profiles ?? [],
+    [profilesQuery.data],
+  );
+  const requestedProfile = storedProfiles[agentId];
+  const activeProfile = availableProfiles.some((profile) => profile.name === requestedProfile)
+    ? profileName(requestedProfile)
+    : DEFAULT_PROFILE_NAME;
+
+  const switchProfile = useCallback(
+    (name: string) => {
+      if (!availableProfiles.some((profile) => profile.name === name)) return;
+      void setActiveProfileStored(agentId, isNamedProfile(name) ? name : undefined);
+      setShowThreads(false);
+    },
+    [agentId, availableProfiles, setActiveProfileStored],
+  );
+
+  // Every derived collection below is keyed by (environment, profile): two
+  // profiles of this environment never share threads, composer drafts, or
+  // cached queries.
   const connectionThreads = useMemo(
-    () => threads.filter((thread) => thread.connectionKey === connectionKey),
-    [connectionKey, threads],
+    () =>
+      threads.filter((thread) =>
+        threadMatchesScope(thread, connectionBaseKey, activeProfile),
+      ),
+    [activeProfile, connectionBaseKey, threads],
   );
 
   const sessions = useQuery({
-    queryKey: ['hermes-sessions', connection.url, connection.agentId ?? connection.id],
-    queryFn: () => listHermesSessions(connection),
+    queryKey: ['hermes-sessions', connection.url, agentId, activeProfile],
+    queryFn: () => listHermesSessions(connection, 60, activeProfile),
     refetchInterval: 15000,
   });
 
   useEffect(() => {
-    const activeBelongsToConnection = connectionThreads.some((thread) => thread.id === activeThreadId);
-    if (hydrated && !activeBelongsToConnection) createThread(connectionKey);
-  }, [activeThreadId, connectionKey, connectionThreads, createThread, hydrated]);
+    if (!hydrated) return;
+    const activeBelongsToScope = connectionThreads.some((thread) => thread.id === activeThreadId);
+    if (!activeBelongsToScope && connectionThreads.length > 0) {
+      // Returning to a profile resumes its most recent conversation instead
+      // of piling up empty threads.
+      const latest = [...connectionThreads].sort((a, b) => b.updatedAt - a.updatedAt)[0];
+      selectThread(latest.id);
+      return;
+    }
+    if (!activeBelongsToScope) createThread(connectionBaseKey, activeProfile);
+  }, [activeProfile, activeThreadId, connectionBaseKey, connectionThreads, createThread, hydrated, selectThread]);
+
+  // Deep links: brio://chat?agent=&profile=&session= opens the named session
+  // on the named profile of ONLY the matching environment. A link for a
+  // different environment is dropped here rather than redirected, so no
+  // state ever crosses environments or profiles.
+  const pendingDeepLink = useDeepLinkStore((state) => state.pending);
+  const consumeDeepLink = useDeepLinkStore((state) => state.consume);
+  useEffect(() => {
+    if (!pendingDeepLink || !hydrated || !profilesQuery.data) return;
+    const resolved = resolveBrioDeepLink(pendingDeepLink, agentId, availableProfiles);
+    if (!resolved) {
+      consumeDeepLink();
+      return;
+    }
+    const requested = resolved.profile;
+    switchProfile(requested);
+    const sessionId = resolved.sessionId;
+    consumeDeepLink();
+    if (!sessionId) return;
+    const existing = threads.find(
+      (thread) =>
+        threadMatchesScope(thread, connectionBaseKey, requested) &&
+        thread.importedSessionId === sessionId,
+    );
+    if (existing) {
+      selectThread(existing.id);
+      return;
+    }
+    let cancelled = false;
+    void (async () => {
+      try {
+        const result = await getHermesSessionMessages(connection, sessionId, requested);
+        const messages: ChatMessage[] = (result.messages ?? [])
+          .filter((message) => Boolean(message.content?.trim()))
+          .map((message, index) => ({
+            id: createChatId(`history_${index}`),
+            role: message.role === 'user' ? 'user' : 'assistant',
+            content: message.tool_name
+              ? `${message.tool_name}\n${message.content.trim()}`
+              : message.content.trim(),
+            createdAt: normalizeTimestamp(message.timestamp),
+          }));
+        if (cancelled) return;
+        const title =
+          messages.find((message) => message.role === 'user')?.content || 'Shared conversation';
+        const id = importThread(connectionBaseKey, sessionId, title, messages, requested);
+        selectThread(id);
+      } catch {
+        // Session may be gone; the profile still switched so context is right.
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [
+    activeProfile,
+    agentId,
+    availableProfiles,
+    connectionBaseKey,
+    connection,
+    consumeDeepLink,
+    hydrated,
+    importThread,
+    pendingDeepLink,
+    profilesQuery.data,
+    selectThread,
+    switchProfile,
+    threads,
+  ]);
 
   const activeThread = connectionThreads.find((thread) => thread.id === activeThreadId) ?? null;
   const composerKey = activeThread?.id ?? '';
@@ -127,25 +259,33 @@ export function ChatWorkspace({
   useEffect(() => {
     const timer = setTimeout(() => scrollRef.current?.scrollToEnd({ animated: true }), 80);
     return () => clearTimeout(timer);
-  }, [activeThread?.messages.length, sending, streamingText]);
+  }, [activeThread?.messages.length, streams]);
+
+  function setStreamState(threadId: string, patch: Partial<StreamState>) {
+    setStreams((current) => {
+      const base = current[threadId] ?? { sending: false, text: '' };
+      return { ...current, [threadId]: { ...base, ...patch } };
+    });
+  }
 
   function openThread(id: string) {
     selectThread(id);
     setShowThreads(false);
-    setSendError('');
   }
 
   function startNewThread(initialPrompt?: string) {
-    const threadId = createThread(connectionKey);
+    const threadId = createThread(connectionBaseKey, activeProfile);
     setDraft(threadId, initialPrompt ?? '');
     setShowThreads(false);
-    setSendError('');
   }
 
-  async function openRemoteSession(session: HermesSession) {
+  async function openRemoteSession(session: HermesSession, sourceProfile: string) {
+    // A session always belongs to the Hermes profile that served it: the
+    // imported thread is pinned to that profile and Brio switches there so
+    // memory, credentials, and cwd stay with their own agent.
     setImportingId(session.id);
     try {
-      const result = await getHermesSessionMessages(connection, session.id);
+      const result = await getHermesSessionMessages(connection, session.id, sourceProfile);
       const messages: ChatMessage[] = (result.messages ?? [])
         .filter((message) => Boolean(message.content?.trim()))
         .map((message, index) => ({
@@ -159,10 +299,14 @@ export function ChatWorkspace({
       const title = session.title?.trim() ||
         messages.find((message) => message.role === 'user')?.content ||
         'Brio conversation';
-      const id = importThread(connectionKey, session.id, title, messages);
+      const id = importThread(connectionBaseKey, session.id, title, messages, sourceProfile);
+      if (profileName(sourceProfile) !== activeProfile) switchProfile(sourceProfile);
       openThread(id);
     } catch (error) {
-      setSendError(error instanceof Error ? error.message : 'Could not open this conversation');
+      setStreams((current) => ({
+        ...current,
+        [activeThreadId ?? '']: { sending: false, text: '', error: error instanceof Error ? error.message : 'Could not open this conversation' },
+      }));
     } finally {
       setImportingId(null);
     }
@@ -175,12 +319,16 @@ export function ChatWorkspace({
       role: message.role,
       content: message.content,
     }));
-    setSendError('');
-    setSending(true);
-    setStreamingText('');
+    // The stream is keyed to its thread: prompts queued on other profiles
+    // keep streaming independently while the user navigates elsewhere.
+    setStreams((current) => ({ ...current, [threadId]: { sending: true, text: '' } }));
 
     const onTextDelta = (delta: string) => {
-      setStreamingText((current) => current + delta);
+      setStreams((current) => {
+        const state = current[threadId];
+        if (!state?.sending) return current;
+        return { ...current, [threadId]: { ...state, text: state.text + delta } };
+      });
     };
 
     try {
@@ -194,14 +342,16 @@ export function ChatWorkspace({
               ? history
               : undefined,
           onTextDelta,
+          profile: profileName(thread.profile),
         });
       } catch (error) {
         if (!thread.lastResponseId) throw error;
-        setStreamingText('');
+        setStreams((current) => ({ ...current, [threadId]: { sending: true, text: '' } }));
         response = await sendResponseStream(connection, content, {
           conversation: threadId,
           conversationHistory: history,
           onTextDelta,
+          profile: profileName(thread.profile),
         });
       }
       addMessage(threadId, {
@@ -224,20 +374,24 @@ export function ChatWorkspace({
       void sessions.refetch();
     } catch (error) {
       const message = error instanceof Error ? error.message : 'Brio could not complete the request';
-      setSendError(message);
+      setStreamState(threadId, { sending: false, text: '', error: message });
       await failPrompt(threadId, queuedPrompt.id, message);
-    } finally {
-      setSending(false);
-      setStreamingText('');
+      return;
     }
+    setStreams((current) => {
+      const next = { ...current };
+      delete next[threadId];
+      return next;
+    });
   }, [acknowledgePrompt, addMessage, completeResponse, connection, failPrompt, sessions]);
 
   useEffect(() => {
-    if (!composerHydrated || !activeThread || sending || queuePaused) return;
+    if (!composerHydrated || !activeThread || queuePaused) return;
+    if (streams[activeThread.id]?.sending) return;
     void claimNext(composerKey).then((nextPrompt) => {
       if (nextPrompt) void deliverPrompt(nextPrompt, activeThread);
     });
-  }, [activeThread, claimNext, composerHydrated, composerKey, deliverPrompt, queue, queuePaused, sending]);
+  }, [activeThread, claimNext, composerHydrated, composerKey, deliverPrompt, queue, queuePaused, streams]);
 
   async function submitPrompt(value = prompt) {
     const content = value.trim();
@@ -260,6 +414,8 @@ export function ChatWorkspace({
     );
   }
 
+  const activeStream = streams[activeThread.id];
+  const otherProfiles = availableProfiles.filter((profile) => profile.name !== activeProfile);
   const showThreadPanel = wide || showThreads;
 
   return (
@@ -268,13 +424,16 @@ export function ChatWorkspace({
         {showThreadPanel ? (
           <ThreadPanel
             activeThreadId={activeThread.id}
+            activeProfile={activeProfile}
+            connection={connection}
             filteredThreads={filteredThreads}
             importingId={importingId}
             onClose={() => setShowThreads(false)}
             onDelete={deleteThread}
             onNew={() => startNewThread()}
             onOpen={openThread}
-            onOpenRemote={(session) => void openRemoteSession(session)}
+            onOpenRemote={(session, profile) => void openRemoteSession(session, profile)}
+            otherProfiles={otherProfiles}
             remoteSessions={remoteSessions}
             search={search}
             setSearch={setSearch}
@@ -288,6 +447,8 @@ export function ChatWorkspace({
             keyboardVerticalOffset={Platform.OS === 'ios' ? 24 : 0}
             style={styles.chatColumn}>
             <ChatHeader
+              activeProfile={activeProfile}
+              availableProfiles={availableProfiles}
               connection={connection}
               health={health}
               healthError={healthError}
@@ -295,7 +456,9 @@ export function ChatWorkspace({
               onDisconnect={onDisconnect}
               onNew={() => startNewThread()}
               onOpenThreads={() => setShowThreads(true)}
+              onSwitchProfile={switchProfile}
               compact={!wide}
+              profilesLoading={profilesQuery.isLoading}
               showThreadsButton={!wide}
               thread={activeThread}
             />
@@ -318,22 +481,28 @@ export function ChatWorkspace({
               ) : (
                 activeThread.messages.map((message) => <MessageBubble key={message.id} message={message} />)
               )}
-              {sending && streamingText ? (
-                <MessageBubble
-                  message={{
-                    id: 'streaming-response',
-                    role: 'assistant',
-                    content: streamingText,
-                    createdAt: 0,
-                  }}
-                />
-              ) : sending ? <ThinkingBubble /> : null}
+              {activeStream?.sending ? (
+                activeStream.text ? (
+                  <MessageBubble
+                    message={{
+                      id: 'streaming-response',
+                      role: 'assistant',
+                      content: activeStream.text,
+                      createdAt: 0,
+                    }}
+                  />
+                ) : (
+                  <ThinkingBubble />
+                )
+              ) : null}
             </ScrollView>
 
             <View style={[styles.composerArea, !wide && styles.composerAreaMobile]}>
               {queue.length > 0 ? (
                 <PromptQueue
-                  activePromptId={sending ? queue.find((item) => item.state === 'sending')?.id : undefined}
+                  activePromptId={
+                    activeStream?.sending ? queue.find((item) => item.state === 'sending')?.id : undefined
+                  }
                   draftOccupied={Boolean(prompt.trim())}
                   onEdit={editQueuedPrompt}
                   onMove={(promptId, offset) => void movePrompt(composerKey, promptId, offset)}
@@ -344,10 +513,10 @@ export function ChatWorkspace({
                   prompts={queue}
                 />
               ) : null}
-              {sendError ? (
+              {activeStream?.error ? (
                 <View style={[styles.errorBanner, { backgroundColor: colors.backgroundSelected }]}>
                   <ThemedText style={{ color: colors.danger }} type="small">
-                    {sendError}
+                    {activeStream.error}
                   </ThemedText>
                 </View>
               ) : null}
@@ -357,7 +526,7 @@ export function ChatWorkspace({
                   maxLength={20000}
                   multiline
                   onChangeText={(value) => setDraft(composerKey, value)}
-                  placeholder={sending ? 'Queue a follow-up…' : 'Message Brio…'}
+                  placeholder={activeStream?.sending ? 'Queue a follow-up…' : 'Message Brio…'}
                   placeholderTextColor={colors.textTertiary}
                   style={[styles.composerInput, { color: colors.text }]}
                   textAlignVertical="top"
@@ -513,7 +682,9 @@ function QueueAction({
 }
 
 function ThreadPanel({
+  activeProfile,
   activeThreadId,
+  connection,
   filteredThreads,
   importingId,
   onClose,
@@ -521,25 +692,30 @@ function ThreadPanel({
   onNew,
   onOpen,
   onOpenRemote,
+  otherProfiles,
   remoteSessions,
   search,
   setSearch,
   showClose,
 }: {
+  activeProfile: string;
   activeThreadId: string;
+  connection: AgentConnection;
   filteredThreads: ChatThread[];
   importingId: string | null;
   onClose: () => void;
   onDelete: (id: string) => void;
   onNew: () => void;
   onOpen: (id: string) => void;
-  onOpenRemote: (session: HermesSession) => void;
+  onOpenRemote: (session: HermesSession, profile: string) => void;
+  otherProfiles: HermesProfile[];
   remoteSessions: HermesSession[];
   search: string;
   setSearch: (value: string) => void;
   showClose: boolean;
 }) {
   const colors = useTheme();
+  const [expandedProfile, setExpandedProfile] = useState<string | null>(null);
   return (
     <View
       style={[
@@ -621,32 +797,169 @@ function ThreadPanel({
         {remoteSessions.length ? (
           <>
             <ThemedText style={styles.remoteLabel} themeColor="textTertiary" type="eyebrow">
-              From your agent
+              From {isNamedProfile(activeProfile) ? activeProfile : 'your agent'}
             </ThemedText>
             {remoteSessions.slice(0, 20).map((session) => (
-              <Pressable
+              <RemoteSessionRow
                 key={session.id}
-                onPress={() => onOpenRemote(session)}
-                style={({ pressed }) => [styles.remoteRow, { opacity: pressed ? 0.72 : 1 }]}>
-                <View style={styles.threadCopy}>
-                  <ThemedText numberOfLines={1} type="smallBold">
-                    {session.title || 'Brio conversation'}
-                  </ThemedText>
-                  <ThemedText themeColor="textTertiary" type="small">
-                    {session.message_count} messages · {relativeDate(normalizeTimestamp(session.started_at))}
-                  </ThemedText>
-                </View>
-                {importingId === session.id ? <ActivityIndicator size="small" /> : <ThemedText>›</ThemedText>}
-              </Pressable>
+                importing={importingId === session.id}
+                onPress={() => onOpenRemote(session, activeProfile)}
+                session={session}
+              />
             ))}
           </>
+        ) : null}
+        {otherProfiles.length ? (
+          <CrossProfileSection
+            connection={connection}
+            expandedProfile={expandedProfile}
+            importingId={importingId}
+            onOpenRemote={onOpenRemote}
+            otherProfiles={otherProfiles}
+            setExpandedProfile={setExpandedProfile}
+          />
         ) : null}
       </ScrollView>
     </View>
   );
 }
 
+function RemoteSessionRow({
+  importing,
+  onPress,
+  session,
+}: {
+  importing: boolean;
+  onPress: () => void;
+  session: HermesSession;
+}) {
+  return (
+    <Pressable
+      onPress={onPress}
+      style={({ pressed }) => [styles.remoteRow, { opacity: pressed ? 0.72 : 1 }]}>
+      <View style={styles.threadCopy}>
+        <ThemedText numberOfLines={1} type="smallBold">
+          {session.title || 'Brio conversation'}
+        </ThemedText>
+        <ThemedText themeColor="textTertiary" type="small">
+          {session.message_count} messages · {relativeDate(normalizeTimestamp(session.started_at))}
+        </ThemedText>
+      </View>
+      {importing ? <ActivityIndicator size="small" /> : <ThemedText>›</ThemedText>}
+    </Pressable>
+  );
+}
+
+/**
+ * Cross-profile @session browsing: recent sessions from the environment's
+ * other Hermes profiles, fetched lazily under their own query keys so no
+ * profile's data is ever cached under another profile's identity.
+ */
+function CrossProfileSection({
+  connection,
+  expandedProfile,
+  importingId,
+  onOpenRemote,
+  otherProfiles,
+  setExpandedProfile,
+}: {
+  connection: AgentConnection;
+  expandedProfile: string | null;
+  importingId: string | null;
+  onOpenRemote: (session: HermesSession, profile: string) => void;
+  otherProfiles: HermesProfile[];
+  setExpandedProfile: (profile: string | null) => void;
+}) {
+  return (
+    <>
+      <ThemedText style={styles.remoteLabel} themeColor="textTertiary" type="eyebrow">
+        Other profiles
+      </ThemedText>
+      {otherProfiles.map((profile) => (
+        <CrossProfileGroup
+          key={profile.name}
+          connection={connection}
+          expanded={expandedProfile === profile.name}
+          importingId={importingId}
+          onOpenRemote={onOpenRemote}
+          profile={profile}
+          toggle={() =>
+            setExpandedProfile(expandedProfile === profile.name ? null : profile.name)
+          }
+        />
+      ))}
+    </>
+  );
+}
+
+function CrossProfileGroup({
+  connection,
+  expanded,
+  importingId,
+  onOpenRemote,
+  profile,
+  toggle,
+}: {
+  connection: AgentConnection;
+  expanded: boolean;
+  importingId: string | null;
+  onOpenRemote: (session: HermesSession, profile: string) => void;
+  profile: HermesProfile;
+  toggle: () => void;
+}) {
+  // Only fetch when expanded; each profile keeps its own cache entry.
+  const sessions = useQuery({
+    queryKey: ['hermes-sessions-cross', connection.url, environmentId(connection), profile.name],
+    enabled: expanded,
+    queryFn: () => listHermesSessions(connection, 10, profile.name),
+    staleTime: 30_000,
+    retry: false,
+  });
+  return (
+    <View style={styles.crossProfileGroup}>
+      <Pressable
+        accessibilityLabel={`Show sessions from profile ${profile.name}`}
+        onPress={toggle}
+        style={({ pressed }) => [
+          styles.crossProfileHeader,
+          { opacity: pressed ? 0.72 : 1 },
+        ]}>
+        <ThemedText
+          numberOfLines={1}
+          themeColor={profile.gateway_running ? 'text' : 'textSecondary'}
+          type="smallBold">
+          {profile.gateway_running ? '● ' : '○ '}
+          {profile.name}
+        </ThemedText>
+        <ThemedText themeColor="textTertiary">{expanded ? '▾' : '›'}</ThemedText>
+      </Pressable>
+      {expanded ? (
+        sessions.isLoading ? (
+          <ActivityIndicator size="small" style={styles.crossProfileLoading} />
+        ) : (sessions.data?.sessions ?? []).length ? (
+          (sessions.data?.sessions ?? []).slice(0, 8).map((session) => (
+            <RemoteSessionRow
+              key={session.id}
+              importing={importingId === session.id}
+              onPress={() => onOpenRemote(session, profile.name)}
+              session={session}
+            />
+          ))
+        ) : (
+          <ThemedText style={styles.emptyThreads} themeColor="textTertiary" type="small">
+            {sessions.isError
+              ? 'No reachable sessions for this profile.'
+              : 'No sessions yet.'}
+          </ThemedText>
+        )
+      ) : null}
+    </View>
+  );
+}
+
 function ChatHeader({
+  activeProfile,
+  availableProfiles,
   connection,
   health,
   healthError,
@@ -654,10 +967,14 @@ function ChatHeader({
   onDisconnect,
   onNew,
   onOpenThreads,
+  onSwitchProfile,
   compact,
+  profilesLoading,
   showThreadsButton,
   thread,
 }: {
+  activeProfile: string;
+  availableProfiles: HermesProfile[];
   connection: AgentConnection;
   health?: HealthResponse;
   healthError: boolean;
@@ -665,7 +982,9 @@ function ChatHeader({
   onDisconnect: () => void;
   onNew: () => void;
   onOpenThreads: () => void;
+  onSwitchProfile: (name: string) => void;
   compact: boolean;
+  profilesLoading: boolean;
   showThreadsButton: boolean;
   thread: ChatThread;
 }) {
@@ -685,12 +1004,22 @@ function ChatHeader({
               ]}
             />
             <ThemedText themeColor="textTertiary" type="small">
-              {connection.name} · {online ? 'online' : healthLoading ? 'checking' : 'unavailable'}
+              {connection.name}
+              {isNamedProfile(activeProfile) ? ` · ${activeProfile}` : ''} ·{' '}
+              {online ? 'online' : healthLoading ? 'checking' : 'unavailable'}
             </ThemedText>
           </View>
         </View>
       </View>
       <View style={styles.headerActions}>
+        {availableProfiles.length > 1 || (profilesLoading && availableProfiles.length === 0) ? (
+          <ProfileSwitcher
+            activeProfile={activeProfile}
+            loading={profilesLoading}
+            onSelect={onSwitchProfile}
+            profiles={availableProfiles}
+          />
+        ) : null}
         <IconButton label="New conversation" onPress={onNew} symbol="＋" />
         {compact ? (
           <IconButton label="Manage agents" onPress={onDisconnect} symbol="···" />
@@ -701,6 +1030,66 @@ function ChatHeader({
         )}
       </View>
     </View>
+  );
+}
+
+/**
+ * Profile switcher for the connected environment. Selecting a profile swaps
+ * the whole workspace identity (threads, composer drafts, session cache);
+ * it never reconnects or changes the environment itself.
+ */
+function ProfileSwitcher({
+  activeProfile,
+  loading,
+  onSelect,
+  profiles,
+}: {
+  activeProfile: string;
+  loading: boolean;
+  onSelect: (name: string) => void;
+  profiles: HermesProfile[];
+}) {
+  const colors = useTheme();
+  if (!profiles.length) {
+    return loading ? (
+      <ActivityIndicator size="small" />
+    ) : null;
+  }
+  const activeMeta = profiles.find((profile) => profile.name === activeProfile);
+  return (
+    <ScrollView horizontal showsHorizontalScrollIndicator={false} style={styles.profileChips}>
+      {profiles.map((profile) => {
+        const active = profile.name === activeProfile;
+        return (
+          <Pressable
+            key={profile.name}
+            accessibilityLabel={`Switch to profile ${profile.name}`}
+            accessibilityState={{ selected: active }}
+            onPress={() => onSelect(profile.name)}
+            style={({ pressed }) => [
+              styles.profileChip,
+              {
+                borderColor: active ? colors.accent : colors.border,
+                backgroundColor: active ? colors.backgroundSelected : 'transparent',
+                opacity: pressed ? 0.7 : 1,
+              },
+            ]}>
+            <View
+              style={[
+                styles.profileChipDot,
+                { backgroundColor: profile.gateway_running ? colors.success : colors.textTertiary },
+              ]}
+            />
+            <ThemedText numberOfLines={1} type="smallBold">{profile.name}</ThemedText>
+          </Pressable>
+        );
+      })}
+      {activeMeta?.gateway_multiplex ? (
+        <View style={[styles.profileChip, { borderColor: colors.border }]}>
+          <ThemedText themeColor="textTertiary" type="small">multiplexed</ThemedText>
+        </View>
+      ) : null}
+    </ScrollView>
   );
 }
 
@@ -845,6 +1234,12 @@ const styles = StyleSheet.create({
   emptyThreads: { paddingHorizontal: Spacing.two, paddingVertical: Spacing.three },
   remoteLabel: { marginBottom: Spacing.two, marginTop: Spacing.four, paddingHorizontal: Spacing.two },
   remoteRow: { alignItems: 'center', flexDirection: 'row', gap: Spacing.two, minHeight: 56, paddingHorizontal: Spacing.three, paddingVertical: Spacing.two },
+  crossProfileGroup: { borderTopWidth: StyleSheet.hairlineWidth, borderColor: 'rgba(255,255,255,0.08)', marginTop: Spacing.one },
+  crossProfileHeader: { alignItems: 'center', flexDirection: 'row', gap: Spacing.two, justifyContent: 'space-between', minHeight: 40, paddingHorizontal: Spacing.three },
+  crossProfileLoading: { paddingVertical: Spacing.two },
+  profileChips: { flexGrow: 0, maxHeight: 44 },
+  profileChip: { alignItems: 'center', borderRadius: 14, borderWidth: StyleSheet.hairlineWidth, flexDirection: 'row', gap: 6, paddingHorizontal: 10, paddingVertical: 6 },
+  profileChipDot: { borderRadius: 4, height: 6, width: 6 },
   chatColumn: { flex: 1, minWidth: 0 },
   chatHeader: { alignItems: 'center', borderBottomWidth: StyleSheet.hairlineWidth, flexDirection: 'row', justifyContent: 'space-between', minHeight: 72, paddingHorizontal: Spacing.four, paddingVertical: Spacing.two },
   chatHeaderMobile: { minHeight: 62, paddingHorizontal: Spacing.three },
