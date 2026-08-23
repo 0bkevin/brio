@@ -69,6 +69,51 @@ export type CapabilitiesResponse = {
   endpoints?: Record<string, { method?: string; path?: string }>;
 };
 
+export type ComposerAttachmentUpload = {
+  id: string;
+  session_id: string;
+  name: string;
+  mime_type: string;
+  kind: 'image' | 'file';
+  size: number;
+  received: number;
+  next_chunk: number;
+  sha256?: string;
+  complete: boolean;
+  created_at: number;
+};
+
+export type ComposerCapabilities = {
+  attachment_chunk_bytes: number;
+  attachment_file_bytes: number;
+  attachment_total_bytes: number;
+  attachment_max_count: number;
+  context_item_bytes: number;
+  context_soft_bytes: number;
+  context_hard_bytes: number;
+  context_max_references: number;
+  folder_entries: number;
+  attachment_kinds: ('image' | 'file')[];
+  context_references: string[];
+  redirect_mode: 'interrupt_then_redirect';
+};
+
+export type ComposerCompletion = {
+  text: string;
+  display?: string;
+  meta?: string;
+  kind?: string;
+};
+
+export type CommandCatalog = {
+  pairs?: [string, string][];
+  commands?: { name: string; description?: string; permission?: string }[];
+  categories?: { name: string; pairs: [string, string][] }[];
+  skills?: Record<string, { usage?: number; origin?: string }>;
+  permissions?: Record<string, string>;
+  warning?: string;
+};
+
 export type HermesControlSession = {
   id: string;
   title?: string;
@@ -255,6 +300,103 @@ export function getCapabilities(
   return brioFetch<CapabilitiesResponse>(connection, '/v1/capabilities');
 }
 
+export function getComposerCapabilities(connection: AgentConnection) {
+  return brioFetch<ComposerCapabilities>(connection, '/composer/capabilities');
+}
+
+export function createAttachmentUpload(
+  connection: AgentConnection,
+  value: { sessionId: string; name: string; mimeType: string; size: number },
+  signal?: AbortSignal,
+) {
+  return brioFetch<ComposerAttachmentUpload>(connection, '/attachments', {
+    method: 'POST',
+    signal,
+    body: JSON.stringify({
+      session_id: value.sessionId,
+      name: value.name,
+      mime_type: value.mimeType,
+      size: value.size,
+    }),
+  });
+}
+
+export function uploadAttachmentChunk(
+  connection: AgentConnection,
+  attachmentId: string,
+  index: number,
+  dataBase64: string,
+  final: boolean,
+  signal?: AbortSignal,
+) {
+  return brioFetch<ComposerAttachmentUpload>(
+    connection,
+    `/attachments/${encodeURIComponent(attachmentId)}/chunks/${index}`,
+    {
+      method: 'PUT',
+      signal,
+      body: JSON.stringify({ data_base64: dataBase64, final }),
+    },
+  );
+}
+
+export function deleteAttachmentUpload(connection: AgentConnection, attachmentId: string) {
+  return brioFetch<{ deleted: boolean }>(
+    connection,
+    `/attachments/${encodeURIComponent(attachmentId)}`,
+    { method: 'DELETE' },
+  );
+}
+
+export function getCommandCatalog(connection: AgentConnection) {
+  return brioFetch<CommandCatalog>(connection, '/composer/commands');
+}
+
+export function completeSlashCommand(connection: AgentConnection, text: string) {
+  return brioFetch<{ items: ComposerCompletion[] }>(connection, '/composer/commands/complete', {
+    method: 'POST',
+    body: JSON.stringify({ text }),
+  });
+}
+
+export function completeContextReference(connection: AgentConnection, query: string) {
+  return brioFetch<{ items: ComposerCompletion[] }>(connection, '/composer/context/complete', {
+    method: 'POST',
+    body: JSON.stringify({ query }),
+  });
+}
+
+export function dispatchComposerCommand(
+  connection: AgentConnection,
+  sessionId: string,
+  text: string,
+  requestId: string,
+) {
+  return brioFetch<Record<string, unknown>>(connection, '/composer/commands/dispatch', {
+    method: 'POST',
+    body: JSON.stringify({ session_id: sessionId, text, request_id: requestId }),
+  });
+}
+
+export function prepareComposerPrompt(
+  connection: AgentConnection,
+  input: string,
+  sessionId: string,
+  attachments: string[],
+) {
+  return brioFetch<{ input: unknown }>(connection, '/composer/prepare', {
+    method: 'POST',
+    body: JSON.stringify({ input, session_id: sessionId, attachments }),
+  });
+}
+
+export function interruptComposerSession(connection: AgentConnection, sessionId: string) {
+  return brioFetch<{ ok: boolean }>(connection, '/composer/redirect', {
+    method: 'POST',
+    body: JSON.stringify({ session_id: sessionId }),
+  });
+}
+
 export function controlRPC<T>(
   connection: AgentConnection,
   method: string,
@@ -413,12 +555,15 @@ export async function sendResponse(
 
 export async function sendResponseStream(
   connection: Pick<AgentConnection, 'url' | 'token'> & Partial<AgentConnection>,
-  prompt: string,
+  prompt: unknown,
   options: {
     conversation?: string;
     previousResponseId?: string;
     conversationHistory?: { role: string; content: string }[];
     onTextDelta?: (delta: string) => void;
+    signal?: AbortSignal;
+    composerSessionId?: string;
+    attachmentIds?: string[];
   } = {},
 ) {
   const parser = new ResponsesSSEParser(options.onTextDelta);
@@ -428,7 +573,7 @@ export async function sendResponseStream(
     await relayFetch<null>(
       connection,
       '/v1/responses',
-      { method: 'POST', body },
+      { method: 'POST', body, signal: options.signal },
       (chunk) => parser.push(chunk),
     );
     return parser.finish();
@@ -442,6 +587,7 @@ export async function sendResponseStream(
       Authorization: `Bearer ${connection.token}`,
     },
     body,
+    signal: options.signal,
   });
   const contentType = response.headers.get('Content-Type')?.toLowerCase() ?? '';
   if (!response.ok || !contentType.includes('text/event-stream')) {
@@ -468,11 +614,13 @@ export async function sendResponseStream(
 }
 
 function responseRequestBody(
-  prompt: string,
+  prompt: unknown,
   options: {
     conversation?: string;
     previousResponseId?: string;
     conversationHistory?: { role: string; content: string }[];
+    composerSessionId?: string;
+    attachmentIds?: string[];
   },
   stream: boolean,
 ) {
@@ -480,6 +628,8 @@ function responseRequestBody(
     model: 'hermes-agent',
     input: prompt,
     stream,
+    ...(options.composerSessionId ? { brio_session_id: options.composerSessionId } : {}),
+    ...(options.attachmentIds?.length ? { brio_attachments: options.attachmentIds } : {}),
     ...(options.previousResponseId
       ? { previous_response_id: options.previousResponseId }
       : options.conversationHistory?.length
@@ -738,6 +888,8 @@ type PendingRelayRequest = {
   timer: ReturnType<typeof setTimeout>;
   chunks: unknown[];
   onChunk?: (chunk: string) => void;
+  signal?: AbortSignal;
+  abort?: () => void;
 };
 
 const relayClients = new Map<string, RelaySocketClient>();
@@ -752,10 +904,19 @@ class RelaySocketClient {
     this.wsURL = wsURL;
   }
 
-  request<T>(frame: RelayFrame, timeoutMs = 5 * 60 * 1000, onChunk?: (chunk: string) => void): Promise<T> {
+  request<T>(
+    frame: RelayFrame,
+    timeoutMs = 5 * 60 * 1000,
+    onChunk?: (chunk: string) => void,
+    signal?: AbortSignal,
+  ): Promise<T> {
     return this.connect().then(
       () =>
         new Promise<T>((resolve, reject) => {
+          if (signal?.aborted) {
+            reject(new Error('Relay request cancelled'));
+            return;
+          }
           const socket = this.socket;
           if (!socket || socket.readyState !== WebSocket.OPEN) {
             reject(new Error('Relay connection is not open'));
@@ -763,10 +924,17 @@ class RelaySocketClient {
           }
 
           const timer = setTimeout(() => {
-            if (this.pending.delete(frame.id)) {
+            if (this.pending.has(frame.id)) {
+              this.clearPending(frame.id);
               reject(new Error('Relay request timed out'));
             }
           }, timeoutMs);
+
+          const abort = () => {
+            if (!this.pending.has(frame.id)) return;
+            this.clearPending(frame.id);
+            reject(new Error('Relay request cancelled'));
+          };
 
           this.pending.set(frame.id, {
             resolve: (value) => resolve(value as T),
@@ -774,7 +942,10 @@ class RelaySocketClient {
             timer,
             chunks: [],
             onChunk,
+            signal,
+            abort,
           });
+          signal?.addEventListener('abort', abort, { once: true });
 
           try {
             socket.send(JSON.stringify(frame));
@@ -925,6 +1096,7 @@ class RelaySocketClient {
     const pending = this.pending.get(id);
     if (pending) {
       clearTimeout(pending.timer);
+      if (pending.abort) pending.signal?.removeEventListener('abort', pending.abort);
       this.pending.delete(id);
     }
   }
@@ -932,6 +1104,7 @@ class RelaySocketClient {
   private rejectAll(error: Error) {
     for (const [id, pending] of this.pending) {
       clearTimeout(pending.timer);
+      if (pending.abort) pending.signal?.removeEventListener('abort', pending.abort);
       pending.reject(error);
       this.pending.delete(id);
     }
@@ -972,7 +1145,7 @@ function relayFetch<T>(
     client = new RelaySocketClient(wsURL);
     relayClients.set(wsURL, client);
   }
-  return client.request<T>(requestFrame, 5 * 60 * 1000, onChunk);
+  return client.request<T>(requestFrame, 5 * 60 * 1000, onChunk, init.signal ?? undefined);
 }
 
 function relayTunnelURL(baseURL: string, agentId: string, relayToken: string) {

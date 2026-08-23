@@ -44,26 +44,28 @@ func Execute() {
 // environment variables first, then the ~/.brio/connect.env state file, then
 // built-in defaults.
 type runOptions struct {
-	relayURL     string
-	relayToken   string
-	agentID      string
-	hermesURL    string
-	hermesAPIKey string
-	hermesHome   string
-	controlURL   string
-	controlToken string
+	relayURL      string
+	relayToken    string
+	agentID       string
+	hermesURL     string
+	hermesAPIKey  string
+	hermesHome    string
+	controlURL    string
+	controlToken  string
+	composerRoots []string
 }
 
 func defaultRunOptions() runOptions {
 	return runOptions{
-		relayURL:     configDefault("BRIO_RELAY_URL", ""),
-		relayToken:   configDefault("BRIO_RELAY_TOKEN", ""),
-		agentID:      configDefault("BRIO_AGENT_ID", ""),
-		hermesURL:    configDefault("HERMES_API_BASE", "http://127.0.0.1:8642"),
-		hermesAPIKey: configDefault("HERMES_API_KEY", ""),
-		hermesHome:   configDefault("HERMES_HOME", ""),
-		controlURL:   configDefault("HERMES_CONTROL_BASE", "http://127.0.0.1:9119"),
-		controlToken: configDefault("HERMES_CONTROL_TOKEN", configDefault("HERMES_DASHBOARD_SESSION_TOKEN", "")),
+		relayURL:      configDefault("BRIO_RELAY_URL", ""),
+		relayToken:    configDefault("BRIO_RELAY_TOKEN", ""),
+		agentID:       configDefault("BRIO_AGENT_ID", ""),
+		hermesURL:     configDefault("HERMES_API_BASE", "http://127.0.0.1:8642"),
+		hermesAPIKey:  configDefault("HERMES_API_KEY", ""),
+		hermesHome:    configDefault("HERMES_HOME", ""),
+		controlURL:    configDefault("HERMES_CONTROL_BASE", "http://127.0.0.1:9119"),
+		controlToken:  configDefault("HERMES_CONTROL_TOKEN", configDefault("HERMES_DASHBOARD_SESSION_TOKEN", "")),
+		composerRoots: filepath.SplitList(configDefault("BRIO_COMPOSER_ROOTS", "")),
 	}
 }
 
@@ -76,6 +78,7 @@ func addRunFlags(cmd *cobra.Command, opts *runOptions) {
 	cmd.Flags().StringVar(&opts.hermesHome, "hermes-home", opts.hermesHome, "Hermes home directory")
 	cmd.Flags().StringVar(&opts.controlURL, "hermes-control-url", opts.controlURL, "Hermes serve JSON-RPC base URL")
 	cmd.Flags().StringVar(&opts.controlToken, "hermes-control-token", opts.controlToken, "Hermes serve session token")
+	cmd.Flags().StringArrayVar(&opts.composerRoots, "composer-root", opts.composerRoots, "allowed root for composer file and Git references (repeatable)")
 }
 
 func (o *runOptions) applyDefaults() {
@@ -93,6 +96,19 @@ func (o *runOptions) applyDefaults() {
 	if o.hermesHome == "" {
 		o.hermesHome = defaultHermesHome()
 	}
+	roots := make([]string, 0, len(o.composerRoots))
+	for _, root := range o.composerRoots {
+		root = strings.TrimSpace(root)
+		if root == "" || strings.ContainsAny(root, "\x00\r\n") {
+			continue
+		}
+		absolute, err := filepath.Abs(root)
+		if err != nil {
+			continue
+		}
+		roots = append(roots, filepath.Clean(absolute))
+	}
+	o.composerRoots = roots
 }
 
 func configDefault(key string, fallback string) string {

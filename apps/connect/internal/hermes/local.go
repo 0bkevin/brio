@@ -29,6 +29,10 @@ func (c *Client) serveLocal(ctx context.Context, frame tunnel.Frame, method stri
 		}
 	case "control-rpc", "control-command", "control-background", "control-events":
 		return c.serveControl(ctx, frame, method, route, emit)
+	case "composer-capabilities", "composer-commands", "composer-command-complete",
+		"composer-command-dispatch", "composer-context-complete", "composer-prepare",
+		"composer-redirect", "composer-attachments", "composer-attachment":
+		return c.serveComposer(ctx, frame, method, route, emit)
 	default:
 		return emit(errorFrame(frame.ID, "NOT_FOUND", "no route for "+method+" "+frame.Path))
 	}
