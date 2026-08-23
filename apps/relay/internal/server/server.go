@@ -103,6 +103,7 @@ func Run(ctx context.Context, cfg Config) error {
 	router.Use(middleware.RequestID)
 	router.Use(requestLogger)
 	router.Use(middleware.Recoverer)
+	router.Use(a.requireSecureTransport)
 	router.Use(a.cors)
 	router.Get("/health", a.health)
 	router.Post("/auth/devices", a.rateLimit("device-registration", a.createDevice))

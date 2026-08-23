@@ -150,6 +150,35 @@ func (a *app) clientIP(r *http.Request) string {
 	return normalizedIP(directIP)
 }
 
+func (a *app) requireSecureTransport(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if a.cfg.InsecureDevMode || r.URL.Path == "/health" || a.requestUsesSecureTransport(r) {
+			next.ServeHTTP(w, r)
+			return
+		}
+		w.Header().Set("Upgrade", "TLS/1.2, HTTP/1.1")
+		writeJSON(w, http.StatusUpgradeRequired, map[string]any{
+			"error": "HTTPS/WSS is required outside loopback",
+		})
+	})
+}
+
+func (a *app) requestUsesSecureTransport(r *http.Request) bool {
+	if r.TLS != nil {
+		return true
+	}
+	directIP := remoteIP(r.RemoteAddr)
+	if directIP != nil && directIP.IsLoopback() {
+		return true
+	}
+	if !a.trustedProxies.contains(directIP) {
+		return false
+	}
+	forwardedProto := r.Header.Get("X-Forwarded-Proto")
+	parts := strings.Split(forwardedProto, ",")
+	return len(parts) > 0 && strings.EqualFold(strings.TrimSpace(parts[len(parts)-1]), "https")
+}
+
 func remoteIP(remoteAddr string) net.IP {
 	host, _, err := net.SplitHostPort(strings.TrimSpace(remoteAddr))
 	if err == nil {

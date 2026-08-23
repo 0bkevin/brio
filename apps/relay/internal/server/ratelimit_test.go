@@ -1,6 +1,7 @@
 package server
 
 import (
+	"crypto/tls"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -79,5 +80,79 @@ func TestClientIPTrustsForwardingOnlyFromConfiguredProxy(t *testing.T) {
 func TestParseTrustedProxyCIDRsRejectsInvalidValue(t *testing.T) {
 	if _, err := parseTrustedProxyCIDRs([]string{"not-a-network"}); err == nil {
 		t.Fatal("invalid trusted proxy CIDR was accepted")
+	}
+}
+
+func TestSecureTransportRejectsPlaintextOutsideLoopback(t *testing.T) {
+	a := &app{}
+	called := false
+	handler := a.requireSecureTransport(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		called = true
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	req := httptest.NewRequest(http.MethodPost, "/auth/devices", nil)
+	req.RemoteAddr = "203.0.113.8:1234"
+	req.Header.Set("X-Forwarded-Proto", "https")
+	recorder := httptest.NewRecorder()
+
+	handler.ServeHTTP(recorder, req)
+
+	if called {
+		t.Fatal("untrusted plaintext request reached the handler")
+	}
+	if recorder.Code != http.StatusUpgradeRequired {
+		t.Fatalf("status = %d, want %d", recorder.Code, http.StatusUpgradeRequired)
+	}
+}
+
+func TestSecureTransportAcceptsTLSLoopbackAndTrustedTLSProxy(t *testing.T) {
+	trusted, err := parseTrustedProxyCIDRs([]string{"10.0.0.0/8"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	a := &app{trustedProxies: trusted}
+	handler := a.requireSecureTransport(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	tests := []struct {
+		name       string
+		remoteAddr string
+		tls        bool
+		proto      string
+	}{
+		{name: "direct TLS", remoteAddr: "203.0.113.8:1234", tls: true},
+		{name: "loopback HTTP", remoteAddr: "127.0.0.1:1234"},
+		{name: "trusted TLS proxy", remoteAddr: "10.1.2.3:1234", proto: "https"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodPost, "/auth/devices", nil)
+			req.RemoteAddr = test.remoteAddr
+			if test.tls {
+				req.TLS = &tls.ConnectionState{}
+			}
+			if test.proto != "" {
+				req.Header.Set("X-Forwarded-Proto", test.proto)
+			}
+			recorder := httptest.NewRecorder()
+			handler.ServeHTTP(recorder, req)
+			if recorder.Code != http.StatusNoContent {
+				t.Fatalf("status = %d, want %d", recorder.Code, http.StatusNoContent)
+			}
+		})
+	}
+}
+
+func TestSecureTransportAllowsHealthProbe(t *testing.T) {
+	a := &app{}
+	handler := a.requireSecureTransport(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	req := httptest.NewRequest(http.MethodGet, "/health", nil)
+	req.RemoteAddr = "203.0.113.8:1234"
+	recorder := httptest.NewRecorder()
+	handler.ServeHTTP(recorder, req)
+	if recorder.Code != http.StatusNoContent {
+		t.Fatalf("health status = %d, want %d", recorder.Code, http.StatusNoContent)
 	}
 }

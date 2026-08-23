@@ -242,6 +242,7 @@ Common values:
 - `BRIO_INSECURE_DEV_MODE` - explicitly enables unverified email sign-in and unrestricted browser origins. `make dev-relay` sets the equivalent CLI flag; never enable it on a deployed relay.
 - `BRIO_ALLOW_LEGACY_QUERY_TOKENS` - migration-only opt-in for old clients that put relay credentials in WebSocket query strings. Current clients use headers/subprotocols; leave this disabled after upgrades.
 - `BRIO_RELAY_TRUSTED_PROXY_CIDRS` - comma-separated reverse-proxy networks allowed to supply `X-Forwarded-For` for rate limiting. Forwarded addresses are ignored unless the direct TCP peer matches this list.
+- Production requests outside loopback require HTTPS/WSS. TLS-terminating proxies must be listed in `BRIO_RELAY_TRUSTED_PROXY_CIDRS` and send `X-Forwarded-Proto: https`; plaintext `/health` remains available for load-balancer probes.
 - `BRIO_RELAY_ALLOWED_ORIGINS` - comma-separated browser origins allowed for relay CORS and WebSocket upgrades. Browser origins are denied when this is unset unless insecure development mode is explicitly enabled; origin-less native clients continue to work.
 - `BRIO_DEVICE_REGISTRATION_KEY` - interim secret required on `POST /auth/devices` through `Authorization: Bearer ...` or `X-Brio-Registration-Key`. With neither this key nor insecure development mode configured, device registration fails closed. Do not embed this key in a public app build; replace it with the hosted account-auth flow.
 - `HERMES_CONTROL_BASE` - `hermes serve` base URL, default `http://127.0.0.1:9119`.
