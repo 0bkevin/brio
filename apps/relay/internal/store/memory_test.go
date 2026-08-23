@@ -6,6 +6,42 @@ import (
 	"time"
 )
 
+func TestMemoryStoreKeepsVerifiedIdentitySeparateFromEmailMetadata(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	s := NewMemoryStore()
+
+	first, err := s.UpsertIdentity(ctx, "https://clerk.example/", "user-1", "Owner@Example.com")
+	if err != nil {
+		t.Fatal(err)
+	}
+	again, err := s.UpsertIdentity(ctx, "https://clerk.example", "user-1", "new@example.com")
+	if err != nil {
+		t.Fatal(err)
+	}
+	otherIssuer, err := s.UpsertIdentity(ctx, "https://other.example", "user-1", "new@example.com")
+	if err != nil {
+		t.Fatal(err)
+	}
+	unverified, _, _, err := s.CreateDeviceToken(ctx, "new@example.com", "Operations device")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.ID != again.ID || again.Email != "new@example.com" {
+		t.Fatalf("identity was not stably upserted: first=%+v again=%+v", first, again)
+	}
+	if otherIssuer.ID == first.ID || unverified.ID == first.ID || unverified.ID == otherIssuer.ID {
+		t.Fatalf("email metadata merged distinct principals: verified=%q other=%q unverified=%q", first.ID, otherIssuer.ID, unverified.ID)
+	}
+	createdUser, device, token, err := s.CreateDeviceTokenForUser(ctx, first.ID, "Phone")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if createdUser.ID != first.ID || device.UserID != first.ID || token == "" {
+		t.Fatalf("unexpected verified device credentials: user=%+v device=%+v token_empty=%v", createdUser, device, token == "")
+	}
+}
+
 func TestMemoryStoreCreatePairingRequiresExistingCompanionTokenForClaimedAgent(t *testing.T) {
 	ctx := context.Background()
 	s := NewMemoryStore()
@@ -14,14 +50,21 @@ func TestMemoryStoreCreatePairingRequiresExistingCompanionTokenForClaimedAgent(t
 	if err != nil {
 		t.Fatalf("first pairing: %v", err)
 	}
+	if agents := s.agents; agents["agent-1"].Status != "offline" || agents["agent-1"].LastSeenAt != nil {
+		t.Fatalf("pairing marked agent online before tunnel connection: %+v", agents["agent-1"])
+	}
 
 	user, _, _, err := s.CreateDeviceToken(ctx, "owner@example.com", "Phone")
 	if err != nil {
 		t.Fatalf("create device token: %v", err)
 	}
 
-	if _, err := s.ClaimPairing(ctx, firstPairing.Code, user.ID); err != nil {
+	claimed, err := s.ClaimPairing(ctx, firstPairing.Code, user.ID)
+	if err != nil {
 		t.Fatalf("claim pairing: %v", err)
+	}
+	if claimed.Status != "offline" || claimed.LastSeenAt != nil {
+		t.Fatalf("claim marked agent online before tunnel connection: %+v", claimed)
 	}
 
 	if _, err := s.CreatePairing(ctx, "agent-1", "Hermes", time.Minute, ""); err != ErrUnauthorized {

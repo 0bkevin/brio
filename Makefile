@@ -53,7 +53,7 @@ dev-mobile:
 	cd $(MOBILE_DIR) && npm run web -- --localhost
 
 dev-relay:
-	cd apps/relay && go run . serve --addr "$(BRIO_RELAY_ADDR)"
+	cd apps/relay && go run . serve --addr "$(BRIO_RELAY_ADDR)" --insecure-dev-mode
 
 dev-connect:
 	cd apps/connect && go run . connect

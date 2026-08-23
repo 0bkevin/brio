@@ -3,6 +3,7 @@
   "main": "expo-router/entry",
   "version": "1.0.0",
   "dependencies": {
+    "@clerk/expo": "^4.5.2",
     "@expo-google-fonts/dm-sans": "^0.4.2",
     "@expo/ui": "~57.0.12",
     "@react-native-async-storage/async-storage": "2.2.0",
@@ -57,6 +58,9 @@
     "check": "npm run lint && npm run typecheck && npm test && npm run export:web"
   },
   "overrides": {
+    "jayson": {
+      "uuid": "^11.1.1"
+    },
     "xcode": {
       "uuid": "^11.1.1"
     }

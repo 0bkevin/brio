@@ -1,11 +1,12 @@
 import { scopedPath } from './profiles-model.ts';
 import { responseRequestBody, type ResponseRequestOptions } from './response-request.ts';
-import type {
-  HermesModelOptions,
-  HermesSession as HermesAnalyticsSession,
-  HermesSessionModelLock,
-  HermesSessionModelPayload,
-} from './hermes-api';
+import {
+  mergeRequestHeaders,
+  type HermesModelOptions,
+  type HermesSession as HermesAnalyticsSession,
+  type HermesSessionModelLock,
+  type HermesSessionModelPayload,
+} from './hermes-api.ts';
 import {
   normalizeContextBreakdown,
   normalizeLiveUsage,
@@ -326,6 +327,40 @@ export type RelayEnrollmentResponse = {
 
 function normalizeBaseURL(url: string) {
   return url.trim().replace(/\/+$/, '');
+}
+
+function parseRelayURL(rawURL: string) {
+  const normalized = normalizeBaseURL(rawURL);
+  const withScheme = /^[a-z][a-z\d+.-]*:/i.test(normalized) ? normalized : `https://${normalized}`;
+  const url = new URL(withScheme);
+  if (!url.hostname || url.username || url.password) {
+    throw new Error('Relay URL must include a host and must not include user info');
+  }
+  if (!['http:', 'https:', 'ws:', 'wss:'].includes(url.protocol)) {
+    throw new Error('Relay URL must use HTTP(S) or WebSocket transport');
+  }
+  if ((url.protocol === 'http:' || url.protocol === 'ws:') && !isLoopbackHostname(url.hostname)) {
+    throw new Error('Relay URL must use HTTPS/WSS outside loopback');
+  }
+  url.search = '';
+  url.hash = '';
+  return url;
+}
+
+function relayHTTPBaseURL(rawURL: string) {
+  const url = parseRelayURL(rawURL);
+  if (url.protocol === 'ws:') url.protocol = 'http:';
+  if (url.protocol === 'wss:') url.protocol = 'https:';
+  url.pathname = url.pathname.replace(/\/+$/, '') || '/';
+  return url.toString().replace(/\/$/, '');
+}
+
+function isLoopbackHostname(rawHostname: string) {
+  const hostname = rawHostname.toLowerCase().replace(/^\[|\]$/g, '');
+  if (hostname === 'localhost' || hostname.endsWith('.localhost')) return true;
+  if (hostname === '::1' || hostname === '0:0:0:0:0:0:0:1') return true;
+  const octets = hostname.split('.').map(Number);
+  return octets.length === 4 && octets.every((octet) => Number.isInteger(octet) && octet >= 0 && octet <= 255) && octets[0] === 127;
 }
 
 function cleanConnectionValue(value: string) {
@@ -1346,13 +1381,16 @@ export async function createRelayDevice(
   relayURL: string,
   email: string,
   deviceName = 'Brio mobile',
+  identityToken?: string,
   signal?: AbortSignal,
 ) {
-  const response = await fetchWithTimeout(`${normalizeBaseURL(relayURL)}/auth/devices`, {
+  const response = await fetchWithTimeout(`${relayHTTPBaseURL(relayURL)}/auth/devices`, {
     method: 'POST',
+    redirect: 'error',
     headers: {
       Accept: 'application/json',
       'Content-Type': 'application/json',
+      ...(identityToken ? { Authorization: `Bearer ${identityToken}` } : {}),
     },
     body: JSON.stringify({ email, device_name: deviceName }),
     signal,
@@ -1364,6 +1402,35 @@ export async function createRelayDevice(
   return body as RelayDeviceSession;
 }
 
+export async function revokeRelayDevice(
+  relayURL: string,
+  relayToken: string,
+  deviceID: string,
+) {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 5_000);
+  try {
+    const response = await fetch(
+      `${relayHTTPBaseURL(relayURL)}/devices/${encodeURIComponent(deviceID)}`,
+      {
+        method: 'DELETE',
+        redirect: 'error',
+        headers: {
+          Accept: 'application/json',
+          Authorization: `Bearer ${relayToken}`,
+        },
+        signal: controller.signal,
+      },
+    );
+    const body = await response.json().catch(() => null);
+    if (!response.ok) {
+      throw new Error(body?.error ?? 'Could not revoke relay device');
+    }
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
 export async function claimRelayPairing(
   relayURL: string,
   relayToken: string,
@@ -1371,9 +1438,10 @@ export async function claimRelayPairing(
   signal?: AbortSignal,
 ) {
   const response = await fetchWithTimeout(
-    `${normalizeBaseURL(relayURL)}/pairings/${encodeURIComponent(pairingCode)}/claim`,
+    `${relayHTTPBaseURL(relayURL)}/pairings/${encodeURIComponent(pairingCode)}/claim`,
     {
       method: 'POST',
+      redirect: 'error',
       headers: {
         Accept: 'application/json',
         Authorization: `Bearer ${relayToken}`,
@@ -1389,7 +1457,8 @@ export async function claimRelayPairing(
 }
 
 export async function listRelayAgents(relayURL: string, relayToken: string) {
-  const response = await fetchWithTimeout(`${normalizeBaseURL(relayURL)}/agents`, {
+  const response = await fetchWithTimeout(`${relayHTTPBaseURL(relayURL)}/agents`, {
+    redirect: 'error',
     headers: {
       Accept: 'application/json',
       Authorization: `Bearer ${relayToken}`,
@@ -1407,8 +1476,9 @@ export async function createRelayEnrollment(
   relayToken: string,
   name = 'Hermes',
 ) {
-  const response = await fetchWithTimeout(`${normalizeBaseURL(relayURL)}/enrollments`, {
+  const response = await fetchWithTimeout(`${relayHTTPBaseURL(relayURL)}/enrollments`, {
     method: 'POST',
+    redirect: 'error',
     headers: {
       Accept: 'application/json',
       Authorization: `Bearer ${relayToken}`,
@@ -1430,9 +1500,10 @@ export async function recoverRelayAgent(
   name?: string,
 ) {
   const response = await fetchWithTimeout(
-    `${normalizeBaseURL(relayURL)}/agents/${encodeURIComponent(agentID)}/recover`,
+    `${relayHTTPBaseURL(relayURL)}/agents/${encodeURIComponent(agentID)}/recover`,
     {
       method: 'POST',
+      redirect: 'error',
       headers: {
         Accept: 'application/json',
         Authorization: `Bearer ${relayToken}`,
@@ -1449,21 +1520,285 @@ export async function recoverRelayAgent(
 }
 
 type RelayFrame = {
-  type: 'request' | 'response' | 'error';
+  type: 'request' | 'response' | 'stream_chunk' | 'stream_end' | 'error' | 'ping' | 'pong';
   id: string;
   method?: string;
   path?: string;
   status?: number;
   headers?: Record<string, string>;
   body?: unknown;
+  data?: string;
   code?: string;
   message?: string;
 };
+
+type PendingRelayRequest = {
+  resolve: (value: unknown) => void;
+  reject: (error: Error) => void;
+  timer: ReturnType<typeof setTimeout>;
+  chunks: unknown[];
+  onChunk?: (chunk: string) => void;
+  onTerminalHeaders?: (headers: Record<string, string>) => void;
+  signal?: AbortSignal;
+  abort?: () => void;
+};
+
+const relayClients = new Map<string, RelaySocketClient>();
+const RELAY_TUNNEL_SUBPROTOCOL = 'brio.tunnel.v1';
+const RELAY_MOBILE_AUTH_SUBPROTOCOL = 'brio.mobile.auth.';
+
+class RelaySocketClient {
+  private readonly wsURL: string;
+  private readonly authSubprotocol: string;
+  private readonly cacheKey: string;
+  private socket: WebSocket | null = null;
+  private opening: Promise<void> | null = null;
+  private pending = new Map<string, PendingRelayRequest>();
+
+  constructor(wsURL: string, relayToken: string, cacheKey: string) {
+    this.wsURL = wsURL;
+    this.cacheKey = cacheKey;
+    if (!/^[A-Za-z0-9._~-]+$/.test(relayToken)) {
+      throw new Error('Relay device token cannot be used as a WebSocket credential');
+    }
+    this.authSubprotocol = `${RELAY_MOBILE_AUTH_SUBPROTOCOL}${relayToken}`;
+  }
+
+  request<T>(
+    frame: RelayFrame,
+    timeoutMs = 5 * 60 * 1000,
+    onChunk?: (chunk: string) => void,
+    onTerminalHeaders?: (headers: Record<string, string>) => void,
+    signal?: AbortSignal,
+  ): Promise<T> {
+    return this.connect().then(
+      () =>
+        new Promise<T>((resolve, reject) => {
+          if (signal?.aborted) {
+            reject(new Error('Relay request cancelled'));
+            return;
+          }
+          const socket = this.socket;
+          if (!socket || socket.readyState !== WebSocket.OPEN) {
+            reject(new Error('Relay connection is not open'));
+            return;
+          }
+
+          const timer = setTimeout(() => {
+            if (this.pending.has(frame.id)) {
+              this.clearPending(frame.id);
+              reject(new Error('Relay request timed out'));
+            }
+          }, timeoutMs);
+
+          const abort = () => {
+            if (!this.pending.has(frame.id)) return;
+            this.clearPending(frame.id);
+            reject(new Error('Relay request cancelled'));
+          };
+
+          this.pending.set(frame.id, {
+            resolve: (value) => resolve(value as T),
+            reject,
+            timer,
+            chunks: [],
+            onChunk,
+            onTerminalHeaders,
+            signal,
+            abort,
+          });
+          signal?.addEventListener('abort', abort, { once: true });
+
+          try {
+            socket.send(JSON.stringify(frame));
+          } catch (error) {
+            this.clearPending(frame.id);
+            reject(error instanceof Error ? error : new Error(String(error)));
+          }
+        }),
+    );
+  }
+
+  private connect(): Promise<void> {
+    if (this.socket?.readyState === WebSocket.OPEN) {
+      return Promise.resolve();
+    }
+    if (this.opening) {
+      return this.opening;
+    }
+
+    this.opening = new Promise<void>((resolve, reject) => {
+      // Browsers cannot attach Authorization to a WebSocket upgrade. Negotiate
+      // the device credential as a role-bound subprotocol so it never appears
+      // in the URL or load-balancer request-target logs.
+      const socket = new WebSocket(this.wsURL, [RELAY_TUNNEL_SUBPROTOCOL, this.authSubprotocol]);
+      this.socket = socket;
+
+      const connectTimer = setTimeout(() => {
+        if (this.socket === socket) {
+          socket.close();
+          this.socket = null;
+        }
+        this.opening = null;
+        if (relayClients.get(this.cacheKey) === this) relayClients.delete(this.cacheKey);
+        reject(new Error('Relay connection timed out'));
+      }, 15000);
+
+      socket.onopen = () => {
+        clearTimeout(connectTimer);
+        this.opening = null;
+        resolve();
+      };
+
+      socket.onerror = () => {
+        clearTimeout(connectTimer);
+        if (this.opening) {
+          this.opening = null;
+          reject(new Error('Relay connection failed'));
+        }
+      };
+
+      socket.onmessage = (event) => {
+        this.handleMessage(String(event.data));
+      };
+
+      socket.onclose = () => {
+        clearTimeout(connectTimer);
+        if (this.socket !== socket) return;
+        const connectionWasOpening = this.opening !== null;
+        this.socket = null;
+        this.opening = null;
+        if (relayClients.get(this.cacheKey) === this) relayClients.delete(this.cacheKey);
+        this.rejectAll(new Error('Relay connection closed'));
+        if (connectionWasOpening) reject(new Error('Relay connection closed before opening'));
+      };
+    });
+
+    return this.opening;
+  }
+
+  close() {
+    const socket = this.socket;
+    if (relayClients.get(this.cacheKey) === this) relayClients.delete(this.cacheKey);
+    this.rejectAll(new Error('Relay connection closed'));
+    if (socket?.readyState === WebSocket.CONNECTING) {
+      socket.close();
+      return;
+    }
+    this.socket = null;
+    this.opening = null;
+    socket?.close();
+  }
+
+  private handleMessage(data: string) {
+    let frame: RelayFrame;
+    try {
+      frame = JSON.parse(data) as RelayFrame;
+    } catch {
+      return;
+    }
+
+    if (frame.type === 'ping') {
+      if (this.socket?.readyState === WebSocket.OPEN) {
+        this.socket.send(JSON.stringify({ type: 'pong', id: frame.id } satisfies RelayFrame));
+      }
+      return;
+    }
+
+    const pending = this.pending.get(frame.id);
+    if (!pending) {
+      return;
+    }
+
+    if (frame.type === 'stream_chunk') {
+      if (pending.onChunk) {
+        try {
+          pending.onChunk(String(frame.data ?? frame.body ?? ''));
+        } catch (error) {
+          this.clearPending(frame.id);
+          pending.reject(error instanceof Error ? error : new Error(String(error)));
+        }
+        return;
+      }
+      pending.chunks.push(frame.body ?? frame.data ?? null);
+      return;
+    }
+
+    this.clearPending(frame.id);
+
+    if (frame.type === 'error') {
+      pending.reject(new Error(frame.message ?? frame.code ?? 'Relay request failed'));
+      return;
+    }
+
+    if (frame.type === 'stream_end') {
+      pending.onTerminalHeaders?.(frame.headers ?? {});
+      if (pending.onChunk) {
+        pending.resolve(null);
+        return;
+      }
+      if (frame.body !== undefined) {
+        pending.resolve(frame.body);
+        return;
+      }
+      if (pending.chunks.length === 0) {
+        pending.resolve(null);
+        return;
+      }
+      if (pending.chunks.every((chunk) => typeof chunk === 'string')) {
+        const combined = pending.chunks.join('');
+        try {
+          pending.resolve(JSON.parse(combined));
+        } catch {
+          pending.reject(new Error('Relay returned streamed data that could not be decoded'));
+        }
+        return;
+      }
+      if (pending.chunks.length === 1) {
+        pending.resolve(pending.chunks[0]);
+        return;
+      }
+      pending.reject(new Error('Relay returned an unsupported streamed response'));
+      return;
+    }
+
+    if ((frame.status ?? 500) >= 400) {
+      const message =
+        typeof frame.body === 'object' && frame.body && 'error' in frame.body
+          ? String((frame.body as { error?: unknown }).error)
+          : `Request failed: ${frame.status}`;
+      pending.reject(new Error(message));
+      return;
+    }
+
+    pending.resolve(frame.body);
+  }
+
+  private clearPending(id: string) {
+    const pending = this.pending.get(id);
+    if (pending) {
+      clearTimeout(pending.timer);
+      if (pending.abort) pending.signal?.removeEventListener('abort', pending.abort);
+      this.pending.delete(id);
+    }
+  }
+
+  private rejectAll(error: Error) {
+    for (const [id, pending] of this.pending) {
+      clearTimeout(pending.timer);
+      if (pending.abort) pending.signal?.removeEventListener('abort', pending.abort);
+      pending.reject(error);
+      this.pending.delete(id);
+    }
+  }
+}
 
 function relayFetch<T>(
   connection: Pick<AgentConnection, 'url' | 'token'> & Partial<AgentConnection>,
   path: string,
   init: RequestInit,
+  onChunk?: (chunk: string) => void,
+  onTerminalHeaders?: (headers: Record<string, string>) => void,
 ): Promise<T> {
   const agentId = connection.agentId ?? connection.id;
   if (!agentId) {
@@ -1474,7 +1809,7 @@ function relayFetch<T>(
   if (!relayToken) {
     return Promise.reject(new Error('Relay connection is missing a device token'));
   }
-  const wsURL = relayTunnelURL(connection.url, agentId, relayToken);
+  const wsURL = relayTunnelURL(connection.url, agentId);
   const body =
     typeof init.body === 'string' && init.body.length > 0 ? JSON.parse(init.body) : null;
   const requestFrame: RelayFrame = {
@@ -1482,76 +1817,40 @@ function relayFetch<T>(
     id: frameId,
     method: init.method ?? 'GET',
     path,
-    headers: {
-      Authorization: `Bearer ${connection.token}`,
-    },
+    headers: mergeRequestHeaders(`Bearer ${connection.token}`, init.headers),
     body,
   };
 
-  return new Promise<T>((resolve, reject) => {
-    const socket = new WebSocket(wsURL);
-    let settled = false;
-    const finish = (callback: () => void) => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timeout);
-      init.signal?.removeEventListener('abort', abortRequest);
-      socket.close();
-      callback();
-    };
-    const abortRequest = () => finish(() => reject(new Error('Connection cancelled')));
-    const timeout = setTimeout(() => {
-      finish(() => reject(new Error('Relay request timed out')));
-    }, requestTimeoutForPath(path));
-
-    if (init.signal?.aborted) {
-      abortRequest();
-      return;
-    }
-    init.signal?.addEventListener('abort', abortRequest, { once: true });
-
-    socket.onopen = () => {
-      if (settled) return;
-      socket.send(JSON.stringify(requestFrame));
-    };
-    socket.onerror = () => {
-      finish(() => reject(new Error('Relay connection failed')));
-    };
-    socket.onmessage = (event) => {
-      const frame = JSON.parse(String(event.data)) as RelayFrame;
-      if (frame.id !== frameId) {
-        return;
-      }
-      if (frame.type === 'error') {
-        finish(() => reject(new Error(frame.message ?? frame.code ?? 'Relay request failed')));
-        return;
-      }
-      if ((frame.status ?? 500) >= 400) {
-        const message =
-          typeof frame.body === 'object' && frame.body && 'error' in frame.body
-            ? String((frame.body as { error?: unknown }).error)
-            : `Request failed: ${frame.status}`;
-        finish(() => reject(new Error(message)));
-        return;
-      }
-      finish(() => resolve(frame.body as T));
-    };
-  });
+  const clientKey = `${wsURL}\u0000${relayToken}`;
+  let client = relayClients.get(clientKey);
+  if (!client) {
+    client = new RelaySocketClient(wsURL, relayToken, clientKey);
+    relayClients.set(clientKey, client);
+  }
+  return client.request<T>(
+    requestFrame,
+    5 * 60 * 1000,
+    onChunk,
+    onTerminalHeaders,
+    init.signal ?? undefined,
+  );
 }
 
-function relayTunnelURL(baseURL: string, agentId: string, relayToken: string) {
-  const normalized = normalizeBaseURL(baseURL);
-  const withScheme = normalized.startsWith('http') || normalized.startsWith('ws')
-    ? normalized
-    : `https://${normalized}`;
-  const url = new URL(withScheme);
+export function disconnectRelayClients(relayToken: string) {
+  const suffix = `\u0000${relayToken}`;
+  for (const [key, client] of relayClients) {
+    if (key.endsWith(suffix)) client.close();
+  }
+}
+
+function relayTunnelURL(baseURL: string, agentId: string) {
+  const url = parseRelayURL(baseURL);
   if (url.protocol === 'http:') {
     url.protocol = 'ws:';
   } else if (url.protocol === 'https:') {
     url.protocol = 'wss:';
   }
-  url.pathname = `${url.pathname.replace(/\/+$/, '')}/tunnel/mobile/${agentId}`;
-  url.searchParams.set('token', relayToken);
+  url.pathname = `${url.pathname.replace(/\/+$/, '')}/tunnel/mobile/${encodeURIComponent(agentId)}`;
   return url.toString();
 }
 

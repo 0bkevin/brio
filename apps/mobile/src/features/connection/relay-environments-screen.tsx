@@ -1,7 +1,8 @@
+import { useClerk } from '@clerk/expo';
 import { useMutation, useQuery } from '@tanstack/react-query';
 import * as Clipboard from 'expo-clipboard';
 import { SymbolView } from 'expo-symbols';
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import { RefreshControl, ScrollView, StyleSheet, View } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 
@@ -10,18 +11,40 @@ import { T3Radius, T3Spacing, T3Typography } from '@/constants/t3-theme';
 import { useT3Theme } from '@/hooks/use-t3-theme';
 import {
   createRelayEnrollment,
+  disconnectRelayClients,
   getHealth,
   listRelayAgents,
   recoverRelayAgent,
+  revokeRelayDevice,
   type AgentConnection,
   type RelayAgent,
 } from '@/lib/brio';
+import { cloudAuthConfigured } from '@/lib/cloud-auth';
 import { useConnectionStore } from '@/state/connection-store';
 import { useRelaySessionStore, type RelaySession } from '@/state/relay-session-store';
 
 export function RelayEnvironmentsScreen({ session }: { session: RelaySession }) {
+  if (cloudAuthConfigured() && session.identitySubject) {
+    return <CloudRelayEnvironmentsScreen session={session} />;
+  }
+  return <RelayEnvironmentsContent session={session} />;
+}
+
+function CloudRelayEnvironmentsScreen({ session }: { session: RelaySession }) {
+  const { signOut } = useClerk();
+  return <RelayEnvironmentsContent onDisconnectIdentity={() => signOut()} session={session} />;
+}
+
+function RelayEnvironmentsContent({
+  onDisconnectIdentity,
+  session,
+}: {
+  onDisconnectIdentity?: () => Promise<unknown>;
+  session: RelaySession;
+}) {
   const colors = useT3Theme();
   const clearSession = useRelaySessionStore((state) => state.clearSession);
+  const saveSession = useRelaySessionStore((state) => state.saveSession);
   const removeRelayConnections = useConnectionStore((state) => state.removeRelayConnections);
   const saveConnection = useConnectionStore((state) => state.saveConnection);
   const [agentName, setAgentName] = useState('Hermes');
@@ -29,6 +52,8 @@ export function RelayEnvironmentsScreen({ session }: { session: RelaySession }) 
   const [connectingId, setConnectingId] = useState<string | null>(null);
   const [connectionError, setConnectionError] = useState('');
   const [copied, setCopied] = useState('');
+  const [activeEnrollment, setActiveEnrollment] = useState(session.activeEnrollment);
+  const [now, setNow] = useState(() => Date.now());
 
   const agents = useQuery({
     queryKey: ['relay-agents', session.relayURL, session.userID],
@@ -38,7 +63,12 @@ export function RelayEnvironmentsScreen({ session }: { session: RelaySession }) 
   const enrollment = useMutation({
     mutationFn: () =>
       createRelayEnrollment(session.relayURL, session.token, agentName.trim() || 'Hermes'),
-    onSuccess: () => void agents.refetch(),
+    onSuccess: async (result) => {
+      setActiveEnrollment(result);
+      setNow(Date.now());
+      await saveSession({ ...session, activeEnrollment: result });
+      void agents.refetch();
+    },
   });
   const recovery = useMutation({
     mutationFn: () => recoverRelayAgent(session.relayURL, session.token, recoveryAgentID.trim()),
@@ -80,9 +110,17 @@ export function RelayEnvironmentsScreen({ session }: { session: RelaySession }) 
 
   const disconnectRelay = async () => {
     setConnectionError('');
+    disconnectRelayClients(session.token);
     try {
-      await removeRelayConnections(session.relayURL);
-      await clearSession();
+      const results = await Promise.allSettled([
+        revokeRelayDevice(session.relayURL, session.token, session.deviceID),
+        removeRelayConnections(session.relayURL),
+        clearSession(),
+        onDisconnectIdentity?.(),
+      ]);
+      for (const result of results.slice(1)) {
+        if (result.status === 'rejected') throw result.reason;
+      }
     } catch (reason) {
       setConnectionError(reason instanceof Error ? reason.message : 'Could not disconnect Relay.');
     }
@@ -98,9 +136,23 @@ export function RelayEnvironmentsScreen({ session }: { session: RelaySession }) 
     }
   };
 
-  const enrollmentCommand = enrollment.data
-    ? `curl -fsSL https://github.com/0bkevin/brio/releases/latest/download/install.sh | BRIO_RELAY_URL=${shellQuote(session.relayURL)} BRIO_ENROLL_CODE=${shellQuote(enrollment.data.code)} BRIO_AGENT_NAME=${shellQuote(agentName.trim() || 'Hermes')} sh`
+  const enrollmentCommand = activeEnrollment
+    ? `curl -fsSL https://github.com/0bkevin/brio/releases/latest/download/install.sh | BRIO_RELAY_URL=${shellQuote(session.relayURL)} BRIO_ENROLL_CODE=${shellQuote(activeEnrollment.code)} BRIO_AGENT_NAME=${shellQuote(activeEnrollment.name || 'Hermes')} sh`
     : '';
+  const enrollmentExpired = Boolean(
+    activeEnrollment && Date.parse(activeEnrollment.expires_at) <= now,
+  );
+  const recoveryCommand = recovery.data
+    ? `brio recover --relay-url ${shellQuote(session.relayURL)} --agent-id ${shellQuote(recovery.data.agent_id)} --device-token ${shellQuote(session.token)} --restart`
+    : '';
+
+  useEffect(() => {
+    if (!activeEnrollment) return;
+    const expiresIn = Date.parse(activeEnrollment.expires_at) - Date.now();
+    if (expiresIn <= 0) return;
+    const timer = setTimeout(() => setNow(Date.now()), expiresIn);
+    return () => clearTimeout(timer);
+  }, [activeEnrollment]);
 
   return (
     <SafeAreaView style={[styles.safe, { backgroundColor: colors.screen }]}>
@@ -231,20 +283,29 @@ export function RelayEnvironmentsScreen({ session }: { session: RelaySession }) 
                   : 'Could not create a code.'}
               </AppText>
             ) : null}
-            {enrollment.data ? (
+            {activeEnrollment ? (
               <View style={[styles.output, { backgroundColor: colors.code }]}>
                 <AppText style={[styles.codeLabel, { color: colors.muted }]}>
                   Enrollment code
                 </AppText>
                 <AppText selectable style={styles.code}>
-                  {enrollment.data.code}
+                  {activeEnrollment.code}
                 </AppText>
                 <AppText selectable style={[styles.command, { color: colors.secondary }]}>
                   {enrollmentCommand}
                 </AppText>
-                <Button onPress={() => void copy('enrollment', enrollmentCommand)} tone="secondary">
-                  {copied === 'enrollment' ? 'Command copied' : 'Copy command'}
-                </Button>
+                {enrollmentExpired ? (
+                  <AppText style={[styles.inlineError, { color: colors.danger }]}>
+                    This enrollment code expired. Generate a new one before continuing.
+                  </AppText>
+                ) : (
+                  <Button
+                    onPress={() => void copy('enrollment', enrollmentCommand)}
+                    tone="secondary"
+                  >
+                    {copied === 'enrollment' ? 'Command copied' : 'Copy command'}
+                  </Button>
+                )}
               </View>
             ) : null}
           </Card>
@@ -282,33 +343,18 @@ export function RelayEnvironmentsScreen({ session }: { session: RelaySession }) 
             ) : null}
             {recovery.data ? (
               <View style={[styles.output, { backgroundColor: colors.code }]}>
+                <AppText style={[styles.cardDetail, { color: colors.muted }]}>
+                  This command contains a private device credential. Run it only on the matching
+                  Hermes machine.
+                </AppText>
                 <AppText selectable style={[styles.command, { color: colors.secondary }]}>
-                  {JSON.stringify(
-                    {
-                      agent_id: recovery.data.agent_id,
-                      relay_token: recovery.data.agent_token,
-                      code: recovery.data.code,
-                      expires_at: recovery.data.expires_at,
-                    },
-                    null,
-                    2,
-                  )}
+                  {recoveryCommand}
                 </AppText>
                 <Button
-                  onPress={() =>
-                    void copy(
-                      'recovery',
-                      JSON.stringify({
-                        agent_id: recovery.data.agent_id,
-                        relay_token: recovery.data.agent_token,
-                        code: recovery.data.code,
-                        expires_at: recovery.data.expires_at,
-                      }),
-                    )
-                  }
+                  onPress={() => void copy('recovery', recoveryCommand)}
                   tone="secondary"
                 >
-                  {copied === 'recovery' ? 'Details copied' : 'Copy recovery details'}
+                  {copied === 'recovery' ? 'Command copied' : 'Copy recovery command'}
                 </Button>
               </View>
             ) : null}

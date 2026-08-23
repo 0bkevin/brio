@@ -12,6 +12,7 @@ import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 
 import { T3Palette, T3Typography } from '@/constants/t3-theme';
 import { IncomingShareProvider } from '@/features/threads/incoming-share-context';
+import { CloudAuthProvider } from '@/lib/cloud-auth';
 import { parseBrioDeepLink } from '@/lib/profiles-model';
 import { useComposerStore } from '@/state/composer-store';
 import { useConnectionStore } from '@/state/connection-store';
@@ -108,33 +109,48 @@ export default function RootLayout() {
 
   return (
     <GestureHandlerRootView style={{ flex: 1 }}>
-      <QueryClientProvider client={queryClient}>
-        <ThemeProvider value={navigationTheme}>
-          <StatusBar style={dark ? 'light' : 'dark'} />
-          <IncomingShareProvider>
-            <Stack
-            screenOptions={{
-              contentStyle: { backgroundColor: colors.screen },
-              headerBackButtonDisplayMode: 'minimal',
-              headerShadowVisible: false,
-              headerStyle: { backgroundColor: colors.sheet },
-              headerTintColor: colors.foreground,
-              headerTitleStyle: { fontFamily: T3Typography.bold, fontSize: 18 },
-            }}>
-            <Stack.Screen name="index" options={{ headerShown: false }} />
-            <Stack.Screen name="connect" options={{ presentation: 'modal', title: 'Add Environment' }} />
-            <Stack.Screen name="relay" options={{ presentation: 'modal', title: 'Brio Relay' }} />
-            <Stack.Screen name="environments" options={{ presentation: 'modal', title: 'Environments' }} />
-            <Stack.Screen name="thread/[id]" options={{ title: 'Hermes' }} />
-            <Stack.Screen name="files" options={{ title: 'Files' }} />
-            <Stack.Screen name="command-center" options={{ title: 'Command Center' }} />
-            <Stack.Screen name="profiles" options={{ title: 'Hermes Profiles' }} />
-            <Stack.Screen name="settings" options={{ presentation: 'modal', title: 'Settings' }} />
-            <Stack.Screen name="explore" options={{ title: 'Diagnostics' }} />
-            </Stack>
-          </IncomingShareProvider>
-        </ThemeProvider>
-      </QueryClientProvider>
+      <CloudAuthProvider>
+        <QueryClientProvider client={queryClient}>
+          <ThemeProvider value={navigationTheme}>
+            <StatusBar style={dark ? 'light' : 'dark'} />
+            <IncomingShareProvider>
+              <Stack
+                screenOptions={{
+                  contentStyle: { backgroundColor: colors.screen },
+                  headerBackButtonDisplayMode: 'minimal',
+                  headerShadowVisible: false,
+                  headerStyle: { backgroundColor: colors.sheet },
+                  headerTintColor: colors.foreground,
+                  headerTitleStyle: { fontFamily: T3Typography.bold, fontSize: 18 },
+                }}
+              >
+                <Stack.Screen name="index" options={{ headerShown: false }} />
+                <Stack.Screen
+                  name="connect"
+                  options={{ presentation: 'modal', title: 'Add Environment' }}
+                />
+                <Stack.Screen
+                  name="relay"
+                  options={{ presentation: 'modal', title: 'Brio Relay' }}
+                />
+                <Stack.Screen
+                  name="environments"
+                  options={{ presentation: 'modal', title: 'Environments' }}
+                />
+                <Stack.Screen name="thread/[id]" options={{ title: 'Hermes' }} />
+                <Stack.Screen name="files" options={{ title: 'Files' }} />
+                <Stack.Screen name="command-center" options={{ title: 'Command Center' }} />
+                <Stack.Screen name="profiles" options={{ title: 'Hermes Profiles' }} />
+                <Stack.Screen
+                  name="settings"
+                  options={{ presentation: 'modal', title: 'Settings' }}
+                />
+                <Stack.Screen name="explore" options={{ title: 'Diagnostics' }} />
+              </Stack>
+            </IncomingShareProvider>
+          </ThemeProvider>
+        </QueryClientProvider>
+      </CloudAuthProvider>
     </GestureHandlerRootView>
   );
 }

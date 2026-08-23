@@ -37,6 +37,12 @@ func TestRecoverRelayAgent(t *testing.T) {
 	}
 }
 
+func TestRecoverRelayAgentRejectsPlaintextRemoteRelayBeforeSendingToken(t *testing.T) {
+	if _, err := recoverRelayAgent(t.Context(), "http://relay.example", "owner-token", "agent-1"); err == nil {
+		t.Fatal("recoverRelayAgent accepted a plaintext remote relay URL")
+	}
+}
+
 func TestRecoverCommandPersistsToken(t *testing.T) {
 	home := t.TempDir()
 	resetSetupEnv(t, home)
