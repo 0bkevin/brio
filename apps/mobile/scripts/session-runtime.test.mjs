@@ -4,12 +4,18 @@ import test from 'node:test';
 import {
   aggregateSessionAnalytics,
   buildRuntimeModelOptions,
+  mergeRuntimeUsage,
+  modelCapabilityBadges,
+  modelCostLabel,
   modelIncompatibilities,
+  modelIsUnavailable,
+  modelPricingFor,
   modelPresetKey,
   normalizeContextBreakdown,
   normalizeLiveUsage,
   normalizeModelOptions,
   parseModelPresets,
+  reasoningEffortChoices,
   selectedCapabilities,
   serializeModelPresets,
 } from '../src/lib/session-runtime.ts';
@@ -252,13 +258,15 @@ test('normalizeContextBreakdown normalizes categories and drops malformed number
 });
 
 test('aggregateSessionAnalytics prefers actual cost, filters by period, and clamps durations', () => {
+  // Millisecond timestamps (device-clock shaped); `since` is milliseconds too.
+  const base = 1_800_000_000_000;
   const sessions = [
     {
       id: 's1',
       source: 'hermes',
       model: 'claude-sonnet-4',
-      started_at: 100,
-      ended_at: 190,
+      started_at: base,
+      ended_at: base + 90_000,
       message_count: 2,
       input_tokens: 100,
       output_tokens: 50,
@@ -273,8 +281,8 @@ test('aggregateSessionAnalytics prefers actual cost, filters by period, and clam
       id: 's2',
       source: 'hermes',
       model: 'claude-sonnet-4',
-      started_at: 200,
-      ended_at: 260,
+      started_at: base + 100_000,
+      ended_at: base + 160_000,
       message_count: 1,
       input_tokens: 30,
       output_tokens: 70,
@@ -284,8 +292,8 @@ test('aggregateSessionAnalytics prefers actual cost, filters by period, and clam
       id: 's3',
       source: 'hermes',
       model: 'gpt-5',
-      started_at: 300,
-      ended_at: 250,
+      started_at: base + 200_000,
+      ended_at: base + 150_000,
       message_count: 1,
       input_tokens: 8,
       output_tokens: 9,
@@ -294,8 +302,8 @@ test('aggregateSessionAnalytics prefers actual cost, filters by period, and clam
       id: 's4',
       source: 'hermes',
       model: 'gpt-5',
-      started_at: 400,
-      ended_at: 460,
+      started_at: base + 300_000,
+      ended_at: base + 360_000,
       message_count: 1,
       input_tokens: 1,
       output_tokens: 2,
@@ -305,15 +313,15 @@ test('aggregateSessionAnalytics prefers actual cost, filters by period, and clam
       id: 'old',
       source: 'hermes',
       model: 'claude-sonnet-4',
-      started_at: 50,
-      ended_at: 60,
+      started_at: base - 50_000,
+      ended_at: base - 40_000,
       message_count: 1,
       input_tokens: 999,
       output_tokens: 999,
     },
   ];
 
-  const analytics = aggregateSessionAnalytics(sessions, { since: 100 });
+  const analytics = aggregateSessionAnalytics(sessions, { since: base });
   assert.equal(analytics.sessions, 4);
   assert.equal(analytics.inputTokens, 139);
   assert.equal(analytics.outputTokens, 131);
@@ -372,4 +380,179 @@ test('model preset keys parse, reject malformed entries, and roundtrip determini
   );
   assert.equal(serialized, '{"anthropic::claude-sonnet-4":{"effort":"high","fast":false},"ollama::llama3.2":{"fast":true}}');
   assert.equal(serializeModelPresets(parseModelPresets('junk')), '{}');
+});
+
+test('modelPricingFor resolves per-model maps and single pricing objects', () => {
+  const perModel = { pricing: { 'claude-x': { input: '3', output: '15', cache: null, free: false } } };
+  assert.deepEqual(modelPricingFor(perModel, 'claude-x'), { input: '3', output: '15', cache: null, free: false });
+  assert.equal(modelPricingFor(perModel, 'claude-y'), undefined);
+  const single = { pricing: { input: '1', output: '2' } };
+  assert.deepEqual(modelPricingFor(single, 'anything'), { input: '1', output: '2' });
+  assert.equal(modelPricingFor({ pricing: null }, 'm'), undefined);
+  assert.equal(modelPricingFor({}, 'm'), undefined);
+});
+
+test('modelCostLabel uses exact backend strings and never synthesizes zero', () => {
+  assert.equal(modelCostLabel({ input: '3', output: '15', cache: null, free: false }), '$3 in · $15 out per Mtok');
+  assert.equal(modelCostLabel({ input: '0', output: '0', free: false }), '$0 in · $0 out per Mtok');
+  assert.equal(modelCostLabel({ free: true }), 'Free');
+  // Missing price means unknown, never zero.
+  assert.equal(modelCostLabel(undefined), null);
+  assert.equal(modelCostLabel(null), null);
+  assert.equal(modelCostLabel({ input: '3' }), null);
+  assert.equal(modelCostLabel({ input: '', output: '2' }), null);
+  assert.equal(modelCostLabel({ input: '  ', output: '2' }), null);
+});
+
+test('reasoningEffortChoices only offers none when can_disable_reasoning is explicit', () => {
+  assert.deepEqual(reasoningEffortChoices({ reasoning: true, can_disable_reasoning: true }), ['none', 'low', 'medium', 'high']);
+  assert.deepEqual(reasoningEffortChoices({ reasoning: true, can_disable_reasoning: false }), ['low', 'medium', 'high']);
+  assert.deepEqual(reasoningEffortChoices({ reasoning: true }), ['low', 'medium', 'high']);
+  // Unknown capability means no invented toggle.
+  assert.deepEqual(reasoningEffortChoices({}), []);
+  assert.deepEqual(reasoningEffortChoices(undefined), []);
+  assert.deepEqual(reasoningEffortChoices(null), []);
+});
+
+test('modelIsUnavailable and modelCapabilityBadges respect explicit backend facts', () => {
+  const provider = { slug: 'p', name: 'P', unavailable_models: ['legacy'] };
+  assert.equal(modelIsUnavailable(provider, 'legacy'), true);
+  assert.equal(modelIsUnavailable(provider, 'current'), false);
+  assert.equal(modelIsUnavailable({ slug: 'p', name: 'P' }, 'm'), false);
+
+  assert.deepEqual(
+    modelCapabilityBadges({ fast: true, reasoning: true, vision: true, tools: true }),
+    ['reasoning', 'fast', 'vision', 'tools'],
+  );
+  assert.deepEqual(modelCapabilityBadges({ attachment: true }), ['vision']);
+  assert.deepEqual(modelCapabilityBadges({ input: { image: true } }), ['vision']);
+  assert.deepEqual(modelCapabilityBadges({ toolcall: true }), ['tools']);
+  // Unknown capabilities produce no invented badges.
+  assert.deepEqual(modelCapabilityBadges({}), []);
+  assert.deepEqual(modelCapabilityBadges(undefined), []);
+});
+
+test('aggregateSessionAnalytics normalizes epoch-second sessions against a millisecond since', () => {
+  const nowMs = 1_800_000_000_000; // device clock, milliseconds
+  const day = 86_400_000;
+  const sessions = [
+    {
+      id: 'recent-seconds',
+      source: 'hermes',
+      model: 'claude-sonnet-4',
+      started_at: (nowMs - 2 * day) / 1000,
+      ended_at: (nowMs - 2 * day) / 1000 + 90,
+      message_count: 1,
+      input_tokens: 10,
+      output_tokens: 5,
+    },
+    {
+      id: 'old-seconds',
+      source: 'hermes',
+      model: 'claude-sonnet-4',
+      started_at: (nowMs - 30 * day) / 1000,
+      ended_at: (nowMs - 30 * day) / 1000 + 60,
+      message_count: 1,
+      input_tokens: 999,
+      output_tokens: 999,
+    },
+  ];
+
+  const week = aggregateSessionAnalytics(sessions, { since: nowMs - 7 * day });
+  assert.equal(week.sessions, 1);
+  assert.equal(week.inputTokens, 10);
+  assert.equal(week.outputTokens, 5);
+  // Second-based timestamps keep second-based durations.
+  assert.ok(Math.abs(week.durationSeconds - 90) < 1e-9);
+
+  const month = aggregateSessionAnalytics(sessions, { since: nowMs - 31 * day });
+  assert.equal(month.sessions, 2);
+});
+
+test('aggregateSessionAnalytics supports millisecond session timestamps and converts durations', () => {
+  const nowMs = 1_800_000_000_000;
+  const day = 86_400_000;
+  const sessions = [
+    {
+      id: 'recent-ms',
+      source: 'hermes',
+      model: 'gpt-5',
+      started_at: nowMs - 2 * day,
+      ended_at: nowMs - 2 * day + 45_000,
+      message_count: 1,
+      input_tokens: 7,
+      output_tokens: 3,
+    },
+    {
+      id: 'old-ms',
+      source: 'hermes',
+      model: 'gpt-5',
+      started_at: nowMs - 20 * day,
+      ended_at: nowMs - 20 * day + 10_000,
+      message_count: 1,
+      input_tokens: 500,
+      output_tokens: 500,
+    },
+  ];
+
+  const week = aggregateSessionAnalytics(sessions, { since: nowMs - 7 * day });
+  assert.equal(week.sessions, 1);
+  assert.equal(week.inputTokens, 7);
+  // Millisecond durations are converted to seconds.
+  assert.ok(Math.abs(week.durationSeconds - 45) < 1e-9);
+
+  assert.equal(aggregateSessionAnalytics(sessions, { since: nowMs - 21 * day }).sessions, 2);
+});
+
+test('mergeRuntimeUsage preserves existing metrics when incoming is sparse', () => {
+  const rich = {
+    inputTokens: 100,
+    outputTokens: 50,
+    totalTokens: 150,
+    reasoningTokens: 20,
+    cacheReadTokens: 30,
+    cacheWriteTokens: 0,
+    apiCalls: 4,
+    contextUsed: 120,
+    contextMax: 200,
+    contextPercent: 60,
+    estimatedCostUsd: 0.25,
+    actualCostUsd: 0,
+    durationSeconds: 12.5,
+    model: 'claude-sonnet-4',
+  };
+
+  // A final three-token Responses usage must not erase richer live metrics.
+  const mergedSparse = mergeRuntimeUsage(rich, { inputTokens: 3, outputTokens: 3, totalTokens: 6 });
+  assert.deepEqual(mergedSparse, {
+    ...rich,
+    inputTokens: 3,
+    outputTokens: 3,
+    totalTokens: 6,
+  });
+
+  // Numeric zero and real model strings are accepted as incoming values.
+  assert.equal(mergedSparse.cacheWriteTokens, 0);
+  assert.equal(mergedSparse.actualCostUsd, 0);
+
+  // A sparse poll keeps the stored values untouched.
+  assert.deepEqual(mergeRuntimeUsage(rich, {}), rich);
+  assert.deepEqual(
+    mergeRuntimeUsage(rich, { inputTokens: undefined, outputTokens: null }),
+    rich,
+  );
+
+  // Incoming defined values win; unknown model strings never overwrite.
+  const overwritten = mergeRuntimeUsage(rich, { model: 'gpt-5', apiCalls: 9 });
+  assert.equal(overwritten.model, 'gpt-5');
+  assert.equal(overwritten.apiCalls, 9);
+  assert.equal(mergeRuntimeUsage(rich, { model: '' }).model, 'claude-sonnet-4');
+  assert.equal(mergeRuntimeUsage(rich, { model: null }).model, 'claude-sonnet-4');
+
+  // Identity/fallback semantics.
+  assert.equal(mergeRuntimeUsage(undefined, undefined), undefined);
+  assert.equal(mergeRuntimeUsage(null, null), undefined);
+  assert.deepEqual(mergeRuntimeUsage(undefined, { inputTokens: 1 }), { inputTokens: 1 });
+  assert.deepEqual(mergeRuntimeUsage(rich, undefined), rich);
+  assert.deepEqual(mergeRuntimeUsage(rich, null), rich);
 });

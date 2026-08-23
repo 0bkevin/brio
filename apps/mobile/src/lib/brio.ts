@@ -8,6 +8,10 @@ import {
 import {
   normalizeHermesSessionMessages,
   normalizeHermesSessions,
+  SESSION_ID_HEADER,
+  headerValue,
+  mergeRequestHeaders,
+  sessionIdentityHeaders,
   type HermesModelOptions,
   type HermesSession,
   type HermesSessionMessage,
@@ -428,6 +432,8 @@ export type ResponseRequestOptions = {
   provider?: string;
   model?: string;
   modelOptions?: Record<string, unknown>;
+  // Stable runtime session identity sent as X-Hermes-Session-Id.
+  sessionId?: string;
 };
 
 export async function sendResponse(
@@ -435,9 +441,11 @@ export async function sendResponse(
   prompt: string,
   options: ResponseRequestOptions = {},
 ) {
+  const sessionHeaders = sessionIdentityHeaders(options.sessionId);
   return brioFetch<HermesResponse>(connection, '/v1/responses', {
     method: 'POST',
     body: JSON.stringify(responseRequestBody(prompt, options, false)),
+    ...(sessionHeaders ? { headers: sessionHeaders } : {}),
   });
 }
 
@@ -450,15 +458,20 @@ export async function sendResponseStream(
 ) {
   const parser = new ResponsesSSEParser(options.onTextDelta);
   const body = JSON.stringify(responseRequestBody(prompt, options, true));
+  const sessionHeaders = sessionIdentityHeaders(options.sessionId);
 
   if (connection.transport === 'relay') {
+    let terminalSessionId = '';
     await relayFetch<null>(
       connection,
       '/v1/responses',
-      { method: 'POST', body },
+      { method: 'POST', body, ...(sessionHeaders ? { headers: sessionHeaders } : {}) },
       (chunk) => parser.push(chunk),
+      (headers) => {
+        terminalSessionId = headerValue(headers, SESSION_ID_HEADER)?.trim() ?? '';
+      },
     );
-    return parser.finish();
+    return withFallbackSessionId(parser.finish(), terminalSessionId);
   }
 
   const response = await expoFetch(`${normalizeBaseURL(connection.url)}/v1/responses`, {
@@ -467,9 +480,11 @@ export async function sendResponseStream(
       Accept: 'text/event-stream, application/json',
       'Content-Type': 'application/json',
       Authorization: `Bearer ${connection.token}`,
+      ...(sessionHeaders ?? {}),
     },
     body,
   });
+  const directSessionId = response.headers.get(SESSION_ID_HEADER)?.trim() ?? '';
   const contentType = response.headers.get('Content-Type')?.toLowerCase() ?? '';
   if (!response.ok || !contentType.includes('text/event-stream')) {
     const text = await response.text();
@@ -479,7 +494,7 @@ export async function sendResponseStream(
       throw new Error(error ?? `Request failed: ${response.status}`);
     }
     if (!result) throw new Error('Agent returned an empty response');
-    return result;
+    return withFallbackSessionId(result, directSessionId);
   }
 
   const reader = response.body?.getReader();
@@ -491,7 +506,15 @@ export async function sendResponseStream(
     parser.push(decoder.decode(value, { stream: true }));
   }
   parser.push(decoder.decode());
-  return parser.finish();
+  return withFallbackSessionId(parser.finish(), directSessionId);
+}
+
+// A session id from the body always wins; transport headers only fill the gap.
+function withFallbackSessionId(response: HermesResponse, headerSessionId: string): HermesResponse {
+  if (!response.session_id?.trim() && headerSessionId) {
+    response.session_id = headerSessionId;
+  }
+  return response;
 }
 
 function responseRequestBody(
@@ -844,6 +867,7 @@ type PendingRelayRequest = {
   timer: ReturnType<typeof setTimeout>;
   chunks: unknown[];
   onChunk?: (chunk: string) => void;
+  onTerminalHeaders?: (headers: Record<string, string>) => void;
 };
 
 const relayClients = new Map<string, RelaySocketClient>();
@@ -858,7 +882,12 @@ class RelaySocketClient {
     this.wsURL = wsURL;
   }
 
-  request<T>(frame: RelayFrame, timeoutMs = 5 * 60 * 1000, onChunk?: (chunk: string) => void): Promise<T> {
+  request<T>(
+    frame: RelayFrame,
+    timeoutMs = 5 * 60 * 1000,
+    onChunk?: (chunk: string) => void,
+    onTerminalHeaders?: (headers: Record<string, string>) => void,
+  ): Promise<T> {
     return this.connect().then(
       () =>
         new Promise<T>((resolve, reject) => {
@@ -880,6 +909,7 @@ class RelaySocketClient {
             timer,
             chunks: [],
             onChunk,
+            onTerminalHeaders,
           });
 
           try {
@@ -986,6 +1016,7 @@ class RelaySocketClient {
     }
 
     if (frame.type === 'stream_end') {
+      pending.onTerminalHeaders?.(frame.headers ?? {});
       if (pending.onChunk) {
         pending.resolve(null);
         return;
@@ -1049,6 +1080,7 @@ function relayFetch<T>(
   path: string,
   init: RequestInit,
   onChunk?: (chunk: string) => void,
+  onTerminalHeaders?: (headers: Record<string, string>) => void,
 ): Promise<T> {
   const agentId = connection.agentId ?? connection.id;
   if (!agentId) {
@@ -1067,9 +1099,9 @@ function relayFetch<T>(
     id: frameId,
     method: init.method ?? 'GET',
     path,
-    headers: {
-      Authorization: `Bearer ${connection.token}`,
-    },
+    // Caller headers ride along on top of the agent Authorization instead of
+    // being discarded (for example X-Hermes-Session-Id).
+    headers: mergeRequestHeaders(`Bearer ${connection.token}`, init.headers),
     body,
   };
 
@@ -1078,7 +1110,7 @@ function relayFetch<T>(
     client = new RelaySocketClient(wsURL);
     relayClients.set(wsURL, client);
   }
-  return client.request<T>(requestFrame, 5 * 60 * 1000, onChunk);
+  return client.request<T>(requestFrame, 5 * 60 * 1000, onChunk, onTerminalHeaders);
 }
 
 function relayTunnelURL(baseURL: string, agentId: string, relayToken: string) {

@@ -2,11 +2,16 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 
 import {
+  SESSION_ID_HEADER,
+  flattenHeaders,
   getHermesModelOptions,
   getHermesSession,
+  headerValue,
+  mergeRequestHeaders,
   normalizeHermesRunUsage,
   normalizeHermesSessionMessages,
   normalizeHermesSessions,
+  sessionIdentityHeaders,
   setHermesSessionModel,
 } from '../src/lib/hermes-api.ts';
 
@@ -235,4 +240,47 @@ test('normalizeHermesRunUsage accepts both API and control-RPC usage shapes', ()
   );
 
   assert.equal(normalizeHermesRunUsage({ input_tokens: Number.NaN }).input_tokens, null);
+});
+
+test('session identity headers are only sent for non-empty ids', () => {
+  assert.deepEqual(sessionIdentityHeaders('sess_1'), { [SESSION_ID_HEADER]: 'sess_1' });
+  assert.deepEqual(sessionIdentityHeaders('  sess_1  '), { [SESSION_ID_HEADER]: 'sess_1' });
+  assert.equal(sessionIdentityHeaders(undefined), undefined);
+  assert.equal(sessionIdentityHeaders(null), undefined);
+  assert.equal(sessionIdentityHeaders('   '), undefined);
+  assert.equal(sessionIdentityHeaders(''), undefined);
+});
+
+test('relay request headers keep Authorization and merge caller headers on top', () => {
+  assert.deepEqual(mergeRequestHeaders('Bearer agent'), { Authorization: 'Bearer agent' });
+  assert.deepEqual(mergeRequestHeaders('Bearer agent', { [SESSION_ID_HEADER]: 'sess_9' }), {
+    Authorization: 'Bearer agent',
+    [SESSION_ID_HEADER]: 'sess_9',
+  });
+  // The connection Authorization always wins: a caller-supplied Authorization
+  // is dropped, never allowed to override the frame credential.
+  assert.deepEqual(
+    mergeRequestHeaders('Bearer agent', {
+      Authorization: 'Bearer caller-token',
+      [SESSION_ID_HEADER]: 'sess_9',
+    }),
+    { Authorization: 'Bearer agent', [SESSION_ID_HEADER]: 'sess_9' },
+  );
+  assert.deepEqual(flattenHeaders([['a', '1'], ['b', '2']]), { a: '1', b: '2' });
+  assert.deepEqual(flattenHeaders(undefined), {});
+  if (typeof Headers !== 'undefined') {
+    // Node's Headers normalizes keys to lowercase; consumers use headerValue,
+    // which is case-insensitive.
+    assert.deepEqual(flattenHeaders(new Headers({ [SESSION_ID_HEADER]: 'sess_9' })), {
+      'x-hermes-session-id': 'sess_9',
+    });
+  }
+});
+
+test('headerValue looks up terminal headers case-insensitively', () => {
+  assert.equal(headerValue({ 'x-hermes-session-id': 'sess_1' }, SESSION_ID_HEADER), 'sess_1');
+  assert.equal(headerValue({ 'X-HERMES-SESSION-ID': 'sess_2' }, SESSION_ID_HEADER), 'sess_2');
+  assert.equal(headerValue({ [SESSION_ID_HEADER]: '' }, SESSION_ID_HEADER), undefined);
+  assert.equal(headerValue({}, SESSION_ID_HEADER), undefined);
+  assert.equal(headerValue(undefined, SESSION_ID_HEADER), undefined);
 });

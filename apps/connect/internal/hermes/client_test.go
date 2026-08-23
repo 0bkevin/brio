@@ -317,6 +317,64 @@ func TestStreamEventStreamPreservesSplitUTF8(t *testing.T) {
 	}
 }
 
+func TestStreamEventStreamTerminalHeadersCarrySessionID(t *testing.T) {
+	sse := "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\"}}\n\n"
+	resp := &http.Response{
+		StatusCode: http.StatusOK,
+		Header: http.Header{
+			"Content-Type":        []string{"text/event-stream"},
+			"X-Hermes-Session-Id": []string{"sess_42"},
+		},
+		Body: io.NopCloser(strings.NewReader(sse)),
+	}
+	frames := []tunnel.Frame{}
+	if err := streamEventStream("sessioned", resp, func(frame tunnel.Frame) error {
+		frames = append(frames, frame)
+		return nil
+	}); err != nil {
+		t.Fatalf("streamEventStream returned error: %v", err)
+	}
+	var end *tunnel.Frame
+	for i := range frames {
+		if frames[i].Type == "stream_end" {
+			end = &frames[i]
+		}
+	}
+	if end == nil {
+		t.Fatalf("frames = %+v, want a terminal stream_end", frames)
+	}
+	if end.Headers["Content-Type"] != "text/event-stream" {
+		t.Fatalf("stream_end Content-Type = %q, want text/event-stream", end.Headers["Content-Type"])
+	}
+	if end.Headers["X-Hermes-Session-Id"] != "sess_42" {
+		t.Fatalf("stream_end X-Hermes-Session-Id = %q, want sess_42", end.Headers["X-Hermes-Session-Id"])
+	}
+
+	// Without the header the key is simply absent, never fabricated.
+	resp = &http.Response{
+		StatusCode: http.StatusOK,
+		Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+		Body:       io.NopCloser(strings.NewReader(sse)),
+	}
+	frames = frames[:0]
+	if err := streamEventStream("plain", resp, func(frame tunnel.Frame) error {
+		frames = append(frames, frame)
+		return nil
+	}); err != nil {
+		t.Fatalf("streamEventStream returned error: %v", err)
+	}
+	for _, frame := range frames {
+		if frame.Type == "stream_end" {
+			if _, ok := frame.Headers["X-Hermes-Session-Id"]; ok {
+				t.Fatalf("stream_end headers = %v, want no session id key", frame.Headers)
+			}
+			if frame.Headers["Content-Type"] != "text/event-stream" {
+				t.Fatalf("stream_end Content-Type = %q, want text/event-stream", frame.Headers["Content-Type"])
+			}
+		}
+	}
+}
+
 func TestStreamEventStreamRejectsOversizedLine(t *testing.T) {
 	resp := &http.Response{
 		StatusCode: http.StatusOK,

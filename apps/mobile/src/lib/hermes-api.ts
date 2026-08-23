@@ -1,3 +1,60 @@
+// X-Hermes-Session-Id is the native stable runtime session identifier. It is
+// sent on /v1/responses requests and echoed on responses so conversations can
+// be continued (and authenticated) under one stable session identity.
+export const SESSION_ID_HEADER = 'X-Hermes-Session-Id';
+
+export function sessionIdentityHeaders(
+  sessionId?: string | null,
+): Record<string, string> | undefined {
+  const id = typeof sessionId === 'string' ? sessionId.trim() : '';
+  return id ? { [SESSION_ID_HEADER]: id } : undefined;
+}
+
+export function flattenHeaders(extra?: HeadersInit): Record<string, string> {
+  if (!extra) return {};
+  if (Array.isArray(extra)) {
+    const flat: Record<string, string> = {};
+    for (const [key, value] of extra) flat[key] = value;
+    return flat;
+  }
+  if (typeof Headers !== 'undefined' && extra instanceof Headers) {
+    const flat: Record<string, string> = {};
+    extra.forEach((value, key) => {
+      flat[key] = value;
+    });
+    return flat;
+  }
+  return { ...(extra as Record<string, string>) };
+}
+
+// Relay frames carry their own Authorization; caller headers (like the session
+// identity header) are merged on top instead of being discarded. The
+// connection's Authorization always wins — a caller can never override it.
+export function mergeRequestHeaders(
+  authorization: string,
+  extra?: HeadersInit,
+): Record<string, string> {
+  const headers: Record<string, string> = {};
+  for (const [key, value] of Object.entries(flattenHeaders(extra))) {
+    if (key.toLowerCase() === 'authorization') continue;
+    headers[key] = value;
+  }
+  return { Authorization: authorization, ...headers };
+}
+
+// Case-insensitive header lookup for terminal frame headers.
+export function headerValue(
+  headers: Record<string, string> | undefined,
+  name: string,
+): string | undefined {
+  if (!headers) return undefined;
+  const target = name.toLowerCase();
+  for (const [key, value] of Object.entries(headers)) {
+    if (key.toLowerCase() === target && value) return value;
+  }
+  return undefined;
+}
+
 export type HermesRequest = {
   baseUrl: string;
   apiKey?: string | null;

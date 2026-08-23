@@ -3,6 +3,7 @@ import type {
   HermesSession,
   ModelCapabilities,
   ModelOptionProvider,
+  ModelPricing,
 } from './hermes-api';
 
 export type RuntimeModelOptions = {
@@ -127,6 +128,19 @@ export function normalizeModelOptions(raw: unknown): HermesModelOptions {
   };
 }
 
+export function findProviderOption(
+  options: HermesModelOptions,
+  provider?: string | null,
+): ModelOptionProvider | undefined {
+  const target = nonEmptyString(provider);
+  if (!target) return undefined;
+  return options.providers.find((candidate) => {
+    if (candidate.slug === target || candidate.name === target) return true;
+    const aliases = candidate.aliases;
+    return Array.isArray(aliases) && aliases.some((alias) => alias === target);
+  });
+}
+
 export function selectedCapabilities(
   options: HermesModelOptions,
   provider?: string | null,
@@ -134,11 +148,7 @@ export function selectedCapabilities(
 ): ModelCapabilities | undefined {
   const target = nonEmptyString(provider);
   if (!target) return undefined;
-  const match = options.providers.find((candidate) => {
-    if (candidate.slug === target || candidate.name === target) return true;
-    const aliases = candidate.aliases;
-    return Array.isArray(aliases) && aliases.some((alias) => alias === target);
-  });
+  const match = findProviderOption(options, provider);
   if (!match) return undefined;
   const capabilities = match.capabilities as Record<string, unknown> | null | undefined;
   if (!isRecord(capabilities)) return undefined;
@@ -307,6 +317,17 @@ export function serializeModelPresets(presets: ModelPresetMap | null | undefined
   return JSON.stringify(Object.fromEntries(entries));
 }
 
+// Epoch values below 10^11 are seconds (dates before ~5138 CE in seconds);
+// anything larger is already milliseconds. Hermes sessions normally report
+// epoch seconds while device clocks are milliseconds.
+function isMilliseconds(timestamp: number): boolean {
+  return timestamp >= 100_000_000_000;
+}
+
+function toMilliseconds(timestamp: number): number {
+  return isMilliseconds(timestamp) ? timestamp : timestamp * 1000;
+}
+
 function emptyAnalyticsBucket(): SessionAnalyticsBucket {
   return {
     sessions: 0,
@@ -334,7 +355,9 @@ function accumulateSession(bucket: SessionAnalyticsBucket, session: HermesSessio
   const startedAt = toNonNegativeNumber(session.started_at);
   const endedAt = toNonNegativeNumber(session.ended_at);
   if (startedAt !== undefined && endedAt !== undefined) {
-    bucket.durationSeconds += Math.max(0, endedAt - startedAt);
+    // Duration stays in seconds regardless of the timestamp unit used.
+    const rawDuration = Math.max(0, endedAt - startedAt);
+    bucket.durationSeconds += isMilliseconds(startedAt) ? rawDuration / 1000 : rawDuration;
   }
 
   // Actual cost wins whenever it is present, even when it is exactly zero.
@@ -353,7 +376,9 @@ export function aggregateSessionAnalytics(
   sessions: readonly HermesSession[],
   options: { since?: number } = {},
 ): SessionAnalytics {
-  const since = typeof options.since === 'number' && Number.isFinite(options.since)
+  // `since` is a device-clock (millisecond) lower bound; session timestamps
+  // may be epoch seconds or milliseconds, so both sides are normalized.
+  const sinceMs = typeof options.since === 'number' && Number.isFinite(options.since)
     ? options.since
     : undefined;
   const totals = emptyAnalyticsBucket();
@@ -361,7 +386,12 @@ export function aggregateSessionAnalytics(
   for (const session of sessions ?? []) {
     if (!session || typeof session !== 'object') continue;
     const startedAt = toNonNegativeNumber(session.started_at);
-    if (since !== undefined && (startedAt === undefined || startedAt < since)) continue;
+    if (
+      sinceMs !== undefined &&
+      (startedAt === undefined || toMilliseconds(startedAt) < sinceMs)
+    ) {
+      continue;
+    }
     accumulateSession(totals, session);
     const model = nonEmptyString(session.model);
     if (model) {
@@ -370,4 +400,95 @@ export function aggregateSessionAnalytics(
     }
   }
   return { ...totals, byModel };
+}
+
+// Merge live/poll usage into stored usage without erasing known metrics:
+// incoming defined values win (including numeric zero and real model strings),
+// while incoming undefined/null fields preserve the current value. A sparse
+// final Responses usage or a sparse poll can therefore never wipe richer data.
+export function mergeRuntimeUsage(
+  current?: NormalizedRuntimeUsage | null,
+  incoming?: NormalizedRuntimeUsage | null,
+): NormalizedRuntimeUsage | undefined {
+  if (!current && !incoming) return undefined;
+  if (!current) return incoming ?? undefined;
+  if (!incoming) return current;
+  const merged: NormalizedRuntimeUsage = { ...current };
+  for (const [key, value] of Object.entries(incoming)) {
+    if (value === undefined || value === null) continue;
+    if (key === 'model') {
+      if (typeof value === 'string' && value.trim() !== '') merged.model = value;
+      continue;
+    }
+    if (typeof value === 'number' && Number.isFinite(value)) {
+      merged[key as keyof Omit<NormalizedRuntimeUsage, 'model'>] = value;
+    }
+  }
+  return merged;
+}
+
+function looksLikePricing(value: unknown): value is ModelPricing {
+  return (
+    isRecord(value) &&
+    (typeof value.input === 'string' ||
+      typeof value.output === 'string' ||
+      value.free === true)
+  );
+}
+
+// Provider pricing is either a single ModelPricing or a map keyed by model.
+export function modelPricingFor(
+  provider: ModelOptionProvider,
+  model: string,
+): ModelPricing | undefined {
+  const pricing = provider.pricing;
+  if (!isRecord(pricing)) return undefined;
+  if (looksLikePricing(pricing)) return pricing;
+  const entry = pricing[model];
+  return looksLikePricing(entry) ? entry : undefined;
+}
+
+// Exact backend cost strings. A missing price means unknown — never zero.
+export function modelCostLabel(pricing?: ModelPricing | null): string | null {
+  if (!pricing) return null;
+  if (pricing.free === true) return 'Free';
+  const input = typeof pricing.input === 'string' ? pricing.input.trim() : '';
+  const output = typeof pricing.output === 'string' ? pricing.output.trim() : '';
+  if (!input || !output) return null;
+  return `$${input} in · $${output} out per Mtok`;
+}
+
+export type ReasoningEffortChoice = 'none' | 'low' | 'medium' | 'high';
+
+// Reasoning controls exist only when the backend explicitly advertises
+// reasoning; "none" only when can_disable_reasoning is explicitly true.
+export function reasoningEffortChoices(
+  capabilities?: ModelCapabilities | null,
+): ReasoningEffortChoice[] {
+  if (!capabilities || capabilities.reasoning !== true) return [];
+  return capabilities.can_disable_reasoning === true
+    ? ['none', 'low', 'medium', 'high']
+    : ['low', 'medium', 'high'];
+}
+
+export function modelIsUnavailable(provider: ModelOptionProvider, model: string): boolean {
+  return Array.isArray(provider.unavailable_models) && provider.unavailable_models.includes(model);
+}
+
+// Badges only for capabilities the backend states positively; everything else
+// stays unknown and is rendered as unknown by the UI.
+export function modelCapabilityBadges(capabilities?: ModelCapabilities | null): string[] {
+  if (!capabilities) return [];
+  const badges: string[] = [];
+  if (capabilities.reasoning === true) badges.push('reasoning');
+  if (capabilities.fast === true) badges.push('fast');
+  if (
+    capabilities.vision === true ||
+    capabilities.attachment === true ||
+    (isRecord(capabilities.input) && capabilities.input.image === true)
+  ) {
+    badges.push('vision');
+  }
+  if (capabilities.tools === true || capabilities.toolcall === true) badges.push('tools');
+  return badges;
 }

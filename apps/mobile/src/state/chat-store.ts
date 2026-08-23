@@ -3,6 +3,7 @@ import { create } from 'zustand';
 import { createJSONStorage, persist } from 'zustand/middleware';
 
 import type { NormalizedContextBreakdown, NormalizedRuntimeUsage } from '../lib/session-runtime';
+import { mergeRuntimeUsage } from '../lib/session-runtime';
 
 export type ChatRole = 'user' | 'assistant';
 
@@ -92,6 +93,9 @@ export const useChatStore = create<ChatState>()(
           createdAt: now,
           updatedAt: now,
           messages: [],
+          // The thread id doubles as the stable runtime session identity for
+          // fresh conversations; imported threads use the imported session id.
+          runtimeSessionId: id,
         };
         set((state) => ({ activeThreadId: id, threads: [thread, ...state.threads] }));
         return id;
@@ -130,7 +134,11 @@ export const useChatStore = create<ChatState>()(
                   messages: [...thread.messages, message],
                   lastResponseId: responseId ?? thread.lastResponseId,
                   needsHistorySeed: false,
-                  ...(runtime?.usage !== undefined ? { usage: runtime.usage } : {}),
+                  // Merge so a sparse final Responses usage never erases
+                  // richer live cache/reasoning/cost/call metrics.
+                  ...(runtime?.usage !== undefined
+                    ? { usage: mergeRuntimeUsage(thread.usage, runtime.usage) }
+                    : {}),
                   ...(runtime?.contextBreakdown !== undefined
                     ? { contextBreakdown: runtime.contextBreakdown }
                     : {}),
@@ -143,9 +151,14 @@ export const useChatStore = create<ChatState>()(
         })),
       updateThreadRuntime: (threadId, patch) =>
         set((state) => ({
-          threads: state.threads.map((thread) =>
-            thread.id === threadId ? { ...thread, ...patch } : thread,
-          ),
+          threads: state.threads.map((thread) => {
+            if (thread.id !== threadId) return thread;
+            const next = { ...thread, ...patch };
+            if (patch.usage !== undefined) {
+              next.usage = mergeRuntimeUsage(thread.usage, patch.usage);
+            }
+            return next;
+          }),
         })),
       setThreadModelOverride: (threadId, override) =>
         set((state) => ({

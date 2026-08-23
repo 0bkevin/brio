@@ -269,12 +269,22 @@ func streamEventStream(id string, resp *http.Response, emit func(tunnel.Frame) e
 					Type:    "stream_end",
 					ID:      id,
 					Status:  resp.StatusCode,
-					Headers: map[string]string{"Content-Type": resp.Header.Get("Content-Type")},
+					Headers: terminalStreamHeaders(resp),
 				})
 			}
 			return emit(errorFrame(id, "LOCAL_READ_FAILED", readErr.Error()))
 		}
 	}
+}
+
+// terminalStreamHeaders carries the content type plus the stable runtime
+// session identity so the mobile client can continue the session later.
+func terminalStreamHeaders(resp *http.Response) map[string]string {
+	headers := map[string]string{"Content-Type": resp.Header.Get("Content-Type")}
+	if sessionID := resp.Header.Get("X-Hermes-Session-Id"); sessionID != "" {
+		headers["X-Hermes-Session-Id"] = sessionID
+	}
+	return headers
 }
 
 func errorFrame(id string, code string, message string) tunnel.Frame {

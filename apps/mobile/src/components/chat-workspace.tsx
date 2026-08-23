@@ -15,19 +15,36 @@ import {
 import { SafeAreaView } from 'react-native-safe-area-context';
 
 import { ThemedText } from '@/components/themed-text';
+import { SessionModelControls } from '@/components/session-model-controls';
 import { Spacing } from '@/constants/theme';
 import { useTheme } from '@/hooks/use-theme';
 import {
   getHermesSessionMessages,
+  getSessionContextBreakdown,
+  getSessionUsage,
   hermesResponseText,
   isAgentHealthy,
+  listHermesModelOptions,
   listHermesSessions,
   sendResponseStream,
   type AgentConnection,
   type HealthResponse,
   type HermesSession,
 } from '@/lib/brio';
-import { createChatId, useChatStore, type ChatMessage, type ChatThread } from '@/state/chat-store';
+import {
+  buildRuntimeModelOptions,
+  modelIncompatibilities,
+  normalizeLiveUsage,
+  selectedCapabilities,
+  type NormalizedContextBreakdown,
+  type NormalizedRuntimeUsage,
+} from '@/lib/session-runtime';
+import {
+  createChatId,
+  useChatStore,
+  type ChatMessage,
+  type ChatThread,
+} from '@/state/chat-store';
 import { EMPTY_PROMPT_QUEUE, type QueuedPrompt } from '@/state/composer-store-model';
 import { useComposerStore } from '@/state/composer-store';
 
@@ -64,6 +81,8 @@ export function ChatWorkspace({
   const deleteThread = useChatStore((state) => state.deleteThread);
   const addMessage = useChatStore((state) => state.addMessage);
   const completeResponse = useChatStore((state) => state.completeResponse);
+  const updateThreadRuntime = useChatStore((state) => state.updateThreadRuntime);
+  const setThreadModelOverride = useChatStore((state) => state.setThreadModelOverride);
   const importThread = useChatStore((state) => state.importThread);
   const [showThreads, setShowThreads] = useState(false);
   const [search, setSearch] = useState('');
@@ -71,6 +90,8 @@ export function ChatWorkspace({
   const [streamingText, setStreamingText] = useState('');
   const [sendError, setSendError] = useState('');
   const [importingId, setImportingId] = useState<string | null>(null);
+  const [sendStartedAt, setSendStartedAt] = useState<number | null>(null);
+  const [elapsedLabel, setElapsedLabel] = useState('');
   const connectionKey = `${connection.transport}:${connection.url}:${connection.agentId ?? connection.id}`;
   const connectionThreads = useMemo(
     () => threads.filter((thread) => thread.connectionKey === connectionKey),
@@ -79,8 +100,15 @@ export function ChatWorkspace({
 
   const sessions = useQuery({
     queryKey: ['hermes-sessions', connection.url, connection.agentId ?? connection.id],
-    queryFn: () => listHermesSessions(connection),
+    queryFn: () => listHermesSessions(connection, 200),
     refetchInterval: 15000,
+  });
+
+  const modelOptions = useQuery({
+    queryKey: ['hermes-model-options', connection.url, connection.agentId ?? connection.id],
+    queryFn: () => listHermesModelOptions(connection),
+    staleTime: 5 * 60_000,
+    retry: 1,
   });
 
   useEffect(() => {
@@ -129,6 +157,72 @@ export function ChatWorkspace({
     return () => clearTimeout(timer);
   }, [activeThread?.messages.length, sending, streamingText]);
 
+  // Live elapsed duration while a prompt is in flight. The label starts in
+  // deliverPrompt and resets there too; this effect only ticks it forward.
+  useEffect(() => {
+    if (!sending || !sendStartedAt) return;
+    const tick = () => {
+      const seconds = Math.max(0, Math.floor((Date.now() - sendStartedAt) / 1000));
+      setElapsedLabel(seconds < 60 ? `${seconds}s` : `${Math.floor(seconds / 60)}m ${seconds % 60}s`);
+    };
+    const timer = setInterval(tick, 1000);
+    return () => clearInterval(timer);
+  }, [sending, sendStartedAt]);
+
+  // Poll live usage/context for the active runtime session: frequently while
+  // sending, then at a modest idle interval. Each RPC is caught separately so
+  // one failing never blocks or erases the other's successful result; failures
+  // simply leave the panel showing Unavailable and never break the chat.
+  const pollThreadId = activeThread?.id;
+  const runtimeSessionId = activeThread?.runtimeSessionId ?? null;
+  useEffect(() => {
+    if (!pollThreadId || !runtimeSessionId) return;
+    let cancelled = false;
+    const refresh = async () => {
+      const patch: { usage?: NormalizedRuntimeUsage; contextBreakdown?: NormalizedContextBreakdown } = {};
+      try {
+        patch.usage = await getSessionUsage(connection, runtimeSessionId);
+      } catch {
+        // Usage RPC unavailable this round; keep prior data untouched.
+      }
+      try {
+        patch.contextBreakdown = await getSessionContextBreakdown(connection, runtimeSessionId);
+      } catch {
+        // Context RPC unavailable this round; keep prior data untouched.
+      }
+      if (!cancelled && (patch.usage !== undefined || 'contextBreakdown' in patch)) {
+        updateThreadRuntime(pollThreadId, patch);
+      }
+    };
+    void refresh();
+    const interval = setInterval(() => void refresh(), sending ? 2000 : 30000);
+    return () => {
+      cancelled = true;
+      clearInterval(interval);
+    };
+  }, [connection, pollThreadId, runtimeSessionId, sending, updateThreadRuntime]);
+
+  // Tool incompatibility uses the effective selection: the thread override if
+  // present, otherwise the model.options root profile default. Explicit
+  // tools/toolcall=false blocks agent turns before send; unknown allows.
+  const effectiveSelection = useMemo(() => {
+    const override = activeThread?.modelOverride;
+    return {
+      provider: override?.provider ?? modelOptions.data?.provider ?? null,
+      model: override?.model ?? modelOptions.data?.model ?? null,
+    };
+  }, [activeThread?.modelOverride, modelOptions.data]);
+  const toolBlockers = useMemo(() => {
+    if (!effectiveSelection.provider || !effectiveSelection.model) return [];
+    const caps = selectedCapabilities(
+      modelOptions.data ?? { model: null, provider: null, providers: [] },
+      effectiveSelection.provider,
+      effectiveSelection.model,
+    );
+    return modelIncompatibilities(caps, { vision: false, tools: true });
+  }, [effectiveSelection, modelOptions.data]);
+  const sendBlocked = toolBlockers.includes('tools');
+
   function openThread(id: string) {
     selectThread(id);
     setShowThreads(false);
@@ -175,9 +269,20 @@ export function ChatWorkspace({
       role: message.role,
       content: message.content,
     }));
+    // The override and session identity are frozen from the snapshot this
+    // prompt was claimed with; a mid-flight override change must not leak in.
+    const snapshotOverride = thread.modelOverride;
+    const runtimeOverrides = {
+      provider: snapshotOverride?.provider,
+      model: snapshotOverride?.model,
+      modelOptions: buildRuntimeModelOptions(snapshotOverride),
+      sessionId: thread.runtimeSessionId ?? thread.id,
+    };
     setSendError('');
     setSending(true);
     setStreamingText('');
+    setSendStartedAt(Date.now());
+    setElapsedLabel('0s');
 
     const onTextDelta = (delta: string) => {
       setStreamingText((current) => current + delta);
@@ -193,6 +298,7 @@ export function ChatWorkspace({
             thread.needsHistorySeed || (!thread.lastResponseId && history.length)
               ? history
               : undefined,
+          ...runtimeOverrides,
           onTextDelta,
         });
       } catch (error) {
@@ -201,6 +307,7 @@ export function ChatWorkspace({
         response = await sendResponseStream(connection, content, {
           conversation: threadId,
           conversationHistory: history,
+          ...runtimeOverrides,
           onTextDelta,
         });
       }
@@ -219,6 +326,10 @@ export function ChatWorkspace({
           createdAt: Date.now(),
         },
         response.id,
+        {
+          ...(response.usage ? { usage: normalizeLiveUsage(response.usage) } : {}),
+          runtimeSessionId: response.session_id?.trim() || undefined,
+        },
       );
       await acknowledgePrompt(threadId, queuedPrompt.id);
       void sessions.refetch();
@@ -229,19 +340,21 @@ export function ChatWorkspace({
     } finally {
       setSending(false);
       setStreamingText('');
+      setSendStartedAt(null);
+      setElapsedLabel('');
     }
   }, [acknowledgePrompt, addMessage, completeResponse, connection, failPrompt, sessions]);
 
   useEffect(() => {
-    if (!composerHydrated || !activeThread || sending || queuePaused) return;
+    if (!composerHydrated || !activeThread || sending || queuePaused || sendBlocked) return;
     void claimNext(composerKey).then((nextPrompt) => {
       if (nextPrompt) void deliverPrompt(nextPrompt, activeThread);
     });
-  }, [activeThread, claimNext, composerHydrated, composerKey, deliverPrompt, queue, queuePaused, sending]);
+  }, [activeThread, claimNext, composerHydrated, composerKey, deliverPrompt, queue, queuePaused, sendBlocked, sending]);
 
   async function submitPrompt(value = prompt) {
     const content = value.trim();
-    if (!content || !composerHydrated || !activeThread) return;
+    if (!content || !composerHydrated || !activeThread || sendBlocked) return;
     await enqueueDraft(activeThread.id, content);
   }
 
@@ -327,7 +440,7 @@ export function ChatWorkspace({
                     createdAt: 0,
                   }}
                 />
-              ) : sending ? <ThinkingBubble /> : null}
+              ) : sending ? <ThinkingBubble elapsedLabel={elapsedLabel} /> : null}
             </ScrollView>
 
             <View style={[styles.composerArea, !wide && styles.composerAreaMobile]}>
@@ -351,6 +464,22 @@ export function ChatWorkspace({
                   </ThemedText>
                 </View>
               ) : null}
+              <SessionModelControls
+                onOverrideChange={(override) => setThreadModelOverride(activeThread.id, override)}
+                options={modelOptions.data}
+                optionsError={Boolean(modelOptions.error)}
+                optionsLoading={modelOptions.isLoading}
+                sessions={sessions.data?.sessions}
+                thread={activeThread}
+              />
+              {sendBlocked ? (
+                <View style={[styles.errorBanner, { backgroundColor: colors.backgroundSelected }]}>
+                  <ThemedText style={{ color: colors.warning }} type="small">
+                    {effectiveSelection.provider}/{effectiveSelection.model} does not support tool
+                    calling, which Brio agent turns require. Pick another model to send messages.
+                  </ThemedText>
+                </View>
+              ) : null}
               <View style={[styles.composer, { backgroundColor: colors.panelStrong, borderColor: colors.border }]}>
                 <TextInput
                   accessibilityLabel="Message Brio"
@@ -365,18 +494,24 @@ export function ChatWorkspace({
                 />
                 <Pressable
                   accessibilityLabel="Send message"
-                  disabled={!composerHydrated || !prompt.trim()}
+                  disabled={!composerHydrated || !prompt.trim() || sendBlocked}
                   onPress={() => void submitPrompt()}
                   style={({ pressed }) => [
                     styles.sendButton,
                     {
-                      backgroundColor: prompt.trim() && composerHydrated ? colors.accent : colors.backgroundSelected,
+                      backgroundColor:
+                        prompt.trim() && composerHydrated && !sendBlocked
+                          ? colors.accent
+                          : colors.backgroundSelected,
                       opacity: pressed ? 0.72 : 1,
                     },
                   ]}>
                   <ThemedText
                     style={{
-                      color: prompt.trim() && composerHydrated ? colors.accentText : colors.textDisabled,
+                      color:
+                        prompt.trim() && composerHydrated && !sendBlocked
+                          ? colors.accentText
+                          : colors.textDisabled,
                       fontSize: 20,
                     }}>
                     ↑
@@ -781,7 +916,7 @@ function MessageBubble({ message }: { message: ChatMessage }) {
   );
 }
 
-function ThinkingBubble() {
+function ThinkingBubble({ elapsedLabel }: { elapsedLabel?: string }) {
   const colors = useTheme();
   return (
     <View style={styles.messageRow}>
@@ -790,7 +925,9 @@ function ThinkingBubble() {
       </View>
       <View style={styles.thinkingRow}>
         <ActivityIndicator color={colors.textSecondary} size="small" />
-        <ThemedText themeColor="textSecondary" type="small">Brio is working…</ThemedText>
+        <ThemedText themeColor="textSecondary" type="small">
+          Brio is working…{elapsedLabel ? ` · ${elapsedLabel}` : ''}
+        </ThemedText>
       </View>
     </View>
   );
