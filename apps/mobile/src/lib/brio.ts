@@ -20,6 +20,10 @@ import {
 } from './hermes-api';
 import { ResponsesSSEParser, type HermesResponse } from './responses-sse';
 import {
+  responseRequestBody,
+  type ResponseRequestOptions,
+} from './response-request';
+import {
   normalizeContextBreakdown,
   normalizeLiveUsage,
   normalizeModelOptions,
@@ -96,6 +100,51 @@ export type CapabilitiesResponse = {
     [key: string]: unknown;
   };
   endpoints?: Record<string, { method?: string; path?: string }>;
+};
+
+export type ComposerAttachmentUpload = {
+  id: string;
+  session_id: string;
+  name: string;
+  mime_type: string;
+  kind: 'image' | 'file';
+  size: number;
+  received: number;
+  next_chunk: number;
+  sha256?: string;
+  complete: boolean;
+  created_at: number;
+};
+
+export type ComposerCapabilities = {
+  attachment_chunk_bytes: number;
+  attachment_file_bytes: number;
+  attachment_total_bytes: number;
+  attachment_max_count: number;
+  context_item_bytes: number;
+  context_soft_bytes: number;
+  context_hard_bytes: number;
+  context_max_references: number;
+  folder_entries: number;
+  attachment_kinds: ('image' | 'file')[];
+  context_references: string[];
+  redirect_mode: 'interrupt_then_redirect';
+};
+
+export type ComposerCompletion = {
+  text: string;
+  display?: string;
+  meta?: string;
+  kind?: string;
+};
+
+export type CommandCatalog = {
+  pairs?: [string, string][];
+  commands?: { name: string; description?: string; permission?: string }[];
+  categories?: { name: string; pairs: [string, string][] }[];
+  skills?: Record<string, { usage?: number; origin?: string }>;
+  permissions?: Record<string, string>;
+  warning?: string;
 };
 
 export type HermesControlSession = {
@@ -284,6 +333,103 @@ export function getCapabilities(
   return brioFetch<CapabilitiesResponse>(connection, '/v1/capabilities');
 }
 
+export function getComposerCapabilities(connection: AgentConnection) {
+  return brioFetch<ComposerCapabilities>(connection, '/composer/capabilities');
+}
+
+export function createAttachmentUpload(
+  connection: AgentConnection,
+  value: { sessionId: string; name: string; mimeType: string; size: number },
+  signal?: AbortSignal,
+) {
+  return brioFetch<ComposerAttachmentUpload>(connection, '/attachments', {
+    method: 'POST',
+    signal,
+    body: JSON.stringify({
+      session_id: value.sessionId,
+      name: value.name,
+      mime_type: value.mimeType,
+      size: value.size,
+    }),
+  });
+}
+
+export function uploadAttachmentChunk(
+  connection: AgentConnection,
+  attachmentId: string,
+  index: number,
+  dataBase64: string,
+  final: boolean,
+  signal?: AbortSignal,
+) {
+  return brioFetch<ComposerAttachmentUpload>(
+    connection,
+    `/attachments/${encodeURIComponent(attachmentId)}/chunks/${index}`,
+    {
+      method: 'PUT',
+      signal,
+      body: JSON.stringify({ data_base64: dataBase64, final }),
+    },
+  );
+}
+
+export function deleteAttachmentUpload(connection: AgentConnection, attachmentId: string) {
+  return brioFetch<{ deleted: boolean }>(
+    connection,
+    `/attachments/${encodeURIComponent(attachmentId)}`,
+    { method: 'DELETE' },
+  );
+}
+
+export function getCommandCatalog(connection: AgentConnection) {
+  return brioFetch<CommandCatalog>(connection, '/composer/commands');
+}
+
+export function completeSlashCommand(connection: AgentConnection, text: string) {
+  return brioFetch<{ items: ComposerCompletion[] }>(connection, '/composer/commands/complete', {
+    method: 'POST',
+    body: JSON.stringify({ text }),
+  });
+}
+
+export function completeContextReference(connection: AgentConnection, query: string) {
+  return brioFetch<{ items: ComposerCompletion[] }>(connection, '/composer/context/complete', {
+    method: 'POST',
+    body: JSON.stringify({ query }),
+  });
+}
+
+export function dispatchComposerCommand(
+  connection: AgentConnection,
+  sessionId: string,
+  text: string,
+  requestId: string,
+) {
+  return brioFetch<Record<string, unknown>>(connection, '/composer/commands/dispatch', {
+    method: 'POST',
+    body: JSON.stringify({ session_id: sessionId, text, request_id: requestId }),
+  });
+}
+
+export function prepareComposerPrompt(
+  connection: AgentConnection,
+  input: string,
+  sessionId: string,
+  attachments: string[],
+) {
+  return brioFetch<{ input: unknown }>(connection, '/composer/prepare', {
+    method: 'POST',
+    body: JSON.stringify({ input, session_id: sessionId, attachments }),
+  });
+}
+
+export function interruptComposerSession(connection: AgentConnection, sessionId: string) {
+  return brioFetch<{ ok: boolean }>(connection, '/composer/redirect', {
+    method: 'POST',
+    body: JSON.stringify({ session_id: sessionId }),
+  });
+}
+
 export function controlRPC<T>(
   connection: AgentConnection,
   method: string,
@@ -425,16 +571,7 @@ function withSubgoals(goal: HermesGoalStatus | null, output: string) {
   return { ...goal, subgoalCount: Math.max(goal.subgoalCount, subgoals.length), subgoals };
 }
 
-export type ResponseRequestOptions = {
-  conversation?: string;
-  previousResponseId?: string;
-  conversationHistory?: { role: string; content: string }[];
-  provider?: string;
-  model?: string;
-  modelOptions?: Record<string, unknown>;
-  // Stable runtime session identity sent as X-Hermes-Session-Id.
-  sessionId?: string;
-};
+export type { ResponseRequestOptions };
 
 export async function sendResponse(
   connection: Pick<AgentConnection, 'url' | 'token'> & Partial<AgentConnection>,
@@ -451,9 +588,12 @@ export async function sendResponse(
 
 export async function sendResponseStream(
   connection: Pick<AgentConnection, 'url' | 'token'> & Partial<AgentConnection>,
-  prompt: string,
+  prompt: unknown,
   options: ResponseRequestOptions & {
     onTextDelta?: (delta: string) => void;
+    signal?: AbortSignal;
+    composerSessionId?: string;
+    attachmentIds?: string[];
   } = {},
 ) {
   const parser = new ResponsesSSEParser(options.onTextDelta);
@@ -465,7 +605,12 @@ export async function sendResponseStream(
     await relayFetch<null>(
       connection,
       '/v1/responses',
-      { method: 'POST', body, ...(sessionHeaders ? { headers: sessionHeaders } : {}) },
+      {
+        method: 'POST',
+        body,
+        signal: options.signal,
+        ...(sessionHeaders ? { headers: sessionHeaders } : {}),
+      },
       (chunk) => parser.push(chunk),
       (headers) => {
         terminalSessionId = headerValue(headers, SESSION_ID_HEADER)?.trim() ?? '';
@@ -483,6 +628,7 @@ export async function sendResponseStream(
       ...(sessionHeaders ?? {}),
     },
     body,
+    signal: options.signal,
   });
   const directSessionId = response.headers.get(SESSION_ID_HEADER)?.trim() ?? '';
   const contentType = response.headers.get('Content-Type')?.toLowerCase() ?? '';
@@ -515,38 +661,6 @@ function withFallbackSessionId(response: HermesResponse, headerSessionId: string
     response.session_id = headerSessionId;
   }
   return response;
-}
-
-function responseRequestBody(
-  prompt: string,
-  options: ResponseRequestOptions,
-  stream: boolean,
-) {
-  // A per-thread model override must ride along on every request, including
-  // retries and continuations. Without an override the profile default
-  // (`hermes-agent`) is left untouched; require_model_lock is never set here
-  // and profile config is never mutated.
-  const hasOverride = Boolean(
-    options.model?.trim() || options.provider?.trim() || options.modelOptions,
-  );
-  return {
-    ...(hasOverride
-      ? {
-          ...(options.model?.trim() ? { model: options.model } : {}),
-          ...(options.provider?.trim() ? { provider: options.provider } : {}),
-          ...(options.modelOptions ? { model_options: options.modelOptions } : {}),
-        }
-      : { model: 'hermes-agent' }),
-    input: prompt,
-    stream,
-    ...(options.previousResponseId
-      ? { previous_response_id: options.previousResponseId }
-      : options.conversationHistory?.length
-        ? { conversation: options.conversation, conversation_history: options.conversationHistory }
-        : options.conversation
-          ? { conversation: options.conversation }
-          : {}),
-  };
 }
 
 export async function listHermesSessions(
@@ -868,6 +982,8 @@ type PendingRelayRequest = {
   chunks: unknown[];
   onChunk?: (chunk: string) => void;
   onTerminalHeaders?: (headers: Record<string, string>) => void;
+  signal?: AbortSignal;
+  abort?: () => void;
 };
 
 const relayClients = new Map<string, RelaySocketClient>();
@@ -887,10 +1003,15 @@ class RelaySocketClient {
     timeoutMs = 5 * 60 * 1000,
     onChunk?: (chunk: string) => void,
     onTerminalHeaders?: (headers: Record<string, string>) => void,
+    signal?: AbortSignal,
   ): Promise<T> {
     return this.connect().then(
       () =>
         new Promise<T>((resolve, reject) => {
+          if (signal?.aborted) {
+            reject(new Error('Relay request cancelled'));
+            return;
+          }
           const socket = this.socket;
           if (!socket || socket.readyState !== WebSocket.OPEN) {
             reject(new Error('Relay connection is not open'));
@@ -898,10 +1019,17 @@ class RelaySocketClient {
           }
 
           const timer = setTimeout(() => {
-            if (this.pending.delete(frame.id)) {
+            if (this.pending.has(frame.id)) {
+              this.clearPending(frame.id);
               reject(new Error('Relay request timed out'));
             }
           }, timeoutMs);
+
+          const abort = () => {
+            if (!this.pending.has(frame.id)) return;
+            this.clearPending(frame.id);
+            reject(new Error('Relay request cancelled'));
+          };
 
           this.pending.set(frame.id, {
             resolve: (value) => resolve(value as T),
@@ -910,7 +1038,10 @@ class RelaySocketClient {
             chunks: [],
             onChunk,
             onTerminalHeaders,
+            signal,
+            abort,
           });
+          signal?.addEventListener('abort', abort, { once: true });
 
           try {
             socket.send(JSON.stringify(frame));
@@ -1062,6 +1193,7 @@ class RelaySocketClient {
     const pending = this.pending.get(id);
     if (pending) {
       clearTimeout(pending.timer);
+      if (pending.abort) pending.signal?.removeEventListener('abort', pending.abort);
       this.pending.delete(id);
     }
   }
@@ -1069,6 +1201,7 @@ class RelaySocketClient {
   private rejectAll(error: Error) {
     for (const [id, pending] of this.pending) {
       clearTimeout(pending.timer);
+      if (pending.abort) pending.signal?.removeEventListener('abort', pending.abort);
       pending.reject(error);
       this.pending.delete(id);
     }
@@ -1110,7 +1243,13 @@ function relayFetch<T>(
     client = new RelaySocketClient(wsURL);
     relayClients.set(wsURL, client);
   }
-  return client.request<T>(requestFrame, 5 * 60 * 1000, onChunk, onTerminalHeaders);
+  return client.request<T>(
+    requestFrame,
+    5 * 60 * 1000,
+    onChunk,
+    onTerminalHeaders,
+    init.signal ?? undefined,
+  );
 }
 
 function relayTunnelURL(baseURL: string, agentId: string, relayToken: string) {

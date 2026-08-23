@@ -62,6 +62,12 @@ func TestRoutePath(t *testing.T) {
 		{path: "/api/model/options", kind: RouteForward, forwardTo: "/api/model/options"},
 		{path: "/v1/memory", kind: RouteLocal, localName: "memory"},
 		{path: "/memory", kind: RouteLocal, localName: "memory"},
+		{path: "/composer/capabilities", kind: RouteLocal, localName: "composer-capabilities"},
+		{path: "/composer/commands", kind: RouteLocal, localName: "composer-commands"},
+		{path: "/composer/prepare", kind: RouteLocal, localName: "composer-prepare"},
+		{path: "/composer/redirect", kind: RouteLocal, localName: "composer-redirect"},
+		{path: "/attachments", kind: RouteLocal, forwardTo: "/attachments", localName: "composer-attachments"},
+		{path: "/attachments/0123456789abcdef0123456789abcdef/chunks/0", kind: RouteLocal, forwardTo: "/attachments/0123456789abcdef0123456789abcdef/chunks/0", localName: "composer-attachment"},
 
 		{path: "/files/write", kind: RouteUnknown},
 		{path: "/files/read", kind: RouteUnknown},

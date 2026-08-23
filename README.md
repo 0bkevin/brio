@@ -87,7 +87,8 @@ and scheduled heartbeats survive mobile app reconnects.
 On the Hermes machine you can also manage the connector directly:
 
 ```bash
-brio setup --relay-url <relay-url> --code <code>   # enroll/re-enroll
+brio setup --relay-url <relay-url> --code <code> \
+  --composer-root /path/to/project                 # enroll and allow @ references
 brio connect                                       # run the tunnel in the foreground
 brio status                                        # service + relay + tunnel credentials
 brio recover --relay-url <url> --agent-id <id> \
@@ -116,6 +117,12 @@ Everything rides the relay tunnel. Per request frame:
 - Served locally by brio from `~/.hermes`:
   `/v1/memory` GET/PUT (legacy `/memory`) with atomic 0600 writes to
   `memories/MEMORY.md` and `USER.md`. `HERMES_HOME` is respected.
+- Served locally by brio for the mobile composer: bounded chunked attachments,
+  context and command completion, prompt preparation, and redirect under
+  `/attachments...` and `/composer...`. File, folder, and Git references are
+  limited to repeatable `--composer-root` values (persisted as
+  `BRIO_COMPOSER_ROOTS`); sensitive paths and private-network URL targets are
+  rejected.
 - Served by brio through the official `hermes serve` control connection:
   `/control/rpc`, `/control/command`, `/control/background`, and
   `/control/events`. These require `HERMES_CONTROL_TOKEN` (or
@@ -129,9 +136,10 @@ Everything rides the relay tunnel. Per request frame:
 The app can also reach a Hermes API server directly on a LAN or private
 network (for example over Tailscale): point it at the machine's
 `http://<host>:8642` with the `API_SERVER_KEY` from `~/.hermes/.env`.
-Chat and native session history work in direct mode. Memory-file editing is a
-connector-only feature and is hidden for direct connections. Internet-facing
-endpoints must terminate HTTPS before the API server.
+Plain chat and native session history work in direct mode. Connector-backed
+composer features (attachments, context expansion, dynamic commands, and
+redirect) require the Brio connector. Internet-facing endpoints must terminate
+HTTPS before the API server.
 
 ## Configuration
 

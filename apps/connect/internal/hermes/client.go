@@ -26,6 +26,9 @@ type Client struct {
 	APIKey string
 	// Home is the Hermes home directory (~/.hermes).
 	Home string
+	// ComposerRoots is the explicit allow-list used by @file, @folder, and
+	// Git context references.
+	ComposerRoots []string
 	// ControlBaseURL is the Hermes serve JSON-RPC endpoint.
 	ControlBaseURL string
 	// ControlToken authenticates the Hermes serve WebSocket session.
@@ -35,6 +38,7 @@ type Client struct {
 
 	controlOnce sync.Once
 	controlApp  *app
+	composerMu  sync.Mutex
 }
 
 const (
@@ -84,12 +88,30 @@ func RoutePath(path string) Route {
 		return Route{Kind: RouteLocal, Name: "control-background"}
 	case "/control/events":
 		return Route{Kind: RouteLocal, Name: "control-events"}
+	case "/composer/capabilities":
+		return Route{Kind: RouteLocal, Name: "composer-capabilities"}
+	case "/composer/commands":
+		return Route{Kind: RouteLocal, Name: "composer-commands"}
+	case "/composer/commands/complete":
+		return Route{Kind: RouteLocal, Name: "composer-command-complete"}
+	case "/composer/commands/dispatch":
+		return Route{Kind: RouteLocal, Name: "composer-command-dispatch"}
+	case "/composer/context/complete":
+		return Route{Kind: RouteLocal, Name: "composer-context-complete"}
+	case "/composer/prepare":
+		return Route{Kind: RouteLocal, Name: "composer-prepare"}
+	case "/composer/redirect":
+		return Route{Kind: RouteLocal, Name: "composer-redirect"}
+	case "/attachments":
+		return Route{Kind: RouteLocal, Path: path, Name: "composer-attachments"}
 	case "/api/sessions":
 		return Route{Kind: RouteForward, Path: path}
 	case "/api/model/options":
 		return Route{Kind: RouteForward, Path: path}
 	}
 	switch {
+	case strings.HasPrefix(path, "/attachments/"):
+		return Route{Kind: RouteLocal, Path: path, Name: "composer-attachment"}
 	case strings.HasPrefix(path, "/v1/runs"), strings.HasPrefix(path, "/api/jobs"):
 		return Route{Kind: RouteForward, Path: path}
 	}
@@ -172,6 +194,15 @@ func (c *Client) Serve(ctx context.Context, frame tunnel.Frame, emit func(tunnel
 }
 
 func (c *Client) forward(ctx context.Context, frame tunnel.Frame, method string, path string, query string, emit func(tunnel.Frame) error) error {
+	if path == "/v1/responses" && method == http.MethodPost {
+		prepared, failure := c.prepareResponseRequest(ctx, frame.Body)
+		if failure != nil {
+			return emit(tunnel.Frame{Type: "response", ID: frame.ID, Status: failure.status, Body: map[string]any{
+				"error": failure.message, "code": failure.code,
+			}})
+		}
+		frame.Body = prepared
+	}
 	var requestBody io.Reader = http.NoBody
 	if frame.Body != nil {
 		payload, err := json.Marshal(frame.Body)
