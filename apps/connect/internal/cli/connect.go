@@ -46,6 +46,7 @@ func runConnect(ctx context.Context, opts runOptions) error {
 		BaseURL:          opts.hermesURL,
 		APIKey:           opts.hermesAPIKey,
 		Home:             opts.hermesHome,
+		ComposerRoots:    opts.composerRoots,
 		ControlBaseURL:   opts.controlURL,
 		ControlToken:     opts.controlToken,
 		ControlOverrides: profileControlOverrides(),

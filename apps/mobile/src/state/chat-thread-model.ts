@@ -1,6 +1,7 @@
 // Relative import keeps this module loadable under plain node test runs
 // (the `@/` alias is only resolved by Metro/tsc).
 import { profileName } from '../lib/profiles-model.ts';
+import type { NormalizedContextBreakdown, NormalizedRuntimeUsage } from '../lib/session-runtime';
 
 // Pure thread-scoping model. Kept free of storage/store dependencies so it
 // runs in unit tests and can be reasoned about in isolation.
@@ -12,6 +13,19 @@ export type ChatMessage = {
   role: ChatRole;
   content: string;
   createdAt: number;
+};
+
+export type ChatModelOverride = {
+  provider: string;
+  model: string;
+  reasoningEffort?: string;
+  fast?: boolean;
+};
+
+export type ChatThreadRuntimePatch = {
+  usage?: NormalizedRuntimeUsage;
+  contextBreakdown?: NormalizedContextBreakdown | undefined;
+  runtimeSessionId?: string;
 };
 
 export type ChatThread = {
@@ -29,6 +43,10 @@ export type ChatThread = {
   lastResponseId?: string;
   importedSessionId?: string;
   needsHistorySeed?: boolean;
+  modelOverride?: ChatModelOverride;
+  usage?: NormalizedRuntimeUsage;
+  contextBreakdown?: NormalizedContextBreakdown;
+  runtimeSessionId?: string;
 };
 
 /** Resolves the concrete Hermes profile a thread is scoped to. */

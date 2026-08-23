@@ -55,9 +55,19 @@ func TestRoutePath(t *testing.T) {
 		{path: "/api/jobs/job_1", kind: RouteForward, forwardTo: "/api/jobs/job_1"},
 		{path: "/api/jobs/job_1/pause", kind: RouteForward, forwardTo: "/api/jobs/job_1/pause"},
 		{path: "/api/sessions", kind: RouteForward, forwardTo: "/api/sessions"},
+		{path: "/api/sessions/sess_1", kind: RouteForward, forwardTo: "/api/sessions/sess_1"},
+		{path: "/api/sessions/search", kind: RouteForward, forwardTo: "/api/sessions/search"},
 		{path: "/api/sessions/sess_1/messages", kind: RouteForward, forwardTo: "/api/sessions/sess_1/messages"},
+		{path: "/api/sessions/sess_1/model", kind: RouteForward, forwardTo: "/api/sessions/sess_1/model"},
+		{path: "/api/model/options", kind: RouteForward, forwardTo: "/api/model/options"},
 		{path: "/v1/memory", kind: RouteLocal, localName: "memory"},
 		{path: "/memory", kind: RouteLocal, localName: "memory"},
+		{path: "/composer/capabilities", kind: RouteLocal, localName: "composer-capabilities"},
+		{path: "/composer/commands", kind: RouteLocal, localName: "composer-commands"},
+		{path: "/composer/prepare", kind: RouteLocal, localName: "composer-prepare"},
+		{path: "/composer/redirect", kind: RouteLocal, localName: "composer-redirect"},
+		{path: "/attachments", kind: RouteLocal, forwardTo: "/attachments", localName: "composer-attachments"},
+		{path: "/attachments/0123456789abcdef0123456789abcdef/chunks/0", kind: RouteLocal, forwardTo: "/attachments/0123456789abcdef0123456789abcdef/chunks/0", localName: "composer-attachment"},
 
 		{path: "/files/write", kind: RouteUnknown},
 		{path: "/files/read", kind: RouteUnknown},
@@ -71,9 +81,12 @@ func TestRoutePath(t *testing.T) {
 		{path: "/v1/sessions/search", kind: RouteUnknown},
 		{path: "/v1/sessions/sess_1", kind: RouteUnknown},
 		{path: "/v1/sessions/sess_1/messages/extra", kind: RouteUnknown},
-		{path: "/api/sessions/search", kind: RouteUnknown},
-		{path: "/api/sessions/sess_1", kind: RouteUnknown},
 		{path: "/api/sessions/sess_1/messages/extra", kind: RouteUnknown},
+		{path: "/api/sessions/sess_1/model/extra", kind: RouteUnknown},
+		{path: "/api/sessions/sess_1/models", kind: RouteUnknown},
+		{path: "/api/sessions/sess_1/", kind: RouteUnknown},
+		{path: "/api/model", kind: RouteUnknown},
+		{path: "/api/model/options/extra", kind: RouteUnknown},
 		{path: "/v1/unknown", kind: RouteUnknown},
 		{path: "/", kind: RouteUnknown},
 	}
@@ -145,12 +158,25 @@ func TestServeMapsLegacyAliases(t *testing.T) {
 	collectFrames(context.Background(), t, client, tunnel.Frame{
 		Type: "request", ID: "a5", Method: http.MethodGet, Path: "/api/sessions/session_1/messages?order=latest",
 	})
+	collectFrames(context.Background(), t, client, tunnel.Frame{
+		Type: "request", ID: "a6", Method: http.MethodGet, Path: "/api/model/options",
+	})
+	collectFrames(context.Background(), t, client, tunnel.Frame{
+		Type: "request", ID: "a7", Method: http.MethodGet, Path: "/api/sessions/session_1",
+	})
+	collectFrames(context.Background(), t, client, tunnel.Frame{
+		Type: "request", ID: "a8", Method: http.MethodPost, Path: "/api/sessions/session_1/model",
+		Body: map[string]string{"model": "hermes-large"},
+	})
 	for _, want := range []string{
 		"POST /v1/responses",
 		"GET /v1/capabilities",
 		"GET /api/jobs",
 		"GET /api/sessions",
 		"GET /api/sessions/session_1/messages",
+		"GET /api/model/options",
+		"GET /api/sessions/session_1",
+		"POST /api/sessions/session_1/model",
 	} {
 		if _, ok := seen[want]; !ok {
 			t.Fatalf("alias was not forwarded as %q; seen = %v", want, seen)
@@ -294,6 +320,64 @@ func TestStreamEventStreamPreservesSplitUTF8(t *testing.T) {
 	}
 	if strings.ContainsRune(got.String(), '\uFFFD') {
 		t.Fatalf("stream data contains a replacement character: %q", got.String())
+	}
+}
+
+func TestStreamEventStreamTerminalHeadersCarrySessionID(t *testing.T) {
+	sse := "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\"}}\n\n"
+	resp := &http.Response{
+		StatusCode: http.StatusOK,
+		Header: http.Header{
+			"Content-Type":        []string{"text/event-stream"},
+			"X-Hermes-Session-Id": []string{"sess_42"},
+		},
+		Body: io.NopCloser(strings.NewReader(sse)),
+	}
+	frames := []tunnel.Frame{}
+	if err := streamEventStream("sessioned", resp, func(frame tunnel.Frame) error {
+		frames = append(frames, frame)
+		return nil
+	}); err != nil {
+		t.Fatalf("streamEventStream returned error: %v", err)
+	}
+	var end *tunnel.Frame
+	for i := range frames {
+		if frames[i].Type == "stream_end" {
+			end = &frames[i]
+		}
+	}
+	if end == nil {
+		t.Fatalf("frames = %+v, want a terminal stream_end", frames)
+	}
+	if end.Headers["Content-Type"] != "text/event-stream" {
+		t.Fatalf("stream_end Content-Type = %q, want text/event-stream", end.Headers["Content-Type"])
+	}
+	if end.Headers["X-Hermes-Session-Id"] != "sess_42" {
+		t.Fatalf("stream_end X-Hermes-Session-Id = %q, want sess_42", end.Headers["X-Hermes-Session-Id"])
+	}
+
+	// Without the header the key is simply absent, never fabricated.
+	resp = &http.Response{
+		StatusCode: http.StatusOK,
+		Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+		Body:       io.NopCloser(strings.NewReader(sse)),
+	}
+	frames = frames[:0]
+	if err := streamEventStream("plain", resp, func(frame tunnel.Frame) error {
+		frames = append(frames, frame)
+		return nil
+	}); err != nil {
+		t.Fatalf("streamEventStream returned error: %v", err)
+	}
+	for _, frame := range frames {
+		if frame.Type == "stream_end" {
+			if _, ok := frame.Headers["X-Hermes-Session-Id"]; ok {
+				t.Fatalf("stream_end headers = %v, want no session id key", frame.Headers)
+			}
+			if frame.Headers["Content-Type"] != "text/event-stream" {
+				t.Fatalf("stream_end Content-Type = %q, want text/event-stream", frame.Headers["Content-Type"])
+			}
+		}
 	}
 }
 

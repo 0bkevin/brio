@@ -3,9 +3,16 @@ import { create } from 'zustand';
 import { createJSONStorage, persist } from 'zustand/middleware';
 
 import { profileName } from '@/lib/profiles';
-import { threadProfileName, type ChatMessage, type ChatThread } from '@/state/chat-thread-model';
+import { mergeRuntimeUsage } from '@/lib/session-runtime';
+import {
+  threadProfileName,
+  type ChatMessage,
+  type ChatModelOverride,
+  type ChatThread,
+  type ChatThreadRuntimePatch,
+} from '@/state/chat-thread-model';
 
-export type { ChatMessage, ChatRole, ChatThread } from '@/state/chat-thread-model';
+export type { ChatMessage, ChatRole, ChatModelOverride, ChatThread, ChatThreadRuntimePatch } from '@/state/chat-thread-model';
 export { threadMatchesScope, threadProfileName } from '@/state/chat-thread-model';
 
 type ChatState = {
@@ -17,7 +24,14 @@ type ChatState = {
   selectThread: (id: string) => void;
   deleteThread: (id: string) => void;
   addMessage: (threadId: string, message: ChatMessage) => void;
-  completeResponse: (threadId: string, message: ChatMessage, responseId?: string) => void;
+  completeResponse: (
+    threadId: string,
+    message: ChatMessage,
+    responseId?: string,
+    runtime?: ChatThreadRuntimePatch,
+  ) => void;
+  updateThreadRuntime: (threadId: string, patch: ChatThreadRuntimePatch) => void;
+  setThreadModelOverride: (threadId: string, override: ChatModelOverride | undefined) => void;
   importThread: (
     connectionKey: string,
     sessionId: string,
@@ -56,6 +70,9 @@ export const useChatStore = create<ChatState>()(
           createdAt: now,
           updatedAt: now,
           messages: [],
+          // The thread id doubles as the stable runtime session identity for
+          // fresh conversations; imported threads use the imported session id.
+          runtimeSessionId: id,
         };
         set((state) => ({ activeThreadId: id, threads: [thread, ...state.threads] }));
         return id;
@@ -84,7 +101,7 @@ export const useChatStore = create<ChatState>()(
               : thread,
           ),
         })),
-      completeResponse: (threadId, message, responseId) =>
+      completeResponse: (threadId, message, responseId, runtime) =>
         set((state) => ({
           threads: state.threads.map((thread) =>
             thread.id === threadId
@@ -94,8 +111,34 @@ export const useChatStore = create<ChatState>()(
                   messages: [...thread.messages, message],
                   lastResponseId: responseId ?? thread.lastResponseId,
                   needsHistorySeed: false,
+                  // Merge so a sparse final Responses usage never erases
+                  // richer live cache/reasoning/cost/call metrics.
+                  ...(runtime?.usage !== undefined
+                    ? { usage: mergeRuntimeUsage(thread.usage, runtime.usage) }
+                    : {}),
+                  ...(runtime?.contextBreakdown !== undefined
+                    ? { contextBreakdown: runtime.contextBreakdown }
+                    : {}),
+                  ...(runtime?.runtimeSessionId !== undefined
+                    ? { runtimeSessionId: runtime.runtimeSessionId }
+                    : {}),
                 }
               : thread,
+          ),
+        })),
+      updateThreadRuntime: (threadId, patch) =>
+        set((state) => ({
+          threads: state.threads.map((thread) => {
+            if (thread.id !== threadId) return thread;
+            const next = { ...thread, ...patch };
+            if (patch.usage !== undefined) next.usage = mergeRuntimeUsage(thread.usage, patch.usage);
+            return next;
+          }),
+        })),
+      setThreadModelOverride: (threadId, override) =>
+        set((state) => ({
+          threads: state.threads.map((thread) =>
+            thread.id === threadId ? { ...thread, modelOverride: override } : thread,
           ),
         })),
       importThread: (connectionKey, sessionId, title, messages, profile) => {
@@ -122,6 +165,7 @@ export const useChatStore = create<ChatState>()(
           updatedAt: lastTimestamp,
           messages,
           importedSessionId: sessionId,
+          runtimeSessionId: sessionId,
           needsHistorySeed: messages.length > 0,
         };
         set((state) => ({ activeThreadId: id, threads: [thread, ...state.threads] }));
