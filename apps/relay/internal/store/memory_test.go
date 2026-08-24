@@ -95,6 +95,16 @@ func TestMemoryStoreUpsertAgentMatchesPersistentOnlineState(t *testing.T) {
 	}
 }
 
+func TestMemoryStoreTouchAgentDoesNotRecreateUnlinkedAgent(t *testing.T) {
+	s := NewMemoryStore()
+	if err := s.TouchAgent(context.Background(), "missing-agent", "offline"); err != ErrNotFound {
+		t.Fatalf("touch missing agent error = %v, want not found", err)
+	}
+	if _, exists := s.agents["missing-agent"]; exists {
+		t.Fatal("presence update recreated a missing agent")
+	}
+}
+
 func TestMemoryStoreCreatePairingRequiresTokenForExistingUnclaimedAgent(t *testing.T) {
 	ctx := context.Background()
 	s := NewMemoryStore()
@@ -285,5 +295,48 @@ func TestMemoryStoreEnrollmentLifecycle(t *testing.T) {
 
 	if _, _, err := s.ClaimEnrollment(ctx, enrollment.Code, "agent-1", ""); err != ErrUsed {
 		t.Fatalf("expected used enrollment, got %v", err)
+	}
+}
+
+func TestMemoryStoreUnlinkAgentRevokesOwnershipAndCredentials(t *testing.T) {
+	ctx := context.Background()
+	s := NewMemoryStore()
+	owner, _, _, err := s.CreateDeviceToken(ctx, "owner@example.com", "Phone")
+	if err != nil {
+		t.Fatal(err)
+	}
+	pairing, err := s.CreatePairing(ctx, "agent-1", "Hermes", time.Minute, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.ClaimPairing(ctx, pairing.Code, owner.ID); err != nil {
+		t.Fatal(err)
+	}
+	other, _, _, err := s.CreateDeviceToken(ctx, "other@example.com", "Tablet")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.UnlinkAgent(ctx, other.ID, "agent-1"); err != ErrUnauthorized {
+		t.Fatalf("other user unlink error = %v, want unauthorized", err)
+	}
+
+	unlinked, err := s.UnlinkAgent(ctx, owner.ID, "agent-1")
+	if err != nil {
+		t.Fatalf("unlink agent: %v", err)
+	}
+	if unlinked.ID != "agent-1" {
+		t.Fatalf("unlinked agent = %+v", unlinked)
+	}
+	if err := s.AuthenticateCompanion(ctx, "agent-1", pairing.AgentToken); err != ErrUnauthorized {
+		t.Fatalf("old companion token error = %v, want unauthorized", err)
+	}
+	if allowed, err := s.UserCanAccessAgent(ctx, owner.ID, "agent-1"); err != nil || allowed {
+		t.Fatalf("unlinked access = %v, err = %v", allowed, err)
+	}
+	if _, err := s.GetPairing(ctx, pairing.Code); err != ErrNotFound {
+		t.Fatalf("stale pairing lookup error = %v, want not found", err)
+	}
+	if _, err := s.UnlinkAgent(ctx, owner.ID, "agent-1"); err != ErrNotFound {
+		t.Fatalf("second unlink error = %v, want not found", err)
 	}
 }

@@ -135,7 +135,7 @@ func writeRelayFrame(ctx context.Context, conn *websocket.Conn, frame Frame) err
 }
 
 func TestConnectRespondsWithSingleWriterUnderConcurrency(t *testing.T) {
-	const total = 60
+	const total = maxConcurrentRequests
 	handler := func(ctx context.Context, frame Frame, emit func(Frame) error) error {
 		return emit(Frame{Type: "response", ID: frame.ID, Status: http.StatusOK, Body: map[string]string{"echo": frame.ID}})
 	}

@@ -63,13 +63,16 @@ const (
 	maxFrameBytes         = 12 * 1024 * 1024
 	maxRelayAPIResponse   = 64 * 1024
 	maxConcurrentRequests = 16
-	initialBackoff        = time.Second
-	maxBackoff            = 32 * time.Second
-	stableConnection      = 30 * time.Second
-	pingInterval          = 25 * time.Second
-	pingTimeout           = 10 * time.Second
-	writeTimeout          = 15 * time.Second
-	dialTimeout           = 15 * time.Second
+	// Match T3 Connect's current retry ladder: a slightly slower first retry
+	// avoids tight reconnect loops during server stalls, while the lower cap
+	// still restores unattended connectors promptly.
+	initialBackoff   = 3 * time.Second
+	maxBackoff       = 16 * time.Second
+	stableConnection = 30 * time.Second
+	pingInterval     = 25 * time.Second
+	pingTimeout      = 10 * time.Second
+	writeTimeout     = 15 * time.Second
+	dialTimeout      = 15 * time.Second
 )
 
 var relayHTTPClient = &http.Client{

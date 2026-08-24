@@ -106,6 +106,7 @@ Authenticated device endpoints:
 - `GET /devices`
 - `DELETE /devices/{id}`
 - `GET /agents`
+- `DELETE /agents/{id}`
 - `POST /enrollments`
 - `POST /agents/{id}/recover`
 - `POST /pairings/{code}/claim`
@@ -129,6 +130,11 @@ The relay needs persistent storage because it is the system of record for:
 - pairing codes
 - connector token rotation
 - recovery state
+
+Postgres migrations are recorded in `brio_schema_migrations` and serialized
+with a transaction-scoped advisory lock. Relay and connector invariants copied
+from T3 Connect, plus the remaining architectural gaps, are documented in
+`docs/relay-practices.md`.
 
 Without Postgres, the in-memory relay is only suitable for development.
 

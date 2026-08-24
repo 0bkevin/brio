@@ -18,6 +18,7 @@ import (
 	identityauth "github.com/brio/brio/apps/relay/internal/auth"
 	"github.com/brio/brio/apps/relay/internal/store"
 	"github.com/go-chi/chi/v5"
+	"github.com/go-chi/chi/v5/middleware"
 )
 
 func TestHubRoutesResponseOnlyToRequestingMobilePeer(t *testing.T) {
@@ -420,6 +421,80 @@ func TestHubDisconnectCompanionsRotatesOnlyTargetAgent(t *testing.T) {
 	}
 }
 
+func TestHubReplacementKeepsOneLiveSessionPerConnectorAndDevice(t *testing.T) {
+	h := newHub()
+	mobile := testPeer("mobile", "agent-1")
+	mobile.deviceID = "device-1"
+	otherDevice := testPeer("mobile", "agent-1")
+	otherDevice.deviceID = "device-2"
+	oldCompanion := testPeer("companion", "agent-1")
+	h.add(mobile)
+	h.add(otherDevice)
+	h.add(oldCompanion)
+
+	h.route(mobile, mustJSON(tunnelFrame{Type: "request", ID: "req-1"}))
+	_ = readFrame(t, oldCompanion)
+	newCompanion := testPeer("companion", "agent-1")
+	h.replaceSession(newCompanion)
+
+	if peerConnected(h, oldCompanion) || !peerConnected(h, newCompanion) {
+		t.Fatal("replacement companion did not become the sole connector session")
+	}
+	if got := readFrame(t, mobile); got.Code != "COMPANION_DISCONNECTED" || got.ID != "req-1" {
+		t.Fatalf("pending requester got %+v after connector replacement", got)
+	}
+
+	replacementMobile := testPeer("mobile", "agent-1")
+	replacementMobile.deviceID = "device-1"
+	h.replaceSession(replacementMobile)
+	if peerConnected(h, mobile) || !peerConnected(h, replacementMobile) {
+		t.Fatal("replacement Mobile socket did not supersede its prior device session")
+	}
+	if !peerConnected(h, otherDevice) {
+		t.Fatal("replacement disconnected another device")
+	}
+}
+
+func TestUnlinkAgentRevokesCredentialsAndDisconnectsAllPeers(t *testing.T) {
+	ctx := context.Background()
+	st := store.NewMemoryStore()
+	owner, _, _, err := st.CreateDeviceToken(ctx, "owner@example.com", "Phone")
+	if err != nil {
+		t.Fatal(err)
+	}
+	pairing, err := st.CreatePairing(ctx, "agent-1", "Hermes", time.Minute, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.ClaimPairing(ctx, pairing.Code, owner.ID); err != nil {
+		t.Fatal(err)
+	}
+	a := &app{hub: newHub(), store: st}
+	mobile := testPeer("mobile", "agent-1")
+	mobile.deviceID = "device-1"
+	companion := testPeer("companion", "agent-1")
+	a.hub.add(mobile)
+	a.hub.add(companion)
+
+	req := httptest.NewRequest(http.MethodDelete, "/agents/agent-1", nil)
+	routeContext := chi.NewRouteContext()
+	routeContext.URLParams.Add("id", "agent-1")
+	requestCtx := context.WithValue(req.Context(), chi.RouteCtxKey, routeContext)
+	requestCtx = context.WithValue(requestCtx, authContextKey{}, store.Auth{User: owner})
+	recorder := httptest.NewRecorder()
+	a.unlinkAgent(recorder, req.WithContext(requestCtx))
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("unlink status = %d, want 200: %s", recorder.Code, recorder.Body.String())
+	}
+	if peerConnected(a.hub, mobile) || peerConnected(a.hub, companion) {
+		t.Fatal("unlink left an agent peer connected")
+	}
+	if err := st.AuthenticateCompanion(ctx, "agent-1", pairing.AgentToken); err != store.ErrUnauthorized {
+		t.Fatalf("old companion token error = %v, want unauthorized", err)
+	}
+}
+
 func TestDisconnectAllPeersDrainsHub(t *testing.T) {
 	a := &app{hub: newHub(), store: &touchStore{}}
 	a.hub.add(testPeer("mobile", "agent-1"))
@@ -735,6 +810,27 @@ func TestRequestLoggerRedactsEnrollmentAndPairingCodesFromPaths(t *testing.T) {
 	if !strings.Contains(logs.String(), "path=/enrollments/:code/claim") ||
 		!strings.Contains(logs.String(), "path=/pairings/:code") {
 		t.Fatalf("request log omitted redacted route shape: %s", logs.String())
+	}
+}
+
+func TestJSONResponsesAreNonCacheableAndRequestIDsAreExposed(t *testing.T) {
+	handler := middleware.RequestID(requestLogger(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		writeJSON(w, http.StatusCreated, map[string]string{"token": "sensitive"})
+	})))
+	recorder := httptest.NewRecorder()
+	handler.ServeHTTP(recorder, httptest.NewRequest(http.MethodPost, "/auth/devices", nil))
+
+	if got := recorder.Header().Get("Cache-Control"); got != "no-store" {
+		t.Fatalf("Cache-Control = %q, want no-store", got)
+	}
+	if got := recorder.Header().Get("Pragma"); got != "no-cache" {
+		t.Fatalf("Pragma = %q, want no-cache", got)
+	}
+	if got := recorder.Header().Get("X-Content-Type-Options"); got != "nosniff" {
+		t.Fatalf("X-Content-Type-Options = %q, want nosniff", got)
+	}
+	if got := recorder.Header().Get("X-Request-ID"); got == "" {
+		t.Fatal("response omitted X-Request-ID")
 	}
 }
 

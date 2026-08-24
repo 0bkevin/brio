@@ -1004,6 +1004,30 @@ export async function listRelayAgents(relayURL: string, relayToken: string) {
   return (body?.agents ?? []) as RelayAgent[];
 }
 
+export async function unlinkRelayAgent(
+  relayURL: string,
+  relayToken: string,
+  agentID: string,
+) {
+  const response = await fetch(
+    `${relayHTTPBaseURL(relayURL)}/agents/${encodeURIComponent(agentID)}`,
+    {
+      method: 'DELETE',
+      redirect: 'error',
+      headers: {
+        Accept: 'application/json',
+        Authorization: `Bearer ${relayToken}`,
+      },
+    },
+  );
+  const body = await response.json().catch(() => null);
+  if (!response.ok) {
+    throw new Error(body?.error ?? 'Could not unlink relay agent');
+  }
+  disconnectRelayAgentClient(relayURL, relayToken, agentID);
+  return body?.agent as RelayAgent;
+}
+
 export async function createRelayEnrollment(
   relayURL: string,
   relayToken: string,
@@ -1376,6 +1400,15 @@ export function disconnectRelayClients(relayToken: string) {
   for (const [key, client] of relayClients) {
     if (key.endsWith(suffix)) client.close();
   }
+}
+
+export function disconnectRelayAgentClient(
+  relayURL: string,
+  relayToken: string,
+  agentID: string,
+) {
+  const key = `${relayTunnelURL(relayURL, agentID)}\u0000${relayToken}`;
+  relayClients.get(key)?.close();
 }
 
 function relayTunnelURL(baseURL: string, agentId: string) {
