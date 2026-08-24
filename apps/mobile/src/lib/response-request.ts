@@ -1,8 +1,3 @@
-// Pure construction of /v1/responses request payloads. Kept free of any
-// React Native or Expo imports so the merge-sensitive behavior (model
-// overrides riding along with composer fields on every request, including
-// retries) can be regression-tested in Node.
-
 export type ResponseRequestOptions = {
   conversation?: string;
   previousResponseId?: string;
@@ -10,7 +5,6 @@ export type ResponseRequestOptions = {
   provider?: string;
   model?: string;
   modelOptions?: Record<string, unknown>;
-  // Stable runtime session identity sent as X-Hermes-Session-Id.
   sessionId?: string;
 };
 
@@ -22,10 +16,6 @@ export function responseRequestBody(
   },
   stream: boolean,
 ) {
-  // A per-thread model override must ride along on every request, including
-  // retries and continuations. Without an override the profile default
-  // (`hermes-agent`) is left untouched; require_model_lock is never set here
-  // and profile config is never mutated.
   const hasOverride = Boolean(
     options.model?.trim() || options.provider?.trim() || options.modelOptions,
   );
@@ -44,7 +34,10 @@ export function responseRequestBody(
     ...(options.previousResponseId
       ? { previous_response_id: options.previousResponseId }
       : options.conversationHistory?.length
-        ? { conversation: options.conversation, conversation_history: options.conversationHistory }
+        ? {
+            conversation: options.conversation,
+            conversation_history: options.conversationHistory,
+          }
         : options.conversation
           ? { conversation: options.conversation }
           : {}),

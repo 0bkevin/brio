@@ -2,8 +2,17 @@
 
 Expo app for the Brio mobile control plane.
 
-Conversation drafts and queued follow-ups are persisted locally. Queued prompts
-can be paused, reordered, edited, retried, or removed before delivery.
+The interface follows the native T3 Code mobile work model, adapted to the
+Hermes/Brio protocol:
+
+- searchable Hermes session list and persistent run state
+- conversation history, long-running tasks, cancellation, and approvals
+- Relay-backed environments
+- saved multi-environment switching, reconnect, editing, and removal
+- workspace file browser and editor
+- memory, config, skills, toolsets, scheduled jobs, logs, and gateway controls
+
+Expo is configured to use the Hermes JavaScript engine on iOS and Android.
 
 ## Run
 
@@ -37,24 +46,13 @@ npm run check
 
 `npm run check` runs Expo linting, TypeScript, and a static web export.
 
-## Connect A Hermes Machine
+## Connect to Hermes
 
-Start the relay for local development:
+In the mobile app, tap **Connect with Brio Relay**, sign in to the Relay, and
+generate an enrollment command. Run that command on the Hermes machine. It
+downloads the slim `brio` connector, configures the stock Hermes API server,
+enrolls the machine with the Relay, and starts the connector service.
 
-```bash
-make dev-relay
-```
-
-In the mobile app, sign in to the relay and generate a setup command. Run that
-command on the Hermes machine. It installs the slim `brio` connector, enables
-the Hermes API server, enrolls the machine with the relay, and installs/starts
-the connector service, which keeps the Brio relay tunnel running.
-
-For local CLI development without the installer:
-
-```bash
-brio setup --relay-url http://127.0.0.1:8082 --code ABCD1234
-```
-
-Direct connections to a Hermes API server on the LAN are still available in
-the app under Advanced.
+Saved environments can be switched, retried, renamed, updated, or removed
+from the environment picker and Settings. See the repository-level README for
+the full connector setup, recovery, and service-management commands.

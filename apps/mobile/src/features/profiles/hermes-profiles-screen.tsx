@@ -519,6 +519,14 @@ function ImportArchiveCard({
     setPreviewInput(null);
     setSecretsConsent(false);
   };
+  const changeArchive = (value: string) => {
+    setArchiveB64(value);
+    invalidatePreview();
+  };
+  const changeTargetName = (value: string) => {
+    setTargetName(value);
+    invalidatePreview();
+  };
 
   const dryRun = useMutation({
     mutationFn: () => previewProfileArchiveImport(connection, { archiveB64, name: targetName }),
@@ -563,23 +571,11 @@ function ImportArchiveCard({
       <ThemedText type="smallBold">Import an exported profile archive</ThemedText>
       <ThemedInput
         label="Target profile name"
-        onChangeText={(value) => {
-          setTargetName(value);
-          invalidatePreview();
-        }}
+        onChangeText={changeTargetName}
         value={targetName}
         placeholder="restored-bot"
       />
-      <ThemedInput
-        label="Archive (base64)"
-        multiline
-        onChangeText={(value) => {
-          setArchiveB64(value);
-          invalidatePreview();
-        }}
-        value={archiveB64}
-        placeholder="H4sIAA…"
-      />
+      <ThemedInput label="Archive (base64)" multiline onChangeText={changeArchive} value={archiveB64} placeholder="H4sIAA…" />
       {dryRun.isSuccess && preview?.has_secrets_file ? (
         <Pressable
           accessibilityRole="checkbox"
@@ -643,11 +639,19 @@ function InstallDistributionCard({
       .join('\n');
   };
 
-  // Preview tokens bind apply to the exact staged tree, so input handlers
-  // invalidate both the preview and token in the same user event.
+  // Preview token binds apply to the exact staged tree; input handlers
+  // invalidate both the preview and the token.
   const invalidatePreview = () => {
     setPreview(null);
     setPreviewInput(null);
+  };
+  const changeSource = (value: string) => {
+    setSource(value);
+    invalidatePreview();
+  };
+  const changeTargetName = (value: string) => {
+    setTargetName(value);
+    invalidatePreview();
   };
 
   const dryRun = useMutation({
@@ -696,19 +700,13 @@ function InstallDistributionCard({
       </ThemedText>
       <ThemedInput
         label="Source"
-        onChangeText={(value) => {
-          setSource(value);
-          invalidatePreview();
-        }}
+        onChangeText={changeSource}
         value={source}
         placeholder="github.com/you/research-bot#v1.2.0"
       />
       <ThemedInput
         label="Profile name (optional — defaults to the manifest)"
-        onChangeText={(value) => {
-          setTargetName(value);
-          invalidatePreview();
-        }}
+        onChangeText={changeTargetName}
         value={targetName}
         placeholder="from manifest"
       />

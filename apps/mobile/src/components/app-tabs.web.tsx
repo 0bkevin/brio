@@ -9,10 +9,12 @@ import {
 import { SymbolView, type SymbolViewProps } from 'expo-symbols';
 import { Pressable, StyleSheet, View } from 'react-native';
 
+import { SectionLabel, StatusBadge, ThemeSwitcher } from './dashboard';
 import { ThemedText } from './themed-text';
 
 import { Spacing } from '@/constants/theme';
 import { useTheme } from '@/hooks/use-theme';
+import { useConnectionStore } from '@/state/connection-store';
 
 export default function AppTabs() {
   const colors = useTheme();
@@ -34,9 +36,6 @@ export default function AppTabs() {
           <TabTrigger name="manage" href="/explore" asChild>
             <SidebarButton icon="gearshape" label="Manage" />
           </TabTrigger>
-          <TabTrigger name="control" href="/command-center" asChild>
-            <SidebarButton icon="square.grid.2x2" label="Control" />
-          </TabTrigger>
         </SidebarNav>
       </TabList>
     </Tabs>
@@ -45,6 +44,7 @@ export default function AppTabs() {
 
 function SidebarNav({ children, compact, ...props }: TabListProps & { compact?: boolean }) {
   const colors = useTheme();
+  const connection = useConnectionStore((state) => state.connection);
 
   return (
     <View
@@ -55,18 +55,39 @@ function SidebarNav({ children, compact, ...props }: TabListProps & { compact?: 
         { backgroundColor: colors.panel, borderColor: colors.border },
       ]}>
       <View style={[styles.brandBlock, compact && styles.compactHidden, { borderColor: colors.border }]}>
-        <View style={[styles.brandMark, { backgroundColor: colors.accent }]}>
-          <ThemedText style={{ color: colors.accentText }} type="smallBold">B</ThemedText>
-        </View>
-        <ThemedText type="smallBold" style={styles.brandText}>Brio</ThemedText>
+        <ThemedText type="brand" style={styles.brandText}>
+          Brio
+        </ThemedText>
+        <ThemedText type="small" themeColor="textSecondary">
+          Hermes Agent
+        </ThemedText>
       </View>
 
       <View style={[styles.navGroup, compact && styles.navGroupCompact]}>
+        <SectionLabel>Navigation</SectionLabel>
         {children}
       </View>
 
+      <View style={[styles.navGroup, compact && styles.compactHidden]}>
+        <SectionLabel>Status</SectionLabel>
+        <StatusBadge tone={connection ? 'success' : 'warning'}>
+          {connection ? connection.status : 'disconnected'}
+        </StatusBadge>
+        <ThemedText numberOfLines={2} type="small" themeColor="textTertiary">
+          {connection?.url ?? 'No connector connected'}
+        </ThemedText>
+      </View>
+
+      <View style={[styles.themeGroup, compact && styles.compactHidden]}>
+        <SectionLabel>Theme</SectionLabel>
+        <ThemeSwitcher />
+      </View>
+
       <View style={[styles.footer, compact && styles.compactHidden, { borderColor: colors.border }]}>
-        <ThemedText type="code" themeColor="textTertiary">v1</ThemedText>
+        <ThemedText type="code" themeColor="textTertiary">
+          v1.0.0
+        </ThemedText>
+        <ThemedText type="eyebrow">Nous</ThemedText>
       </View>
     </View>
   );
@@ -92,7 +113,7 @@ function SidebarButton({
         },
       ]}>
       <SymbolView name={icon} size={16} tintColor={isFocused ? colors.text : colors.textSecondary} />
-      <ThemedText type="small" themeColor={isFocused ? 'text' : 'textSecondary'} style={styles.navLabel}>
+      <ThemedText type="eyebrow" themeColor={isFocused ? 'text' : 'textSecondary'} style={styles.navLabel}>
         {label}
       </ThemedText>
       {isFocused ? <View style={[styles.activeRail, { backgroundColor: colors.accent }]} /> : null}
@@ -106,7 +127,7 @@ const styles = StyleSheet.create({
     minHeight: 0,
   },
   slotWide: {
-    paddingLeft: 104,
+    paddingLeft: 260,
   },
   slotCompact: {
     paddingTop: 66,
@@ -115,14 +136,13 @@ const styles = StyleSheet.create({
     bottom: 0,
     borderRightWidth: StyleSheet.hairlineWidth,
     flexShrink: 0,
-    gap: Spacing.four,
+    gap: Spacing.three,
     left: 0,
     minHeight: '100%',
     paddingTop: Spacing.three,
-    // Web-only value; react-native's stock position union stops CI typechecks.
-    position: 'fixed' as never,
+    position: 'absolute',
     top: 0,
-    width: 104,
+    width: 260,
     zIndex: 10,
   },
   sidebarCompact: {
@@ -139,25 +159,17 @@ const styles = StyleSheet.create({
     width: '100%',
   },
   brandBlock: {
-    alignItems: 'center',
     borderBottomWidth: StyleSheet.hairlineWidth,
-    gap: Spacing.two,
+    gap: Spacing.one,
     paddingBottom: Spacing.three,
-    paddingHorizontal: Spacing.two,
-  },
-  brandMark: {
-    alignItems: 'center',
-    borderRadius: 12,
-    height: 36,
-    justifyContent: 'center',
-    width: 36,
+    paddingHorizontal: Spacing.four,
   },
   brandText: {
     lineHeight: 20,
   },
   navGroup: {
-    gap: Spacing.one,
-    paddingHorizontal: Spacing.two,
+    gap: Spacing.two,
+    paddingHorizontal: Spacing.three,
   },
   navGroupCompact: {
     alignItems: 'center',
@@ -167,17 +179,16 @@ const styles = StyleSheet.create({
   },
   navButton: {
     alignItems: 'center',
-    borderRadius: 10,
     borderLeftWidth: 1,
-    gap: Spacing.one,
-    justifyContent: 'center',
-    minHeight: 58,
+    flexDirection: 'row',
+    gap: Spacing.two,
+    minHeight: 42,
     paddingHorizontal: Spacing.two,
     paddingVertical: Spacing.two,
     position: 'relative',
   },
   navLabel: {
-    fontSize: 12,
+    flex: 1,
   },
   activeRail: {
     bottom: 6,
@@ -186,12 +197,19 @@ const styles = StyleSheet.create({
     top: 6,
     width: 1,
   },
+  themeGroup: {
+    flex: 1,
+    gap: Spacing.two,
+    minHeight: 0,
+    paddingHorizontal: Spacing.three,
+  },
   footer: {
     alignItems: 'center',
     borderTopWidth: StyleSheet.hairlineWidth,
-    justifyContent: 'center',
+    flexDirection: 'row',
+    justifyContent: 'space-between',
     marginTop: 'auto',
-    paddingHorizontal: Spacing.two,
+    paddingHorizontal: Spacing.four,
     paddingVertical: Spacing.three,
   },
   compactHidden: {

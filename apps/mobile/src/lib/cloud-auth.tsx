@@ -31,7 +31,7 @@ function CloudSessionGuard({ children }: { children: ReactNode }) {
   const { isLoaded, isSignedIn, userId } = useAuth({ treatPendingAsSignedOut: false });
   const relaySession = useRelaySessionStore((state) => state.session);
   const clearRelaySession = useRelaySessionStore((state) => state.clearSession);
-  const clearConnection = useConnectionStore((state) => state.clearConnection);
+  const removeRelayConnections = useConnectionStore((state) => state.removeRelayConnections);
   const clearingSession = useRef('');
 
   useEffect(() => {
@@ -43,12 +43,12 @@ function CloudSessionGuard({ children }: { children: ReactNode }) {
     disconnectRelayClients(relaySession.token);
     void Promise.allSettled([
       revokeRelayDevice(relaySession.relayURL, relaySession.token, relaySession.deviceID),
-      clearConnection(),
+      removeRelayConnections(relaySession.relayURL),
       clearRelaySession(),
     ]).finally(() => {
       if (clearingSession.current === sessionKey) clearingSession.current = '';
     });
-  }, [clearConnection, clearRelaySession, isLoaded, isSignedIn, relaySession, userId]);
+  }, [clearRelaySession, isLoaded, isSignedIn, relaySession, removeRelayConnections, userId]);
 
   return children;
 }

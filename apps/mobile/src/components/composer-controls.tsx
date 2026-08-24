@@ -44,6 +44,7 @@ export function ComposerControls({
   onRemoveAttachment,
   onSend,
   onUndo,
+  profile,
   sessionId,
 }: {
   active: boolean;
@@ -60,6 +61,7 @@ export function ComposerControls({
   onRemoveAttachment: (attachmentId: string) => Promise<boolean>;
   onSend: (mode: PromptDeliveryMode) => void;
   onUndo: () => void;
+  profile: string;
   sessionId: string;
 }) {
   const colors = useTheme();
@@ -73,22 +75,22 @@ export function ComposerControls({
   const token = completionToken(draft);
 
   const capabilities = useQuery({
-    queryKey: ['composer-capabilities', connection.id, connection.url],
-    queryFn: () => getComposerCapabilities(connection),
+    queryKey: ['composer-capabilities', connection.id, connection.url, profile],
+    queryFn: () => getComposerCapabilities(connection, profile),
     staleTime: 5 * 60_000,
   });
   const suggestions = useQuery({
-    queryKey: ['composer-completion', connection.id, token?.kind, token?.query],
+    queryKey: ['composer-completion', connection.id, profile, token?.kind, token?.query],
     queryFn: () =>
       token?.kind === 'command'
-        ? completeSlashCommand(connection, token.query)
-        : completeContextReference(connection, token?.query ?? ''),
+        ? completeSlashCommand(connection, token.query, profile)
+        : completeContextReference(connection, token?.query ?? '', profile),
     enabled: Boolean(token),
     staleTime: 15_000,
   });
   const commands = useQuery({
-    queryKey: ['composer-commands', connection.id],
-    queryFn: () => getCommandCatalog(connection),
+    queryKey: ['composer-commands', connection.id, profile],
+    queryFn: () => getCommandCatalog(connection, profile),
     enabled: commandsOpen,
     staleTime: 60_000,
   });
@@ -127,6 +129,7 @@ export function ComposerControls({
           source,
           (progress) => setUploads((current) => current.map((item) => item.key === key ? { ...item, progress } : item)),
           controller.signal,
+          profile,
         );
         await onAddAttachment(uploaded);
         setUploads((current) => current.filter((item) => item.key !== key));
@@ -139,7 +142,7 @@ export function ComposerControls({
       }
     }
     return succeeded;
-  }, [attachments, capabilities.data, connection, onAddAttachment, sessionId]);
+  }, [attachments, capabilities.data, connection, onAddAttachment, profile, sessionId]);
 
   useEffect(() => {
     if (incomingShare.isResolving || incomingShare.error || incomingShare.sharedPayloads.length === 0) return;
@@ -218,7 +221,9 @@ export function ComposerControls({
   };
   const removeAttachment = async (attachment: ComposerAttachment) => {
     try {
-      if (await onRemoveAttachment(attachment.id)) await deleteAttachmentUpload(connection, attachment.id);
+      if (await onRemoveAttachment(attachment.id)) {
+        await deleteAttachmentUpload(connection, attachment.id, profile);
+      }
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : 'Could not remove attachment');
     }

@@ -27,6 +27,7 @@ export async function uploadComposerAttachment(
   source: AttachmentSource,
   onProgress: (progress: number) => void,
   signal?: AbortSignal,
+  profile?: string,
 ): Promise<ComposerAttachment> {
   throwIfAborted(signal);
   onProgress(0.05);
@@ -43,6 +44,7 @@ export async function uploadComposerAttachment(
       size: sourceInfo.size,
     },
     signal,
+    profile,
   );
 
   try {
@@ -61,6 +63,7 @@ export async function uploadComposerAttachment(
         chunk,
         index === chunks - 1,
         signal,
+        profile,
       );
       onProgress(0.15 + (0.85 * (index + 1)) / chunks);
     }
@@ -76,7 +79,7 @@ export async function uploadComposerAttachment(
       sha256: current.sha256,
     };
   } catch (error) {
-    await deleteAttachmentUpload(connection, created.id).catch(() => undefined);
+    await deleteAttachmentUpload(connection, created.id, profile).catch(() => undefined);
     throw error;
   }
 }

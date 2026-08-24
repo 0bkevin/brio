@@ -10,14 +10,6 @@ import { AppText, AppTextInput, Button, Card, EmptyState, StatusDot } from '@/co
 import { T3Radius, T3Spacing, T3Typography } from '@/constants/t3-theme';
 import { useT3Theme } from '@/hooks/use-t3-theme';
 import {
-  DEFAULT_PROFILE_NAME,
-  environmentId,
-  isNamedProfile,
-  listProfiles,
-  profileName,
-  type HermesProfile,
-} from '@/lib/profiles';
-import {
   aggregateRootAgentUsage,
   controlRPC,
   executeControlCommand,
@@ -31,28 +23,38 @@ import {
   type HermesControlEvent,
   type HermesSubagent,
 } from '@/lib/brio';
+import {
+  DEFAULT_PROFILE_NAME,
+  environmentId as profileEnvironmentId,
+  isNamedProfile,
+  listProfiles,
+  profileName,
+  type HermesProfile,
+} from '@/lib/profiles';
+import { useConnectionStore } from '@/state/connection-store';
+import { useProfileStore } from '@/state/profile-store';
 
 export function HermesCommandCenterScreen({ connection }: { connection: AgentConnection }) {
   const colors = useT3Theme();
   const router = useRouter();
   const queryClient = useQueryClient();
-  const agentId = environmentId(connection);
-  const environments = [connection];
-  const [environmentIdState, setEnvironmentId] = useState(connection.id);
-  const activeEnvironment =
-    environments.find((item) => item.id === environmentIdState) ?? connection;
-
-  // Hermes profile selection. Profiles live inside one environment; the
-  // switcher re-scopes every query below without touching the connection.
+  const savedConnections = useConnectionStore((state) => state.connections);
+  const environments = savedConnections.length ? savedConnections : [connection];
+  const [environmentId, setEnvironmentId] = useState(connection.id);
+  const activeConnection =
+    environments.find((item) => item.id === environmentId) ?? connection;
+  const agentId = profileEnvironmentId(activeConnection);
+  const storedProfiles = useProfileStore((state) => state.activeProfiles);
+  const setActiveProfile = useProfileStore((state) => state.setActiveProfile);
   const profilesQuery = useQuery({
-    queryKey: ['profiles', activeEnvironment.url, agentId],
-    queryFn: () => listProfiles(activeEnvironment),
+    queryKey: ['profiles', activeConnection.url, agentId],
+    queryFn: () => listProfiles(activeConnection),
     staleTime: 30_000,
     retry: false,
   });
-  const availableProfiles: HermesProfile[] = profilesQuery.data?.profiles ?? [];
-  const [requestedProfile, setRequestedProfile] = useState('');
-  const activeProfile = availableProfiles.some((profile) => profile.name === requestedProfile)
+  const profiles: HermesProfile[] = profilesQuery.data?.profiles ?? [];
+  const requestedProfile = storedProfiles[agentId];
+  const activeProfile = profiles.some((profile) => profile.name === requestedProfile)
     ? profileName(requestedProfile)
     : profilesQuery.data
       ? profileName(profilesQuery.data.active)
@@ -67,44 +69,41 @@ export function HermesCommandCenterScreen({ connection }: { connection: AgentCon
   const [steerText, setSteerText] = useState('');
 
   const sessions = useQuery({
-    queryKey: ['control-sessions', activeEnvironment.id, activeEnvironment.url, activeProfile],
-    queryFn: () => listControlSessions(activeEnvironment, 100, isNamedProfile(activeProfile) ? activeProfile : undefined),
+    queryKey: ['control-sessions', activeConnection.id, activeConnection.url, activeProfile],
+    queryFn: () => listControlSessions(activeConnection, 100, activeProfile),
     refetchInterval: 15_000,
-    retry: false,
   });
   const sessionId = sessions.data?.sessions.some((session) => session.id === selectedSessionId)
     ? selectedSessionId
     : sessions.data?.sessions[0]?.id ?? '';
 
   const snapshot = useQuery({
-    queryKey: ['command-center', activeEnvironment.id, activeEnvironment.url, sessionId, activeProfile],
-    queryFn: () => getCommandCenterSnapshot(activeEnvironment, sessionId, isNamedProfile(activeProfile) ? activeProfile : undefined),
+    queryKey: ['command-center', activeConnection.id, activeConnection.url, sessionId, activeProfile],
+    queryFn: () => getCommandCenterSnapshot(activeConnection, sessionId, activeProfile),
     enabled: Boolean(sessionId),
     refetchInterval: 5_000,
-    retry: false,
   });
   const refresh = async () => {
     await Promise.all([sessions.refetch(), snapshot.refetch()]);
   };
   const invalidate = async () => {
     await queryClient.invalidateQueries({
-      queryKey: ['command-center', activeEnvironment.id, activeEnvironment.url, sessionId, activeProfile],
+      queryKey: ['command-center', activeConnection.id, activeConnection.url, sessionId, activeProfile],
     });
   };
 
   const command = useMutation({
     mutationFn: (value: { command: string; confirm?: boolean }) =>
-      executeControlCommand(activeEnvironment, sessionId, value.command, value.confirm, isNamedProfile(activeProfile) ? activeProfile : undefined),
+      executeControlCommand(activeConnection, sessionId, value.command, value.confirm, activeProfile),
     onSuccess: invalidate,
   });
   const rpc = useMutation({
     mutationFn: (value: { method: string; params?: Record<string, unknown>; confirm?: boolean }) =>
-      controlRPC(activeEnvironment, value.method, value.params ?? {}, value.confirm, undefined, isNamedProfile(activeProfile) ? activeProfile : undefined),
+      controlRPC(activeConnection, value.method, value.params ?? {}, value.confirm, undefined, activeProfile),
     onSuccess: invalidate,
   });
   const background = useMutation({
-    mutationFn: (text: string) =>
-      startBackgroundTask(activeEnvironment, sessionId, text, isNamedProfile(activeProfile) ? activeProfile : undefined),
+    mutationFn: (text: string) => startBackgroundTask(activeConnection, sessionId, text, activeProfile),
     onSuccess: async () => {
       setBackgroundPrompt('');
       await invalidate();
@@ -127,7 +126,7 @@ export function HermesCommandCenterScreen({ connection }: { connection: AgentCon
     return (
       <EmptyState
         action={<Button onPress={() => void sessions.refetch()}>Try again</Button>}
-        detail={`${errorMessage(sessions.error)} Start “hermes serve” and configure its session token in Brio Companion.`}
+        detail={`${errorMessage(sessions.error)} Start “hermes serve” and configure its session token in the Brio connector.`}
         title="Hermes control plane unavailable"
       />
     );
@@ -146,7 +145,7 @@ export function HermesCommandCenterScreen({ connection }: { connection: AgentCon
             <StatusDot status={snapshot.isError ? 'error' : snapshot.isFetching ? 'busy' : 'online'} />
             <View style={styles.flex}>
               <AppText style={styles.title}>Command Center</AppText>
-              <AppText style={[styles.caption, { color: colors.muted }]}>{activeEnvironment.name} · backend-owned state</AppText>
+              <AppText style={[styles.caption, { color: colors.muted }]}>{activeConnection.name} · backend-owned state</AppText>
             </View>
             <Pressable
               accessibilityLabel="Refresh Command Center"
@@ -165,7 +164,7 @@ export function HermesCommandCenterScreen({ connection }: { connection: AgentCon
                     style={({ pressed }) => [
                       styles.environmentChip,
                       {
-                        borderColor: environment.id === activeEnvironment.id ? colors.foreground : colors.border,
+                        borderColor: environment.id === activeConnection.id ? colors.foreground : colors.border,
                         opacity: pressed ? 0.65 : 1,
                       },
                     ]}>
@@ -176,22 +175,27 @@ export function HermesCommandCenterScreen({ connection }: { connection: AgentCon
               </View>
             </ScrollView>
           ) : null}
-          {availableProfiles.length > 1 ? (
+          {profiles.length > 1 ? (
             <ScrollView horizontal showsHorizontalScrollIndicator={false}>
               <View style={styles.chips}>
-                {availableProfiles.map((profile) => {
-                  const active = profile.name === activeProfile;
+                {profiles.map((profile) => {
+                  const selected = profile.name === activeProfile;
                   return (
                     <Pressable
                       accessibilityLabel={`Control profile ${profile.name}`}
                       accessibilityRole="button"
-                      accessibilityState={{ selected: active }}
+                      accessibilityState={{ selected }}
                       key={profile.name}
-                      onPress={() => setRequestedProfile(profile.name)}
+                      onPress={() =>
+                        void setActiveProfile(
+                          agentId,
+                          isNamedProfile(profile.name) ? profile.name : undefined,
+                        )
+                      }
                       style={({ pressed }) => [
                         styles.environmentChip,
                         {
-                          borderColor: active ? colors.primary : colors.border,
+                          borderColor: selected ? colors.primary : colors.border,
                           opacity: pressed ? 0.65 : 1,
                         },
                       ]}>
@@ -342,7 +346,7 @@ export function HermesCommandCenterScreen({ connection }: { connection: AgentCon
               </Button>
             </Panel>
 
-            <Panel title="Heartbeat" detail="Per-session recurring prompt driven by Companion while it is running">
+            <Panel title="Heartbeat" detail="Per-session recurring prompt driven by the connector while it is running">
               {snapshot.data.heartbeat ? (
                 <>
                   <View style={styles.statusRow}>
@@ -466,7 +470,15 @@ export function HermesCommandCenterScreen({ connection }: { connection: AgentCon
                   <AgentRow
                     agent={agent}
                     key={agent.subagent_id}
-                    onJump={(childSessionId) => router.push(`/thread/${encodeURIComponent(childSessionId)}`)}
+                    onJump={(childSessionId) =>
+                      router.push(
+                        `/thread/${encodeURIComponent(childSessionId)}${
+                          isNamedProfile(activeProfile)
+                            ? `?profile=${encodeURIComponent(activeProfile)}`
+                            : ''
+                        }`,
+                      )
+                    }
                     onStop={(target) =>
                       confirmAction('Stop this agent?', `${target.goal || 'Agent'} · ${target.subagent_id}`, () =>
                         rpc.mutate({ method: 'subagent.interrupt', params: { session_id: target.owner_session_id ?? snapshot.data?.runtimeSessionId, subagent_id: target.subagent_id }, confirm: true }),
