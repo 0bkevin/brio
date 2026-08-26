@@ -14,6 +14,7 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"sync"
 	"time"
 
 	"nhooyr.io/websocket"
@@ -46,6 +47,17 @@ type Config struct {
 // error frames are delivered through emit; the handler returns a non-nil
 // error only when the connection can no longer accept frames.
 type RequestHandler func(ctx context.Context, frame Frame, emit func(Frame) error) error
+
+type channelInput struct {
+	frames   chan Frame
+	stop     chan struct{}
+	stopOnce sync.Once
+	closing  bool
+}
+
+func (c *channelInput) finish() {
+	c.stopOnce.Do(func() { close(c.stop) })
+}
 
 // EnrollmentResult is the relay response for a claimed enrollment code.
 type EnrollmentResult struct {
@@ -225,6 +237,8 @@ func connect(ctx context.Context, cfg Config) error {
 
 	slog.Info("connected relay tunnel", "agent_id", cfg.AgentID)
 	requests := make(chan struct{}, maxConcurrentRequests)
+	channels := map[string]*channelInput{}
+	var channelsMu sync.Mutex
 	for {
 		_, data, err := conn.Read(connCtx)
 		if err != nil {
@@ -236,6 +250,90 @@ func connect(ctx context.Context, cfg Config) error {
 		}
 		switch frame.Type {
 		case "request":
+		case "channel_open":
+			channelsMu.Lock()
+			_, exists := channels[frame.ID]
+			if exists {
+				channelsMu.Unlock()
+				if err := emit(Frame{Type: "channel_error", ID: frame.ID, Code: "DUPLICATE_CHANNEL", Message: "channel is already open"}); err != nil {
+					return err
+				}
+				continue
+			}
+			input := &channelInput{frames: make(chan Frame, 32), stop: make(chan struct{})}
+			channels[frame.ID] = input
+			channelsMu.Unlock()
+			input.frames <- frame
+			go func(id string, channel *channelInput) {
+				channelEmit := func(out Frame) error {
+					err := emit(out)
+					if out.Type == "channel_close" || out.Type == "channel_error" {
+						channelsMu.Lock()
+						channel.closing = true
+						channelsMu.Unlock()
+						channel.finish()
+					}
+					return err
+				}
+				defer func() {
+					channel.finish()
+					// Idempotent for every terminal path, and essential when the
+					// handler emitted a terminal frame without receiving a peer close.
+					_ = cfg.Handler(connCtx, Frame{Type: "channel_close", ID: id}, emit)
+					channelsMu.Lock()
+					if channels[id] == channel {
+						delete(channels, id)
+					}
+					channelsMu.Unlock()
+				}()
+				for {
+					select {
+					case <-connCtx.Done():
+						return
+					case <-channel.stop:
+						return
+					case next := <-channel.frames:
+						if err := cfg.Handler(connCtx, next, channelEmit); err != nil {
+							slog.Warn("tunnel channel handler failed", "channel_id", id, "error", err)
+							return
+						}
+						if next.Type == "channel_close" {
+							return
+						}
+					}
+				}
+			}(frame.ID, input)
+			continue
+		case "channel_data", "channel_close":
+			channelsMu.Lock()
+			input := channels[frame.ID]
+			if input == nil || input.closing {
+				channelsMu.Unlock()
+				if err := emit(Frame{Type: "channel_error", ID: frame.ID, Code: "CHANNEL_NOT_OPEN", Message: "channel is not open"}); err != nil {
+					return err
+				}
+				continue
+			}
+			if frame.Type == "channel_close" {
+				input.closing = true
+			}
+			channelsMu.Unlock()
+			select {
+			case input.frames <- frame:
+			case <-input.stop:
+				if err := emit(Frame{Type: "channel_error", ID: frame.ID, Code: "CHANNEL_NOT_OPEN", Message: "channel is not open"}); err != nil {
+					return err
+				}
+			default:
+				channelsMu.Lock()
+				input.closing = true
+				channelsMu.Unlock()
+				input.finish()
+				if err := emit(Frame{Type: "channel_error", ID: frame.ID, Code: "CHANNEL_BACKPRESSURE", Message: "channel input buffer is full"}); err != nil {
+					return err
+				}
+			}
+			continue
 		case "ping":
 			if err := emit(Frame{Type: "pong", ID: frame.ID}); err != nil {
 				return err

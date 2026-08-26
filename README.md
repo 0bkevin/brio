@@ -15,7 +15,9 @@ The preferred UX is:
 Hermes Agent stays completely stock: the connector is a small Go binary in
 this repo that keeps an outbound WebSocket tunnel to the relay and forwards
 a fixed set of request paths to Hermes' local API server
-(`http://127.0.0.1:8642`). There is no local HTTP server in the connector.
+(`http://127.0.0.1:8642`). It also proxies an opaque, multiplexed channel to
+the native `hermes serve` `/api/ws` gateway for real-time conversations.
+There is no local HTTP server in the connector.
 
 ## What Is Here
 
@@ -29,7 +31,8 @@ a fixed set of request paths to Hermes' local API server
 - Go `1.26.6` (relay and connector).
 - Node.js and npm (mobile app).
 - Hermes Agent on the target machine (stock; no fork needed).
-- `hermes serve` on loopback for optional Command Center controls.
+- `hermes serve` on loopback for real-time conversations and Command Center
+  controls. Older installations can use the documented degraded REST/SSE mode.
 
 Postgres is optional. The relay uses in-memory development storage when
 `BRIO_DATABASE_URL` is unset.
@@ -116,6 +119,16 @@ headers. The relay temporarily accepts the legacy `?token=` form so already
 installed connectors can upgrade without an outage only when
 `BRIO_ALLOW_LEGACY_QUERY_TOKENS=true` is explicitly configured.
 
+Conversation traffic uses a persistent `channel_open` / `channel_data` /
+`channel_close` flow on that same authenticated tunnel. The connector opens
+Hermes `/api/ws` locally and injects `HERMES_CONTROL_TOKEN`; gateway JSON-RPC
+payloads remain opaque to Brio and the credential never reaches Mobile or the
+relay. Channels share the tunnel's bounded queues and reconnect automatically.
+Hermes event sequence replay removes duplicates and fills bounded reconnect
+gaps; after every reconnect Brio also calls `session.resume` with the durable
+session id so Hermes rebinds the live session transport and returns its
+authoritative in-flight state.
+
 - Forwarded to the stock Hermes API server with
   `Authorization: Bearer API_SERVER_KEY` (replacing any frame credentials):
   `/v1/responses`, `/v1/runs...`, `/api/jobs...`, `/v1/capabilities`,
@@ -142,6 +155,14 @@ installed connectors can upgrade without an outage only when
   `HERMES_DASHBOARD_SESSION_TOKEN`) and default to
   `HERMES_CONTROL_BASE=http://127.0.0.1:9119`. Under `/p/<profile>/...` they
   require a per-profile control override (see Hermes Profiles).
+- Proxied transparently from Mobile to the official `hermes serve` gateway:
+  `/api/ws`, or `/p/<profile>/api/ws` with a dedicated per-profile endpoint.
+  Chat prompts use native JSON-RPC and consume `message.*`, `tool.*`, approval,
+  reasoning, usage, and lifecycle events without polling. If the gateway is
+  unavailable because the installed Hermes version predates `hermes serve`,
+  Mobile explicitly enters `degraded` state and uses `/v1/runs/{id}/events`
+  SSE plus REST mutations. The degraded path is still event-driven; it never
+  polls run status on a fixed interval.
 - Everything else returns a 404-style error frame. The old file/config/
   gateway/skills/tools/logs endpoints are intentionally gone.
 
@@ -230,6 +251,14 @@ Plain chat and native session history work in direct mode. Connector-backed
 composer features (attachments, context expansion, dynamic commands, and
 redirect) require the Brio connector. Internet-facing endpoints must terminate
 HTTPS before the API server.
+
+Hermes' API server and `hermes serve` gateway are separate transports (normally
+ports 8642 and 9119) with separate credentials. A direct pairing payload may
+therefore provide `gateway_url` plus `gateway_token` to enable native `/api/ws`;
+both fields are required together. Without them Brio deliberately uses the
+REST/SSE degraded conversation path instead of reusing `API_SERVER_KEY` against
+the wrong service. Static gateway tokens are intended for a loopback/private
+tunnel; current public Hermes gateways use short-lived OAuth WebSocket tickets.
 
 ## Configuration
 
