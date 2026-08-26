@@ -25,6 +25,7 @@ import {
   filterAgentsForControlSession,
   finalizeConnection,
   getHealth,
+  listSessions,
   normalizeMessageList,
   normalizeCapabilities,
   normalizeFileList,
@@ -44,6 +45,38 @@ test('normalizes current Hermes list envelopes without breaking legacy responses
   assert.deepEqual(normalizeSessionList({ sessions }).sessions, sessions);
   assert.deepEqual(normalizeMessageList({ data: messages }).messages, messages);
   assert.deepEqual(normalizeMessageList({ messages }).messages, messages);
+});
+
+test('keeps automation sessions out of chat history even when Hermes ignores source filters', async () => {
+  const originalFetch = globalThis.fetch;
+  let requestURL = '';
+  globalThis.fetch = async (input) => {
+    requestURL = String(input);
+    return new Response(JSON.stringify({
+      data: [
+        { id: 'chat-1', source: 'brio', started_at: 1, message_count: 2 },
+        { id: 'cron-1', source: 'cron', started_at: 2, message_count: 2 },
+        { id: 'heartbeat-1', source: 'heartbeat', started_at: 3, message_count: 2 },
+      ],
+    }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+  };
+  try {
+    const result = await listSessions({
+      id: 'direct-1',
+      name: 'Hermes',
+      mode: 'self_hosted',
+      transport: 'direct',
+      status: 'online',
+      capabilities: {},
+      url: 'http://127.0.0.1:8787',
+      token: 'secret',
+    }, 100, 'coder', { excludeSources: ['cron', 'heartbeat'], order: 'recent' });
+    assert.deepEqual(result.sessions.map((session) => session.id), ['chat-1']);
+    assert.match(requestURL, /exclude_sources=cron%2Cheartbeat/);
+    assert.match(requestURL, /order=recent/);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
 });
 
 test('creates a persisted Hermes session before a REST-backed new thread starts', async () => {

@@ -139,6 +139,7 @@ export default function RootLayout() {
                 />
                 <Stack.Screen name="thread/[id]" options={{ title: 'Hermes' }} />
                 <Stack.Screen name="files" options={{ title: 'Files' }} />
+                <Stack.Screen name="automation" options={{ title: 'Automation' }} />
                 <Stack.Screen name="command-center" options={{ title: 'Command Center' }} />
                 <Stack.Screen name="profiles" options={{ title: 'Hermes Profiles' }} />
                 <Stack.Screen

@@ -295,7 +295,20 @@ export type HermesJob = Record<string, unknown> & {
   prompt?: string;
   enabled?: boolean;
   paused?: boolean;
-  schedule?: string;
+  state?: string | null;
+  schedule?: string | { kind?: string; expr?: string; run_at?: string; display?: string };
+  schedule_display?: string | null;
+  last_run_at?: string | null;
+  next_run_at?: string | null;
+  last_status?: string | null;
+  last_error?: string | null;
+};
+
+export type SessionListOptions = {
+  source?: string;
+  sources?: string[];
+  excludeSources?: string[];
+  order?: 'created' | 'recent';
 };
 
 export type HermesControlSession = {
@@ -328,6 +341,7 @@ export type HermesHeartbeatStatus = {
   fireCount: number;
   detail: string;
   lastError?: string;
+  outputSessionId?: string;
 };
 
 export type HermesSubagent = Record<string, unknown> & {
@@ -692,12 +706,36 @@ export function interruptComposerSession(connection: AgentConnection, sessionId:
   });
 }
 
-export async function listSessions(connection: AgentConnection, limit = 100, profile?: string) {
+export async function listSessions(
+  connection: AgentConnection,
+  limit = 100,
+  profile?: string,
+  options: SessionListOptions = {},
+) {
+  const query = new URLSearchParams({ limit: String(limit) });
+  if (options.source) query.set('source', options.source);
+  if (options.sources?.length) query.set('sources', options.sources.join(','));
+  if (options.excludeSources?.length) query.set('exclude_sources', options.excludeSources.join(','));
+  if (options.order) query.set('order', options.order);
   const response = await brioFetch<HermesSessionListEnvelope>(
     connection,
-    `${scopedPath('/api/sessions', profile)}?limit=${limit}`,
+    `${scopedPath('/api/sessions', profile)}?${query.toString()}`,
   );
-  return normalizeSessionList(response);
+  const normalized = normalizeSessionList(response);
+  // Older Hermes builds ignore source query parameters. Keep Brio's split
+  // correct locally while retaining wire compatibility with those builds.
+  const included = options.source
+    ? new Set([options.source])
+    : options.sources?.length
+      ? new Set(options.sources)
+      : null;
+  const excluded = new Set(options.excludeSources ?? []);
+  return {
+    ...normalized,
+    sessions: normalized.sessions.filter((session) =>
+      (!included || included.has(session.source)) && !excluded.has(session.source),
+    ),
+  };
 }
 
 export function createSession(
@@ -1025,26 +1063,34 @@ export function getLogs(
   );
 }
 
-export function listJobs(connection: AgentConnection) {
-  return brioFetch<HermesJob[] | { jobs: HermesJob[] }>(connection, '/jobs/');
+export function listJobs(connection: AgentConnection, profile?: string) {
+  return brioFetch<HermesJob[] | { jobs: HermesJob[] }>(connection, scopedPath('/jobs/', profile));
+}
+
+export function listJobRuns(connection: AgentConnection, jobId: string, limit = 20, profile?: string) {
+  return brioFetch<{ runs: HermesSession[]; limit?: number }>(
+    connection,
+    `${scopedPath(`/jobs/${encodeURIComponent(jobId)}/runs`, profile)}?limit=${Math.max(1, Math.min(limit, 100))}`,
+  );
 }
 
 export function runJobAction(
   connection: AgentConnection,
   jobId: string,
   action: 'pause' | 'resume' | 'trigger',
+  profile?: string,
 ) {
   return brioFetch<Record<string, unknown>>(
     connection,
-    `/jobs/${encodeURIComponent(jobId)}/${action}`,
+    scopedPath(`/jobs/${encodeURIComponent(jobId)}/${action}`, profile),
     { method: 'POST', body: '{}' },
   );
 }
 
-export function deleteJob(connection: AgentConnection, jobId: string) {
+export function deleteJob(connection: AgentConnection, jobId: string, profile?: string) {
   return brioFetch<Record<string, unknown>>(
     connection,
-    `/jobs/${encodeURIComponent(jobId)}`,
+    scopedPath(`/jobs/${encodeURIComponent(jobId)}`, profile),
     { method: 'DELETE' },
   );
 }

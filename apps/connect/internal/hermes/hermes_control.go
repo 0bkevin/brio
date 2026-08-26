@@ -121,6 +121,8 @@ type controlHeartbeatState struct {
 	Detail           string  `json:"detail"`
 	LastError        string  `json:"lastError,omitempty"`
 	RuntimeSessionID string  `json:"-"`
+	OutputSessionID  string  `json:"outputSessionId,omitempty"`
+	OutputRuntimeID  string  `json:"-"`
 	NextAt           float64 `json:"-"`
 	InFlight         bool    `json:"-"`
 }
@@ -443,6 +445,13 @@ func (c *controlClient) SyncHeartbeat(storedSessionID string, runtimeSessionID s
 	}
 	existing, existed := c.heartbeats[storedSessionID]
 	state.RuntimeSessionID = runtimeSessionID
+	if existed {
+		// Heartbeat responses live in one automation-only conversation. Keep
+		// that destination when the schedule is refreshed or replaced so a
+		// recurring heartbeat never creates one visible thread per firing.
+		state.OutputSessionID = existing.OutputSessionID
+		state.OutputRuntimeID = existing.OutputRuntimeID
+	}
 	if existed && !isHeartbeatReplacementCommand(command) && existing.Prompt == state.Prompt && existing.Interval == state.Interval {
 		if existing.FireCount > state.FireCount {
 			state.FireCount = existing.FireCount
@@ -610,8 +619,20 @@ func (c *controlClient) fireHeartbeat(storedSessionID string) {
 		state.Interval,
 		state.Prompt,
 	)
+	outputRuntimeID, outputSessionID, err := c.ensureHeartbeatOutputSession(ctx, state)
+	if err != nil {
+		c.finishHeartbeatAttempt(storedSessionID, err, 30*time.Second)
+		return
+	}
+	c.heartbeatMu.Lock()
+	if current, exists := c.heartbeats[storedSessionID]; exists {
+		current.OutputRuntimeID = outputRuntimeID
+		current.OutputSessionID = outputSessionID
+		c.heartbeats[storedSessionID] = current
+	}
+	c.heartbeatMu.Unlock()
 	if _, err = c.Call(ctx, "prompt.submit", map[string]any{
-		"session_id": runtimeSessionID,
+		"session_id": outputRuntimeID,
 		"text":       prompt,
 		"queued":     true,
 	}); err != nil {
@@ -648,6 +669,56 @@ func (c *controlClient) fireHeartbeat(storedSessionID string) {
 		c.heartbeats[storedSessionID] = current
 	}
 	c.heartbeatMu.Unlock()
+}
+
+func (c *controlClient) ensureHeartbeatOutputSession(ctx context.Context, state controlHeartbeatState) (string, string, error) {
+	if storedSessionID := strings.TrimSpace(state.OutputSessionID); storedSessionID != "" {
+		resumed, err := c.Call(ctx, "session.resume", map[string]any{
+			"session_id": storedSessionID, "omit_messages": true,
+		})
+		if err == nil {
+			var session struct {
+				SessionID       string `json:"session_id"`
+				StoredSessionID string `json:"stored_session_id"`
+				SessionKey      string `json:"session_key"`
+			}
+			if json.Unmarshal(resumed, &session) == nil && strings.TrimSpace(session.SessionID) != "" {
+				stored := strings.TrimSpace(session.StoredSessionID)
+				if stored == "" {
+					stored = strings.TrimSpace(session.SessionKey)
+				}
+				if stored == "" {
+					stored = storedSessionID
+				}
+				return strings.TrimSpace(session.SessionID), stored, nil
+			}
+		}
+	}
+
+	created, err := c.Call(ctx, "session.create", map[string]any{
+		"cols":   100,
+		"source": "heartbeat",
+		"title":  "Heartbeat responses",
+	})
+	if err != nil {
+		return "", "", fmt.Errorf("could not create the heartbeat response session: %w", err)
+	}
+	var session struct {
+		SessionID       string `json:"session_id"`
+		StoredSessionID string `json:"stored_session_id"`
+		SessionKey      string `json:"session_key"`
+	}
+	if json.Unmarshal(created, &session) != nil || strings.TrimSpace(session.SessionID) == "" {
+		return "", "", errors.New("Hermes returned an invalid session.create result for heartbeat responses")
+	}
+	stored := strings.TrimSpace(session.StoredSessionID)
+	if stored == "" {
+		stored = strings.TrimSpace(session.SessionKey)
+	}
+	if stored == "" {
+		return "", "", errors.New("Hermes did not return a persisted session id for heartbeat responses")
+	}
+	return strings.TrimSpace(session.SessionID), stored, nil
 }
 
 func (c *controlClient) finishHeartbeatAttempt(storedSessionID string, err error, retryAfter time.Duration) {

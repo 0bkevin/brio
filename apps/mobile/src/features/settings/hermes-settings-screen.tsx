@@ -106,6 +106,8 @@ export function HermesSettingsScreen({ connection }: { connection: AgentConnecti
         </Section>
 
         <Section title="Automation">
+          <Row label="Automation responses" onPress={() => router.push('/automation')} />
+          <Divider />
           <Row label="Scheduled jobs" onPress={() => setPanel('jobs')} />
           <Divider />
           <Row label="Logs" onPress={() => setPanel('logs')} />

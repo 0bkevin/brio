@@ -407,6 +407,11 @@ func TestHeartbeatRunnerQueuesDuePromptAndReanchorsHermes(t *testing.T) {
 			switch request.Method {
 			case "session.resume":
 				result = map[string]any{"session_id": "runtime-session"}
+			case "session.create":
+				if request.Params["source"] != "heartbeat" || request.Params["title"] != "Heartbeat responses" {
+					t.Fatalf("heartbeat session params = %+v", request.Params)
+				}
+				result = map[string]any{"session_id": "heartbeat-runtime", "stored_session_id": "heartbeat-stored"}
 			case "session.status":
 				result = map[string]any{"output": "Agent Running: No"}
 			case "prompt.submit":
@@ -447,7 +452,7 @@ func TestHeartbeatRunnerQueuesDuePromptAndReanchorsHermes(t *testing.T) {
 	)
 	select {
 	case params := <-promptSubmitted:
-		if params["queued"] != true || !strings.Contains(params["text"].(string), "[Heartbeat — recurring instruction, fires every 10m]") {
+		if params["session_id"] != "heartbeat-runtime" || params["queued"] != true || !strings.Contains(params["text"].(string), "[Heartbeat — recurring instruction, fires every 10m]") {
 			t.Fatalf("prompt params = %+v", params)
 		}
 	case <-time.After(3 * time.Second):
@@ -456,7 +461,7 @@ func TestHeartbeatRunnerQueuesDuePromptAndReanchorsHermes(t *testing.T) {
 	deadline := time.Now().Add(time.Second)
 	for {
 		state := client.Heartbeat("stored-session")
-		if state != nil && state.FireCount == 1 && state.NextInSeconds > 500 {
+		if state != nil && state.FireCount == 1 && state.NextInSeconds > 500 && state.OutputSessionID == "heartbeat-stored" {
 			break
 		}
 		if time.Now().After(deadline) {
