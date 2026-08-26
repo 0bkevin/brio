@@ -43,7 +43,7 @@ func installService(exe string, startNow bool) error {
 	return runCommand("systemctl", "--user", "enable", serviceName+".service")
 }
 
-func renderSystemdUserService(exe string, home string) string {
+func renderSystemdUserService(exe string, _ string) string {
 	return fmt.Sprintf(`[Unit]
 Description=Brio Connector
 After=network-online.target
@@ -53,7 +53,7 @@ StartLimitBurst=5
 [Service]
 Type=simple
 ExecStart=%s connect
-WorkingDirectory=%s
+WorkingDirectory=%%h
 # Hermes CLI subprocesses share this cgroup. If the kernel kills one greedy
 # child, keep the connector alive and let that request fail in isolation.
 OOMPolicy=continue
@@ -62,7 +62,7 @@ RestartSec=5
 
 [Install]
 WantedBy=default.target
-`, systemdQuote(exe), systemdQuote(home))
+`, systemdQuote(exe))
 }
 
 func stopService() error {

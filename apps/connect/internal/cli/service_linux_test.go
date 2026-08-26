@@ -16,7 +16,7 @@ func TestRenderSystemdUserServiceBoundsCrashLoopsAndChildOOMs(t *testing.T) {
 		"Restart=always",
 		"RestartSec=5",
 		`ExecStart="/opt/Brio Connector/brio" connect`,
-		`WorkingDirectory="/home/brio user"`,
+		`WorkingDirectory=%h`,
 	} {
 		if !strings.Contains(unit, expected) {
 			t.Fatalf("systemd unit omitted %q:\n%s", expected, unit)

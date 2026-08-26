@@ -123,8 +123,10 @@ export function HermesHomeScreen({ connection }: { connection: AgentConnection }
       isNamedProfile(activeProfile) ? `?profile=${encodeURIComponent(activeProfile)}` : ''
     }` as const;
   const startNewTask = () => {
-    const sessionId = `brio_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
-    router.push(threadPath(sessionId));
+    // `new` tells the thread screen to create a Hermes gateway session on the
+    // first prompt. A made-up stored session id is treated as a resume request
+    // by Hermes and leaves a fresh conversation in an error state.
+    router.push(threadPath('new'));
   };
 
   return (

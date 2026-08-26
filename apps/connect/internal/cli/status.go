@@ -36,9 +36,11 @@ func runStatus(ctx context.Context, opts runOptions) error {
 		fmt.Printf("Relay URL: %s\n", opts.relayURL)
 	}
 
+	serviceState := ""
 	if status, err := serviceStatus(); err != nil {
 		fmt.Printf("Service: unknown (%v)\n", err)
 	} else {
+		serviceState = status
 		fmt.Printf("Service: %s\n", status)
 	}
 
@@ -58,6 +60,13 @@ func runStatus(ctx context.Context, opts runOptions) error {
 		fmt.Println("Tunnel: no stored credentials (run `brio setup` or `brio recover`)")
 		return nil
 	}
+	// A companion probe authenticates by opening a real tunnel. The relay permits
+	// one companion per agent, so probing while the service is active would
+	// replace the production tunnel and cause a visible reconnect in Mobile.
+	if !shouldProbeTunnel(serviceState) {
+		fmt.Println("Tunnel: service active (credential probe skipped)")
+		return nil
+	}
 	if err := tunnel.Probe(statusCtx, tunnel.Config{
 		AgentID:    opts.agentID,
 		RelayURL:   opts.relayURL,
@@ -68,6 +77,10 @@ func runStatus(ctx context.Context, opts runOptions) error {
 	}
 	fmt.Println("Tunnel: credentials accepted")
 	return nil
+}
+
+func shouldProbeTunnel(serviceState string) bool {
+	return serviceState != "active"
 }
 
 func checkRelayHealth(ctx context.Context, relayURL string) error {

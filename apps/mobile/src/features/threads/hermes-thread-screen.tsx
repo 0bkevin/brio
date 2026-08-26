@@ -47,7 +47,12 @@ import { isNamedProfile } from '@/lib/profiles';
 import { buildRuntimeModelOptions, normalizeLiveUsage } from '@/lib/session-runtime';
 import { useRunStore } from '@/state/run-store';
 import { useComposerStore } from '@/state/composer-store';
-import { EMPTY_PROMPT_QUEUE, type QueuedPrompt } from '@/state/composer-store-model';
+import {
+  EMPTY_COMPOSER_ATTACHMENTS,
+  EMPTY_PROMPT_HISTORY,
+  EMPTY_PROMPT_QUEUE,
+  type QueuedPrompt,
+} from '@/state/composer-store-model';
 import type { ChatModelOverride, ChatThread } from '@/state/chat-thread-model';
 
 type FeedItem = HermesMessage & { id: string };
@@ -120,10 +125,14 @@ export function HermesThreadScreen({
   const clearActiveRun = useRunStore((state) => state.clearActiveRun);
   const composerHydrated = useComposerStore((state) => state.hydrated);
   const draft = useComposerStore((state) => state.drafts[composerKey] ?? '');
-  const attachments = useComposerStore((state) => state.attachments[composerKey] ?? []);
+  const attachments = useComposerStore(
+    (state) => state.attachments[composerKey] ?? EMPTY_COMPOSER_ATTACHMENTS,
+  );
   const queue = useComposerStore((state) => state.queues[composerKey] ?? EMPTY_PROMPT_QUEUE);
   const queuePaused = useComposerStore((state) => Boolean(state.paused[composerKey]));
-  const history = useComposerStore((state) => state.promptHistory[composerKey] ?? []);
+  const history = useComposerStore(
+    (state) => state.promptHistory[composerKey] ?? EMPTY_PROMPT_HISTORY,
+  );
   const revisions = useComposerStore((state) => state.draftRevisions[composerKey]);
   const composerStorageError = useComposerStore((state) => state.storageError);
   const setDraft = useComposerStore((state) => state.setDraft);

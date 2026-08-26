@@ -1,0 +1,57 @@
+services:
+  postgres:
+    image: postgres:17-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: brio
+      POSTGRES_USER: brio
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U brio -d brio"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  relay:
+    build:
+      context: ../../apps/relay
+    restart: unless-stopped
+    environment:
+      BRIO_RELAY_ADDR: :8080
+      BRIO_DATABASE_URL: postgres://brio:${POSTGRES_PASSWORD}@postgres:5432/brio?sslmode=disable
+      BRIO_RELAY_ALLOWED_ORIGINS: ${BRIO_RELAY_ALLOWED_ORIGINS:-}
+      BRIO_RELAY_TRUSTED_PROXY_CIDRS: ${BRIO_RELAY_TRUSTED_PROXY_CIDRS:-172.16.0.0/12}
+      BRIO_ALLOW_LEGACY_QUERY_TOKENS: ${BRIO_ALLOW_LEGACY_QUERY_TOKENS:-false}
+      BRIO_INSECURE_DEV_MODE: ${BRIO_INSECURE_DEV_MODE:-false}
+      BRIO_DEVICE_REGISTRATION_KEY: ${BRIO_DEVICE_REGISTRATION_KEY:-}
+      BRIO_CLERK_SECRET_KEY: ${BRIO_CLERK_SECRET_KEY:-}
+      BRIO_CLERK_JWT_KEY: ${BRIO_CLERK_JWT_KEY:-}
+      BRIO_CLERK_ISSUER: ${BRIO_CLERK_ISSUER:-}
+      BRIO_CLERK_JWT_AUDIENCE: ${BRIO_CLERK_JWT_AUDIENCE:-brio-relay}
+      BRIO_CLERK_AUTHORIZED_PARTIES: ${BRIO_CLERK_AUTHORIZED_PARTIES:-}
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    environment:
+      BRIO_DOMAIN: ${BRIO_DOMAIN:?set BRIO_DOMAIN in .env}
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+    depends_on:
+      - relay
+
+volumes:
+  postgres-data:
+  caddy-data:
+  caddy-config:

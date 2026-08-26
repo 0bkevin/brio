@@ -11,6 +11,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -78,6 +79,9 @@ const (
 	RouteUnknown RouteKind = iota
 	// RouteForward means the path is proxied to the Hermes API server.
 	RouteForward
+	// RouteControlForward means the path is proxied to the authenticated
+	// Hermes dashboard/control HTTP server.
+	RouteControlForward
 	// RouteLocal means the path is served from the Hermes home directory.
 	RouteLocal
 )
@@ -141,8 +145,30 @@ func RoutePath(path string) Route {
 		return Route{Kind: RouteLocal, Path: path, Name: "composer-attachments"}
 	case "/api/sessions":
 		return Route{Kind: RouteForward, Path: path}
+	case "/api/sessions/search":
+		return Route{Kind: RouteControlForward, Path: path}
 	case "/api/model/options":
 		return Route{Kind: RouteForward, Path: path}
+	case "/files":
+		return Route{Kind: RouteControlForward, Path: "/api/files"}
+	case "/files/read":
+		return Route{Kind: RouteControlForward, Path: "/api/files/read"}
+	case "/files/write":
+		return Route{Kind: RouteControlForward, Path: "/api/files/upload"}
+	case "/config/raw":
+		return Route{Kind: RouteControlForward, Path: "/api/config/raw"}
+	case "/skills":
+		return Route{Kind: RouteControlForward, Path: "/api/skills"}
+	case "/tools/toolsets":
+		return Route{Kind: RouteControlForward, Path: "/api/tools/toolsets"}
+	case "/gateway/status":
+		return Route{Kind: RouteControlForward, Path: "/api/status"}
+	case "/gateway/restart":
+		return Route{Kind: RouteControlForward, Path: "/api/gateway/restart"}
+	case "/logs":
+		return Route{Kind: RouteControlForward, Path: "/api/logs"}
+	case "/jobs", "/jobs/":
+		return Route{Kind: RouteControlForward, Path: "/api/cron/jobs"}
 	}
 	switch {
 	case strings.HasPrefix(path, "/api/profiles/"):
@@ -151,11 +177,37 @@ func RoutePath(path string) Route {
 		return Route{Kind: RouteLocal, Path: path, Name: "composer-attachment"}
 	case strings.HasPrefix(path, "/v1/runs"), strings.HasPrefix(path, "/api/jobs"):
 		return Route{Kind: RouteForward, Path: path}
+	case strings.HasPrefix(path, "/tools/toolsets/"):
+		name := strings.TrimPrefix(path, "/tools/toolsets/")
+		if name != "" && !strings.Contains(name, "/") {
+			return Route{Kind: RouteControlForward, Path: "/api/tools/toolsets/" + name}
+		}
+	case strings.HasPrefix(path, "/jobs/"):
+		if mapped, ok := legacyCronJobPath(path); ok {
+			return Route{Kind: RouteControlForward, Path: mapped}
+		}
 	}
 	if isSessionMessagesPath(path) || isSessionDetailPath(path) || isSessionModelPath(path) {
 		return Route{Kind: RouteForward, Path: path}
 	}
 	return Route{Kind: RouteUnknown}
+}
+
+func legacyCronJobPath(path string) (string, bool) {
+	rest := strings.TrimPrefix(path, "/jobs/")
+	id, action, hasAction := strings.Cut(rest, "/")
+	if id == "" || strings.Contains(action, "/") {
+		return "", false
+	}
+	if !hasAction {
+		return "/api/cron/jobs/" + id, true
+	}
+	switch action {
+	case "pause", "resume", "trigger":
+		return "/api/cron/jobs/" + id + "/" + action, true
+	default:
+		return "", false
+	}
 }
 
 // splitProfilePrefix recognizes `/p/<name>` and `/p/<name>/...` prefixes for
@@ -316,11 +368,96 @@ func (c *Client) Serve(ctx context.Context, frame tunnel.Frame, emit func(tunnel
 	switch route.Kind {
 	case RouteForward:
 		return c.forward(ctx, frame, method, route, query, emit)
+	case RouteControlForward:
+		return c.forwardControlHTTP(ctx, frame, method, route, query, emit)
 	case RouteLocal:
 		return c.serveLocal(ctx, frame, method, route, query, emit)
 	default:
 		return emit(errorFrame(frame.ID, "NOT_FOUND", "no route for "+method+" "+frame.Path))
 	}
+}
+
+// forwardControlHTTP serves dashboard-only JSON endpoints that the Hermes
+// gateway API does not expose. The control token is always injected locally;
+// credentials supplied by Mobile are never forwarded.
+func (c *Client) forwardControlHTTP(ctx context.Context, frame tunnel.Frame, method string, route Route, query string, emit func(tunnel.Frame) error) error {
+	requestMethod := method
+	requestBody := frame.Body
+	if route.Path == "/api/files/upload" && method == http.MethodPut {
+		body, ok := frame.Body.(map[string]any)
+		if !ok {
+			return emit(errorFrame(frame.ID, "BAD_REQUEST", "file write body must be an object"))
+		}
+		path, pathOK := body["path"].(string)
+		content, contentOK := body["content"].(string)
+		if !pathOK || strings.TrimSpace(path) == "" || !contentOK {
+			return emit(errorFrame(frame.ID, "BAD_REQUEST", "file write requires path and content"))
+		}
+		if len(content) > 1024*1024 {
+			return emit(errorFrame(frame.ID, "BAD_REQUEST", "file content exceeds 1 MiB"))
+		}
+		requestMethod = http.MethodPost
+		requestBody = map[string]any{
+			"path":      path,
+			"data_url":  "data:text/plain;base64," + base64.StdEncoding.EncodeToString([]byte(content)),
+			"overwrite": true,
+		}
+	}
+	if strings.HasPrefix(route.Path, "/api/tools/toolsets/") && method == http.MethodPatch {
+		requestMethod = http.MethodPut
+	}
+	endpoint, err := c.gatewayEndpoint(route.Profile)
+	if err != nil {
+		return emit(errorFrame(frame.ID, "CONTROL_UNAVAILABLE", err.Error()))
+	}
+	target := strings.TrimRight(endpoint.BaseURL, "/") + route.Path
+	if query != "" {
+		target += "?" + query
+	}
+	var bodyReader io.Reader = http.NoBody
+	if requestBody != nil {
+		payload, marshalErr := json.Marshal(requestBody)
+		if marshalErr != nil {
+			return emit(errorFrame(frame.ID, "BAD_REQUEST", marshalErr.Error()))
+		}
+		bodyReader = bytes.NewReader(payload)
+	}
+	req, err := http.NewRequestWithContext(ctx, requestMethod, target, bodyReader)
+	if err != nil {
+		return emit(errorFrame(frame.ID, "BAD_REQUEST", err.Error()))
+	}
+	req.Header.Set("Accept", "application/json")
+	if requestBody != nil {
+		req.Header.Set("Content-Type", "application/json")
+	}
+	req.Header.Set("Authorization", "Bearer "+endpoint.Token)
+	resp, err := c.httpClient().Do(req)
+	if err != nil {
+		return emit(errorFrame(frame.ID, "LOCAL_UNREACHABLE", err.Error()))
+	}
+	defer resp.Body.Close()
+	data, err := io.ReadAll(io.LimitReader(resp.Body, maxResponseBytes+1))
+	if err != nil {
+		return emit(errorFrame(frame.ID, "LOCAL_READ_FAILED", err.Error()))
+	}
+	if len(data) > maxResponseBytes {
+		return emit(errorFrame(frame.ID, "RESPONSE_TOO_LARGE", "local response is larger than 10 MiB"))
+	}
+	contentType := resp.Header.Get("Content-Type")
+	var body any
+	if len(data) > 0 && strings.Contains(strings.ToLower(contentType), "json") {
+		_ = json.Unmarshal(data, &body)
+	}
+	if body == nil {
+		body = string(data)
+	}
+	return emit(tunnel.Frame{
+		Type:    "response",
+		ID:      frame.ID,
+		Status:  resp.StatusCode,
+		Headers: map[string]string{"Content-Type": contentType},
+		Body:    body,
+	})
 }
 
 func (c *Client) forward(ctx context.Context, frame tunnel.Frame, method string, route Route, query string, emit func(tunnel.Frame) error) error {

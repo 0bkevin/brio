@@ -56,10 +56,23 @@ func TestRoutePath(t *testing.T) {
 		{path: "/api/jobs/job_1/pause", kind: RouteForward, forwardTo: "/api/jobs/job_1/pause"},
 		{path: "/api/sessions", kind: RouteForward, forwardTo: "/api/sessions"},
 		{path: "/api/sessions/sess_1", kind: RouteForward, forwardTo: "/api/sessions/sess_1"},
-		{path: "/api/sessions/search", kind: RouteForward, forwardTo: "/api/sessions/search"},
+		{path: "/api/sessions/search", kind: RouteControlForward, forwardTo: "/api/sessions/search"},
 		{path: "/api/sessions/sess_1/messages", kind: RouteForward, forwardTo: "/api/sessions/sess_1/messages"},
 		{path: "/api/sessions/sess_1/model", kind: RouteForward, forwardTo: "/api/sessions/sess_1/model"},
 		{path: "/api/model/options", kind: RouteForward, forwardTo: "/api/model/options"},
+		{path: "/files", kind: RouteControlForward, forwardTo: "/api/files"},
+		{path: "/files/read", kind: RouteControlForward, forwardTo: "/api/files/read"},
+		{path: "/files/write", kind: RouteControlForward, forwardTo: "/api/files/upload"},
+		{path: "/config/raw", kind: RouteControlForward, forwardTo: "/api/config/raw"},
+		{path: "/skills", kind: RouteControlForward, forwardTo: "/api/skills"},
+		{path: "/tools/toolsets", kind: RouteControlForward, forwardTo: "/api/tools/toolsets"},
+		{path: "/tools/toolsets/browser", kind: RouteControlForward, forwardTo: "/api/tools/toolsets/browser"},
+		{path: "/gateway/status", kind: RouteControlForward, forwardTo: "/api/status"},
+		{path: "/gateway/restart", kind: RouteControlForward, forwardTo: "/api/gateway/restart"},
+		{path: "/logs", kind: RouteControlForward, forwardTo: "/api/logs"},
+		{path: "/jobs/", kind: RouteControlForward, forwardTo: "/api/cron/jobs"},
+		{path: "/jobs/job_1/pause", kind: RouteControlForward, forwardTo: "/api/cron/jobs/job_1/pause"},
+		{path: "/jobs/job_1", kind: RouteControlForward, forwardTo: "/api/cron/jobs/job_1"},
 		{path: "/v1/memory", kind: RouteLocal, localName: "memory"},
 		{path: "/memory", kind: RouteLocal, localName: "memory"},
 		{path: "/composer/capabilities", kind: RouteLocal, localName: "composer-capabilities"},
@@ -69,14 +82,6 @@ func TestRoutePath(t *testing.T) {
 		{path: "/attachments", kind: RouteLocal, forwardTo: "/attachments", localName: "composer-attachments"},
 		{path: "/attachments/0123456789abcdef0123456789abcdef/chunks/0", kind: RouteLocal, forwardTo: "/attachments/0123456789abcdef0123456789abcdef/chunks/0", localName: "composer-attachment"},
 
-		{path: "/files/write", kind: RouteUnknown},
-		{path: "/files/read", kind: RouteUnknown},
-		{path: "/config/raw", kind: RouteUnknown},
-		{path: "/gateway/restart", kind: RouteUnknown},
-		{path: "/gateway/status", kind: RouteUnknown},
-		{path: "/skills", kind: RouteUnknown},
-		{path: "/tools/toolsets", kind: RouteUnknown},
-		{path: "/logs", kind: RouteUnknown},
 		{path: "/sessions/search", kind: RouteUnknown},
 		{path: "/v1/sessions/search", kind: RouteUnknown},
 		{path: "/v1/sessions/sess_1", kind: RouteUnknown},
@@ -101,6 +106,81 @@ func TestRoutePath(t *testing.T) {
 		if tt.kind == RouteLocal && got.Name != tt.localName {
 			t.Fatalf("RoutePath(%q) local name = %q, want %q", tt.path, got.Name, tt.localName)
 		}
+	}
+}
+
+func TestSessionSearchUsesControlServerCredentials(t *testing.T) {
+	var gotAuth, gotPath, gotQuery string
+	control := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotAuth = r.Header.Get("Authorization")
+		gotPath = r.URL.Path
+		gotQuery = r.URL.RawQuery
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{"results": []any{}})
+	}))
+	defer control.Close()
+
+	client := &Client{
+		BaseURL:        "http://127.0.0.1:1",
+		APIKey:         "gateway-key",
+		ControlBaseURL: control.URL,
+		ControlToken:   "control-key",
+		Home:           t.TempDir(),
+	}
+	frames := collectFrames(context.Background(), t, client, tunnel.Frame{
+		Type: "request", ID: "search-1", Method: http.MethodGet,
+		Path:    "/api/sessions/search?q=needle&limit=10",
+		Headers: map[string]string{"Authorization": "Bearer mobile-token"},
+	})
+	if gotAuth != "Bearer control-key" {
+		t.Fatalf("Authorization = %q, want control credential", gotAuth)
+	}
+	if gotPath != "/api/sessions/search" || gotQuery != "q=needle&limit=10" {
+		t.Fatalf("request = %s?%s", gotPath, gotQuery)
+	}
+	if len(frames) != 1 || frames[0].Status != http.StatusOK {
+		t.Fatalf("frames = %+v, want one 200 response", frames)
+	}
+}
+
+func TestControlCompatibilityRoutesTranslateLegacyWrites(t *testing.T) {
+	type seenRequest struct {
+		method string
+		path   string
+		body   map[string]any
+	}
+	seen := []seenRequest{}
+	control := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body map[string]any
+		if r.Body != nil {
+			_ = json.NewDecoder(r.Body).Decode(&body)
+		}
+		seen = append(seen, seenRequest{method: r.Method, path: r.URL.Path, body: body})
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]bool{"ok": true})
+	}))
+	defer control.Close()
+	client := &Client{ControlBaseURL: control.URL, ControlToken: "control-key", Home: t.TempDir()}
+
+	collectFrames(context.Background(), t, client, tunnel.Frame{
+		Type: "request", ID: "write", Method: http.MethodPut, Path: "/files/write",
+		Body: map[string]any{"path": "/workspace/note.txt", "content": "hello"},
+	})
+	collectFrames(context.Background(), t, client, tunnel.Frame{
+		Type: "request", ID: "toolset", Method: http.MethodPatch, Path: "/tools/toolsets/browser",
+		Body: map[string]any{"enabled": true, "platform": "cli"},
+	})
+
+	if len(seen) != 2 {
+		t.Fatalf("seen = %+v", seen)
+	}
+	if seen[0].method != http.MethodPost || seen[0].path != "/api/files/upload" ||
+		seen[0].body["path"] != "/workspace/note.txt" ||
+		seen[0].body["data_url"] != "data:text/plain;base64,aGVsbG8=" {
+		t.Fatalf("file write translation = %+v", seen[0])
+	}
+	if seen[1].method != http.MethodPut || seen[1].path != "/api/tools/toolsets/browser" || seen[1].body["enabled"] != true {
+		t.Fatalf("toolset translation = %+v", seen[1])
 	}
 }
 
@@ -192,7 +272,7 @@ func TestServeMapsLegacyAliases(t *testing.T) {
 
 func TestServeRejectsUnknownPath(t *testing.T) {
 	client := &Client{BaseURL: "http://127.0.0.1:1", APIKey: "hermes-key", Home: t.TempDir()}
-	for _, path := range []string{"/files/write", "/config/raw", "/gateway/restart", "/skills", "/tools/toolsets", "/logs"} {
+	for _, path := range []string{"/files/delete-all", "/config/secrets", "/gateway/shell", "/skills/install", "/tools/toolsets/a/b", "/logs/delete"} {
 		frames := collectFrames(context.Background(), t, client, tunnel.Frame{
 			Type: "request", ID: "u1", Method: http.MethodGet, Path: path,
 		})

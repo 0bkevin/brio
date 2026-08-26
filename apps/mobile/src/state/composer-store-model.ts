@@ -40,6 +40,8 @@ export const EMPTY_COMPOSER_STATE: StoredComposerState = {
 };
 
 export const EMPTY_PROMPT_QUEUE: QueuedPrompt[] = [];
+export const EMPTY_COMPOSER_ATTACHMENTS: ComposerAttachment[] = [];
+export const EMPTY_PROMPT_HISTORY: string[] = [];
 
 export type EnqueuedComposerDraft = {
   prompt: QueuedPrompt;
