@@ -63,6 +63,8 @@ test('direct Hermes gateway uses /api/ws, dispatches ordered events, and speaks 
     capabilities: {},
     url: 'https://hermes.example/base/',
     token: 'session-secret',
+    gatewayUrl: 'https://hermes.example:9119/base/',
+    gatewayToken: 'dashboard-secret',
   };
   const acquired = acquireHermesGateway(connection, 'coder');
   try {
@@ -70,7 +72,7 @@ test('direct Hermes gateway uses /api/ws, dispatches ordered events, and speaks 
     acquired.client.onEvent((event) => events.push(event));
     await acquired.client.connect();
     const socket = FakeWebSocket.instances[0];
-    assert.equal(socket.url, 'wss://hermes.example/base/p/coder/api/ws?token=session-secret');
+    assert.equal(socket.url, 'wss://hermes.example:9119/base/p/coder/api/ws?token=dashboard-secret');
 
     const created = await acquired.client.request('session.create', { source: 'brio' });
     assert.deepEqual(created, { session_id: 'runtime-1', stored_session_id: 'stored-1' });
@@ -99,6 +101,59 @@ test('direct Hermes gateway uses /api/ws, dispatches ordered events, and speaks 
       /timed out/,
       'a stalled gateway request must reset instead of hanging the conversation',
     );
+  } finally {
+    acquired.release();
+    globalThis.WebSocket = originalWebSocket;
+  }
+});
+
+test('direct mode degrades instead of sending API_SERVER_KEY to hermes serve', async () => {
+  const acquired = acquireHermesGateway({
+    id: 'direct-without-gateway',
+    name: 'Hermes',
+    mode: 'self_hosted',
+    transport: 'direct',
+    status: 'online',
+    capabilities: {},
+    url: 'http://hermes.example:8642',
+    token: 'api-server-key',
+  }, 'default');
+  try {
+    await assert.rejects(acquired.client.connect(), /separate addresses and credentials/);
+    assert.equal(acquired.client.connectionState, 'degraded');
+  } finally {
+    acquired.release();
+  }
+});
+
+test('a late close from an old direct socket cannot close its replacement', async () => {
+  const originalWebSocket = globalThis.WebSocket;
+  globalThis.WebSocket = FakeWebSocket;
+  FakeWebSocket.instances = [];
+  const connection = {
+    id: 'direct-generation-guard',
+    name: 'Hermes',
+    mode: 'self_hosted',
+    transport: 'direct',
+    status: 'online',
+    capabilities: {},
+    url: 'http://hermes.example:8642',
+    token: 'api-server-key',
+    gatewayUrl: 'http://hermes.example:9119',
+    gatewayToken: 'dashboard-token',
+  };
+  const acquired = acquireHermesGateway(connection, 'default');
+  try {
+    await acquired.client.connect();
+    const first = FakeWebSocket.instances[0];
+    first.onclose?.({});
+    await acquired.client.connect();
+    const second = FakeWebSocket.instances[1];
+    first.onclose?.({});
+    assert.equal(acquired.client.connectionState, 'open');
+    const created = await acquired.client.request('session.create', { source: 'brio' });
+    assert.equal(created.session_id, 'runtime-1');
+    assert.ok(second.sent.length > 0);
   } finally {
     acquired.release();
     globalThis.WebSocket = originalWebSocket;

@@ -25,6 +25,8 @@ export type AgentConnection = {
   url: string;
   token: string;
   relayToken?: string;
+  gatewayUrl?: string;
+  gatewayToken?: string;
   agentId?: string;
   pairingCode?: string;
   agentKind?: string;
@@ -142,6 +144,7 @@ export type HermesRunStatus = {
     | 'queued'
     | 'running'
     | 'waiting_for_approval'
+    | 'waiting_for_input'
     | 'stopping'
     | 'completed'
     | 'failed'
@@ -631,41 +634,66 @@ export function subscribeRunEvents(
 ) {
   const controller = new AbortController();
   const path = scopedPath(`/v1/runs/${encodeURIComponent(runId)}/events`, profile);
-  let buffer = '';
-  let dataLines: string[] = [];
-  const consume = (chunk: string) => {
-    buffer += chunk;
-    const lines = buffer.split(/\r?\n/);
-    buffer = lines.pop() ?? '';
-    for (const line of lines) {
-      if (line === '') {
-        if (dataLines.length > 0) onEvent();
-        dataLines = [];
-      } else if (line.startsWith('data:')) {
-        dataLines.push(line.slice(5).trimStart());
-      }
-    }
-  };
-
-  const stream = connection.transport === 'relay'
-    ? relayFetch<null>(
-        connection,
-        path,
-        { method: 'GET', signal: controller.signal },
-        consume,
-      )
-    : streamDirectRunEvents(connection, path, controller.signal, consume);
-  void stream.then(
-    () => {
-      if (!controller.signal.aborted) onEvent();
-    },
-    (reason) => {
-      if (!controller.signal.aborted) {
+  const streamUntilStopped = async () => {
+    let attempt = 0;
+    while (!controller.signal.aborted) {
+      let buffer = '';
+      let dataLines: string[] = [];
+      const consume = (chunk: string) => {
+        buffer += chunk;
+        const lines = buffer.split(/\r?\n/);
+        buffer = lines.pop() ?? '';
+        for (const line of lines) {
+          if (line === '') {
+            if (dataLines.length > 0) {
+              attempt = 0;
+              onEvent();
+            }
+            dataLines = [];
+          } else if (line.startsWith('data:')) {
+            dataLines.push(line.slice(5).trimStart());
+          }
+        }
+      };
+      try {
+        if (connection.transport === 'relay') {
+          await relayFetch<null>(
+            connection,
+            path,
+            { method: 'GET', signal: controller.signal },
+            consume,
+            undefined,
+            30 * 60_000,
+          );
+        } else {
+          await streamDirectRunEvents(connection, path, controller.signal, consume);
+        }
+        if (controller.signal.aborted) break;
+        onEvent();
+      } catch (reason) {
+        if (controller.signal.aborted) break;
         onError?.(reason instanceof Error ? reason : new Error(String(reason)));
       }
-    },
-  );
+      const delay = Math.min(16_000, 500 * 2 ** Math.min(attempt, 5));
+      attempt += 1;
+      await waitForAbort(delay, controller.signal);
+    }
+  };
+  void streamUntilStopped();
   return () => controller.abort();
+}
+
+function waitForAbort(delay: number, signal: AbortSignal) {
+  if (signal.aborted) return Promise.resolve();
+  return new Promise<void>((resolve) => {
+    const timer = setTimeout(finish, delay);
+    function finish() {
+      clearTimeout(timer);
+      signal.removeEventListener('abort', finish);
+      resolve();
+    }
+    signal.addEventListener('abort', finish, { once: true });
+  });
 }
 
 async function streamDirectRunEvents(
@@ -1217,6 +1245,8 @@ export type PairingPayload = {
   transport?: 'direct' | 'relay';
   agent_id?: string;
   code?: string;
+  gateway_url?: string;
+  gateway_token?: string;
 };
 
 function isPairingTransport(value: unknown): value is 'direct' | 'relay' {
@@ -1233,6 +1263,8 @@ function pairingPayloadFromUnknown(value: unknown): PairingPayload {
   const transport = candidate.transport ?? candidate.mode ?? 'direct';
   const code = typeof candidate.code === 'string' ? candidate.code.trim() : undefined;
   const agentId = typeof candidate.agent_id === 'string' ? candidate.agent_id.trim() : undefined;
+  const gatewayURL = typeof candidate.gateway_url === 'string' ? candidate.gateway_url.trim() : '';
+  const gatewayToken = typeof candidate.gateway_token === 'string' ? candidate.gateway_token.trim() : '';
 
   if (
     candidate.transport !== undefined &&
@@ -1264,6 +1296,28 @@ function pairingPayloadFromUnknown(value: unknown): PairingPayload {
   if (transport === 'relay' && !code) {
     throw new Error('Relay pairing details do not include a claim code');
   }
+  if (Boolean(gatewayURL) !== Boolean(gatewayToken)) {
+    throw new Error('Direct gateway details require both an address and a token');
+  }
+  if (transport !== 'direct' && gatewayURL) {
+    throw new Error('Gateway details are only valid for direct connections');
+  }
+  let normalizedGatewayURL: string | undefined;
+  if (gatewayURL) {
+    let parsedGatewayURL: URL;
+    try {
+      parsedGatewayURL = new URL(gatewayURL);
+    } catch {
+      throw new Error('Direct gateway details include an invalid address');
+    }
+    if (!['http:', 'https:', 'ws:', 'wss:'].includes(parsedGatewayURL.protocol) || !parsedGatewayURL.hostname) {
+      throw new Error('Direct gateway details must use an HTTP(S) or WebSocket address');
+    }
+    if (parsedGatewayURL.search || parsedGatewayURL.hash || parsedGatewayURL.username || parsedGatewayURL.password) {
+      throw new Error('Direct gateway details include an invalid server address');
+    }
+    normalizedGatewayURL = parsedGatewayURL.toString().replace(/\/$/, '');
+  }
 
   return {
     url: parsedURL.toString().replace(/\/$/, ''),
@@ -1272,6 +1326,7 @@ function pairingPayloadFromUnknown(value: unknown): PairingPayload {
     transport,
     ...(agentId ? { agent_id: agentId } : {}),
     ...(code ? { code } : {}),
+    ...(normalizedGatewayURL ? { gateway_url: normalizedGatewayURL, gateway_token: gatewayToken } : {}),
   };
 }
 
@@ -1365,6 +1420,8 @@ export function connectionFromPairingPayload(payload: PairingPayload): AgentConn
     token: payload.token,
     agentId: payload.agent_id,
     pairingCode: payload.code,
+    gatewayUrl: payload.gateway_url,
+    gatewayToken: payload.gateway_token,
   };
 }
 
@@ -1660,6 +1717,7 @@ type RelayChannelCallbacks = {
 };
 
 type ActiveRelayChannel = RelayChannelCallbacks & {
+  id: string;
   generation: number;
   path: string;
 };
@@ -1756,28 +1814,38 @@ class RelaySocketClient {
   }
 
   async openChannel(path: string, callbacks: RelayChannelCallbacks): Promise<RelayChannel> {
-    const id = `channel_${Date.now()}_${Math.random().toString(16).slice(2)}`;
-    this.channels.set(id, { ...callbacks, generation: 0, path });
+    const channel: ActiveRelayChannel = {
+      ...callbacks,
+      id: relayChannelID(),
+      generation: 0,
+      path,
+    };
+    this.channels.set(channel.id, channel);
     try {
       await this.connect();
-      this.openChannelForCurrentGeneration(id);
+      this.openChannelForCurrentGeneration(channel);
     } catch (error) {
-      this.channels.delete(id);
+      if (this.channels.get(channel.id) === channel) this.channels.delete(channel.id);
       throw error;
     }
     return {
       send: async (data: string) => {
         await this.connect();
         const socket = this.socket;
-        if (!socket || socket.readyState !== WebSocket.OPEN || !this.channels.has(id)) {
+        if (
+          !socket ||
+          socket.readyState !== WebSocket.OPEN ||
+          this.channels.get(channel.id) !== channel
+        ) {
           throw new Error('Relay gateway channel is not open');
         }
-        socket.send(JSON.stringify({ type: 'channel_data', id, data } satisfies RelayFrame));
+        socket.send(JSON.stringify({ type: 'channel_data', id: channel.id, data } satisfies RelayFrame));
       },
       close: () => {
-        const existed = this.channels.delete(id);
+        const existed = this.channels.get(channel.id) === channel;
+        if (existed) this.channels.delete(channel.id);
         if (existed && this.socket?.readyState === WebSocket.OPEN) {
-          this.socket.send(JSON.stringify({ type: 'channel_close', id } satisfies RelayFrame));
+          this.socket.send(JSON.stringify({ type: 'channel_close', id: channel.id } satisfies RelayFrame));
         }
         if (this.channels.size === 0 && this.pending.size === 0 && this.reconnectTimer) {
           clearTimeout(this.reconnectTimer);
@@ -1817,7 +1885,9 @@ class RelaySocketClient {
         this.opening = null;
         this.generation += 1;
         this.reconnectAttempts = 0;
-        for (const id of this.channels.keys()) this.openChannelForCurrentGeneration(id);
+        for (const channel of [...this.channels.values()]) {
+          this.openChannelForCurrentGeneration(channel);
+        }
         resolve();
       };
 
@@ -1996,14 +2066,23 @@ class RelaySocketClient {
     }
   }
 
-  private openChannelForCurrentGeneration(id: string) {
-    const channel = this.channels.get(id);
+  private openChannelForCurrentGeneration(channel: ActiveRelayChannel) {
     const socket = this.socket;
-    if (!channel || !socket || socket.readyState !== WebSocket.OPEN || channel.generation === this.generation) {
+    if (
+      this.channels.get(channel.id) !== channel ||
+      !socket ||
+      socket.readyState !== WebSocket.OPEN ||
+      channel.generation === this.generation
+    ) {
       return;
     }
+    this.channels.delete(channel.id);
+    channel.id = relayChannelID();
     channel.generation = this.generation;
-    socket.send(JSON.stringify({ type: 'channel_open', id, path: channel.path } satisfies RelayFrame));
+    this.channels.set(channel.id, channel);
+    socket.send(
+      JSON.stringify({ type: 'channel_open', id: channel.id, path: channel.path } satisfies RelayFrame),
+    );
   }
 
   private scheduleReconnect() {
@@ -2017,12 +2096,17 @@ class RelaySocketClient {
   }
 }
 
+function relayChannelID() {
+  return `channel_${Date.now()}_${Math.random().toString(16).slice(2)}`;
+}
+
 function relayFetch<T>(
   connection: Pick<AgentConnection, 'url' | 'token'> & Partial<AgentConnection>,
   path: string,
   init: RequestInit,
   onChunk?: (chunk: string) => void,
   onTerminalHeaders?: (headers: Record<string, string>) => void,
+  timeoutMs = 5 * 60 * 1000,
 ): Promise<T> {
   const agentId = connection.agentId ?? connection.id;
   if (!agentId) {
@@ -2053,7 +2137,7 @@ function relayFetch<T>(
   }
   return client.request<T>(
     requestFrame,
-    5 * 60 * 1000,
+    timeoutMs,
     onChunk,
     onTerminalHeaders,
     init.signal ?? undefined,

@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -315,6 +316,76 @@ func TestConnectRepliesPongToPing(t *testing.T) {
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("timed out waiting for pong")
+	}
+}
+
+func TestConnectReleasesTerminalChannelAndAllowsIDReuse(t *testing.T) {
+	var opens atomic.Int32
+	firstClosed := make(chan struct{})
+	var closeOnce sync.Once
+	handler := func(ctx context.Context, frame Frame, emit func(Frame) error) error {
+		switch frame.Type {
+		case "channel_open":
+			if opens.Add(1) == 1 {
+				return emit(Frame{Type: "channel_error", ID: frame.ID, Code: "UPSTREAM_CLOSED"})
+			}
+			return emit(Frame{Type: "channel_opened", ID: frame.ID, Status: http.StatusSwitchingProtocols})
+		case "channel_close":
+			closeOnce.Do(func() { close(firstClosed) })
+		}
+		return nil
+	}
+
+	openedAgain := make(chan Frame, 1)
+	relay := fakeRelay(t, func(conn *websocket.Conn) {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		_ = writeRelayFrame(ctx, conn, Frame{Type: "channel_open", ID: "reused", Path: "/api/ws"})
+		for {
+			_, data, err := conn.Read(ctx)
+			if err != nil {
+				return
+			}
+			var frame Frame
+			if json.Unmarshal(data, &frame) != nil || frame.ID != "reused" {
+				continue
+			}
+			if frame.Type != "channel_error" || frame.Code != "UPSTREAM_CLOSED" {
+				continue
+			}
+			select {
+			case <-firstClosed:
+			case <-ctx.Done():
+				return
+			}
+			for {
+				_ = writeRelayFrame(ctx, conn, Frame{Type: "channel_open", ID: "reused", Path: "/api/ws"})
+				_, data, err = conn.Read(ctx)
+				if err != nil {
+					return
+				}
+				if json.Unmarshal(data, &frame) == nil && frame.Type == "channel_opened" {
+					openedAgain <- frame
+					return
+				}
+				time.Sleep(time.Millisecond)
+			}
+		}
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() {
+		_ = connect(ctx, Config{RelayURL: relay.URL, AgentID: "agent-1", RelayToken: "token", Handler: handler})
+	}()
+
+	select {
+	case frame := <-openedAgain:
+		if frame.ID != "reused" || opens.Load() != 2 {
+			t.Fatalf("reopened frame = %+v, open calls = %d", frame, opens.Load())
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("terminal channel entry was not released for ID reuse")
 	}
 }
 

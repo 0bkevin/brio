@@ -123,8 +123,11 @@ Conversation traffic uses a persistent `channel_open` / `channel_data` /
 `channel_close` flow on that same authenticated tunnel. The connector opens
 Hermes `/api/ws` locally and injects `HERMES_CONTROL_TOKEN`; gateway JSON-RPC
 payloads remain opaque to Brio and the credential never reaches Mobile or the
-relay. Channels share the tunnel's bounded queues and reconnect automatically;
-Hermes event sequence replay removes duplicates and fills reconnect gaps.
+relay. Channels share the tunnel's bounded queues and reconnect automatically.
+Hermes event sequence replay removes duplicates and fills bounded reconnect
+gaps; after every reconnect Brio also calls `session.resume` with the durable
+session id so Hermes rebinds the live session transport and returns its
+authoritative in-flight state.
 
 - Forwarded to the stock Hermes API server with
   `Authorization: Bearer API_SERVER_KEY` (replacing any frame credentials):
@@ -248,6 +251,14 @@ Plain chat and native session history work in direct mode. Connector-backed
 composer features (attachments, context expansion, dynamic commands, and
 redirect) require the Brio connector. Internet-facing endpoints must terminate
 HTTPS before the API server.
+
+Hermes' API server and `hermes serve` gateway are separate transports (normally
+ports 8642 and 9119) with separate credentials. A direct pairing payload may
+therefore provide `gateway_url` plus `gateway_token` to enable native `/api/ws`;
+both fields are required together. Without them Brio deliberately uses the
+REST/SSE degraded conversation path instead of reusing `API_SERVER_KEY` against
+the wrong service. Static gateway tokens are intended for a loopback/private
+tunnel; current public Hermes gateways use short-lived OAuth WebSocket tickets.
 
 ## Configuration
 

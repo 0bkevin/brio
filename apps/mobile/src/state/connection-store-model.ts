@@ -28,11 +28,17 @@ export function validStoredConnections(value: unknown): StoredConnections | null
 export function isStoredConnection(value: unknown): value is AgentConnection {
   if (!value || typeof value !== 'object') return false;
   const candidate = value as Partial<AgentConnection>;
+  const gatewayFieldsAreValid =
+    (candidate.gatewayUrl === undefined && candidate.gatewayToken === undefined) ||
+    (candidate.transport === 'direct' &&
+      typeof candidate.gatewayUrl === 'string' &&
+      typeof candidate.gatewayToken === 'string');
   return (
     typeof candidate.id === 'string' &&
     typeof candidate.url === 'string' &&
     typeof candidate.token === 'string' &&
-    (candidate.transport === 'direct' || candidate.transport === 'relay')
+    (candidate.transport === 'direct' || candidate.transport === 'relay') &&
+    gatewayFieldsAreValid
   );
 }
 

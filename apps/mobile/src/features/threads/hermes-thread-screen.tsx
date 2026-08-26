@@ -12,7 +12,7 @@ import {
 import { SafeAreaView } from 'react-native-safe-area-context';
 
 import { ComposerControls } from '@/components/composer-controls';
-import { AppText, Button, Card, EmptyState } from '@/components/t3-ui';
+import { AppText, AppTextInput, Button, Card, EmptyState } from '@/components/t3-ui';
 import { SessionModelControls } from '@/components/session-model-controls';
 import { CHAT_CONTENT_MAX_WIDTH, T3Radius, T3Spacing, T3Typography } from '@/constants/t3-theme';
 import { useT3Theme } from '@/hooks/use-t3-theme';
@@ -64,6 +64,28 @@ type GatewaySessionResponse = {
     streaming?: boolean;
   } | null;
   pending_approval?: Record<string, unknown> | null;
+  pending_clarify?: Record<string, unknown> | null;
+};
+
+type GatewayApproval = {
+  requestId: string;
+  choices: ('once' | 'session' | 'always' | 'deny')[];
+  detail?: string;
+};
+
+type GatewayInputQuestion = {
+  id?: string;
+  question: string;
+  choices: string[];
+  multiSelect: boolean;
+};
+
+type GatewayInputRequest = {
+  kind: 'clarify' | 'sudo' | 'secret';
+  requestId: string;
+  prompt: string;
+  questions: GatewayInputQuestion[];
+  questionIndex: number;
 };
 
 export function HermesThreadScreen({
@@ -91,6 +113,8 @@ export function HermesThreadScreen({
   const [gatewayState, setGatewayState] = useState<HermesGatewayState>('connecting');
   const [gatewayRun, setGatewayRun] = useState<HermesRunStatus | null>(null);
   const [gatewayActivity, setGatewayActivity] = useState<FeedItem[]>([]);
+  const [gatewayApproval, setGatewayApproval] = useState<GatewayApproval | null>(null);
+  const [gatewayInput, setGatewayInput] = useState<GatewayInputRequest | null>(null);
   const runId = useRunStore((state) => state.activeRuns[runKey] ?? null);
   const setActiveRun = useRunStore((state) => state.setActiveRun);
   const clearActiveRun = useRunStore((state) => state.clearActiveRun);
@@ -167,7 +191,75 @@ export function HermesThreadScreen({
     const acquired = acquireHermesGateway(connection, profile);
     const gateway = acquired.client;
     gatewayRef.current = gateway;
-    const removeStateListener = gateway.onState(setGatewayState);
+    let observedOpen = false;
+    let disposed = false;
+    const profileParams = isNamedProfile(profile) ? { profile } : {};
+    const applyResumedSession = (resumed: GatewaySessionResponse, fallbackStoredID: string) => {
+      const storedSessionID = resumed.stored_session_id ?? resumed.session_key ?? fallbackStoredID;
+      const pendingInput = normalizeGatewayInput('clarify.request', resumed.pending_clarify);
+      gatewaySessionRef.current = { runtime: resumed.session_id, stored: storedSessionID };
+      setGatewayApproval(normalizeGatewayApproval(resumed.pending_approval));
+      setGatewayInput(pendingInput);
+      if (resumed.running || resumed.inflight?.error || resumed.pending_approval || pendingInput) {
+        const identifier = `gateway:${resumed.session_id}`;
+        setActiveRun(runKey, identifier);
+        const storedRunKey = `${connection.id}:${profile}:${storedSessionID}`;
+        if (storedRunKey !== runKey) setActiveRun(storedRunKey, identifier);
+        setGatewayRun({
+          object: 'hermes.run',
+          run_id: identifier,
+          session_id: storedSessionID,
+          status: resumed.inflight?.error
+            ? 'failed'
+            : resumed.pending_approval
+              ? 'waiting_for_approval'
+              : pendingInput
+                ? 'waiting_for_input'
+              : 'running',
+          output: resumed.inflight?.assistant,
+          error: resumed.inflight?.error,
+          updated_at: Date.now() / 1000,
+        });
+      } else {
+        if (useRunStore.getState().activeRuns[runKey]?.startsWith('gateway:')) clearActiveRun(runKey);
+        setGatewayRun(null);
+      }
+    };
+    const rebindSession = async (storedSessionID: string) => {
+      const resumed = await gateway.request<GatewaySessionResponse>('session.resume', {
+        session_id: storedSessionID,
+        omit_messages: true,
+        ...profileParams,
+      });
+      if (disposed) return;
+      applyResumedSession(resumed, storedSessionID);
+      await Promise.all([
+        queryClient.invalidateQueries({
+          queryKey: ['session-messages', connection.id, connection.url, profile, storedSessionID],
+        }),
+        queryClient.invalidateQueries({
+          queryKey: ['session-usage', connection.id, connection.url, profile, storedSessionID],
+        }),
+        queryClient.invalidateQueries({
+          queryKey: ['session-context', connection.id, connection.url, profile, storedSessionID],
+        }),
+      ]);
+    };
+    const removeStateListener = gateway.onState((state) => {
+      setGatewayState(state);
+      if (state !== 'open') return;
+      if (!observedOpen) {
+        observedOpen = true;
+        return;
+      }
+      const target = gatewaySessionRef.current;
+      if (!target) return;
+      void rebindSession(target.stored).catch(() => {
+        if (disposed) return;
+        setGatewayState('degraded');
+        if (useRunStore.getState().activeRuns[runKey]?.startsWith('gateway:')) clearActiveRun(runKey);
+      });
+    });
     const removeEventListener = gateway.onEvent((event) => {
       const target = gatewaySessionRef.current;
       if (!target || event.session_id !== target.runtime) return;
@@ -182,6 +274,8 @@ export function HermesThreadScreen({
       };
       if (event.type === 'message.start') {
         setGatewayActivity([]);
+        setGatewayApproval(null);
+        setGatewayInput(null);
         setGatewayRun(base);
       } else if (event.type === 'message.delta') {
         const delta = gatewayPayloadText(event.payload);
@@ -196,6 +290,8 @@ export function HermesThreadScreen({
         const output = gatewayPayloadText(event.payload);
         const failed = event.payload?.status === 'error';
         setGatewayActivity([]);
+        setGatewayApproval(null);
+        setGatewayInput(null);
         if (event.payload?.usage) {
           queryClient.setQueryData(
             ['session-usage', connection.id, connection.url, profile, target.stored],
@@ -215,12 +311,38 @@ export function HermesThreadScreen({
         clearActiveRun(`${connection.id}:${profile}:${target.stored}`);
         clearActiveRun(runKey);
       } else if (event.type === 'approval.request') {
+        setGatewayInput(null);
+        setGatewayApproval(normalizeGatewayApproval(event.payload));
         setGatewayRun((previous) => ({
           ...(previous ?? base),
           status: 'waiting_for_approval',
           last_event: event.type,
           updated_at: now,
         }));
+      } else if (
+        event.type === 'clarify.request' ||
+        event.type === 'sudo.request' ||
+        event.type === 'secret.request'
+      ) {
+        setGatewayApproval(null);
+        setGatewayInput(normalizeGatewayInput(event.type, event.payload));
+        setGatewayRun((previous) => ({
+          ...(previous ?? base),
+          status: 'waiting_for_input',
+          last_event: event.type,
+          updated_at: now,
+        }));
+      } else if (
+        event.type === 'clarify.expire' ||
+        event.type === 'sudo.expire' ||
+        event.type === 'secret.expire'
+      ) {
+        const requestID = typeof event.payload?.request_id === 'string' ? event.payload.request_id : '';
+        setGatewayInput((current) => {
+          if (!current || (requestID && current.requestId !== requestID)) return current;
+          setGatewayRun((previous) => previous ? { ...previous, status: 'running' } : previous);
+          return null;
+        });
       } else if (event.type === 'session.usage') {
         queryClient.setQueryData(
           ['session-usage', connection.id, connection.url, profile, target.stored],
@@ -261,6 +383,8 @@ export function HermesThreadScreen({
         }));
       } else if (event.type === 'error') {
         setGatewayActivity([]);
+        setGatewayApproval(null);
+        setGatewayInput(null);
         setGatewayRun((previous) => ({
           ...(previous ?? base),
           status: 'failed',
@@ -287,40 +411,26 @@ export function HermesThreadScreen({
     void gateway.connect().then(async () => {
       if (routeSessionId === 'new' || gatewaySessionRef.current) return;
       try {
-        const resumed = await gateway.request<GatewaySessionResponse>(
-          'session.resume',
-          { session_id: routeSessionId, omit_messages: true },
-        );
-        const storedSessionID = resumed.stored_session_id ?? resumed.session_key ?? routeSessionId;
-        gatewaySessionRef.current = {
-          runtime: resumed.session_id,
-          stored: storedSessionID,
-        };
-        if (resumed.running || resumed.inflight?.error) {
-          const identifier = `gateway:${resumed.session_id}`;
-          setActiveRun(runKey, identifier);
-          setGatewayRun({
-            object: 'hermes.run',
-            run_id: identifier,
-            session_id: storedSessionID,
-            status: resumed.inflight?.error
-              ? 'failed'
-              : resumed.pending_approval
-                ? 'waiting_for_approval'
-                : 'running',
-            output: resumed.inflight?.assistant,
-            error: resumed.inflight?.error,
-            updated_at: Date.now() / 1000,
-          });
-        } else if (useRunStore.getState().activeRuns[runKey]?.startsWith('gateway:')) {
-          clearActiveRun(runKey);
-        }
+        const resumed = await gateway.request<GatewaySessionResponse>('session.resume', {
+          session_id: routeSessionId,
+          omit_messages: true,
+          ...profileParams,
+        });
+        applyResumedSession(resumed, routeSessionId);
       } catch {
+        if (useRunStore.getState().activeRuns[runKey]?.startsWith('gateway:')) clearActiveRun(runKey);
         setGatewayState('degraded');
       }
-    }).catch(() => setGatewayState('degraded'));
+    }).catch(() => {
+      if (useRunStore.getState().activeRuns[runKey]?.startsWith('gateway:')) clearActiveRun(runKey);
+      setGatewayApproval(null);
+      setGatewayInput(null);
+      setGatewayRun(null);
+      setGatewayState('degraded');
+    });
 
     return () => {
+      disposed = true;
       removeEventListener();
       removeStateListener();
       if (gatewayRef.current === gateway) gatewayRef.current = null;
@@ -391,6 +501,7 @@ export function HermesThreadScreen({
               }>('session.create', {
                 source: 'brio',
                 title: 'Hermes conversation',
+                ...(isNamedProfile(profile) ? { profile } : {}),
                 ...(modelOverride?.model ? { model: modelOverride.model } : {}),
                 ...(modelOverride?.provider ? { provider: modelOverride.provider } : {}),
                 ...(modelOverride?.reasoningEffort
@@ -402,7 +513,11 @@ export function HermesThreadScreen({
             } else {
               const resumed = await gateway.request<GatewaySessionResponse>(
                 'session.resume',
-                { session_id: routeSessionId, omit_messages: true },
+                {
+                  session_id: routeSessionId,
+                  omit_messages: true,
+                  ...(isNamedProfile(profile) ? { profile } : {}),
+                },
               );
               target = {
                 runtime: resumed.session_id,
@@ -552,21 +667,58 @@ export function HermesThreadScreen({
     },
   });
   const approval = useMutation({
-    mutationFn: (choice: 'once' | 'session' | 'always' | 'deny') => {
+    mutationFn: async (choice: 'once' | 'session' | 'always' | 'deny') => {
       const target = gatewaySessionRef.current;
       if (runId?.startsWith('gateway:') && target && gatewayRef.current) {
-        return gatewayRef.current.request('approval.respond', {
+        if (!gatewayApproval?.requestId || !gatewayApproval.choices.includes(choice)) {
+          throw new Error('This Hermes approval is no longer available');
+        }
+        const result = await gatewayRef.current.request<{ resolved?: boolean }>('approval.respond', {
           session_id: target.runtime,
+          request_id: gatewayApproval.requestId,
           choice,
         });
+        if (result.resolved !== true) throw new Error('Hermes did not resolve the approval request');
+        return result;
       }
       return approveRun(connection, runId!, choice, profile);
     },
     onSuccess: () => {
       if (runId?.startsWith('gateway:')) {
+        setGatewayApproval(null);
         setGatewayRun((previous) => previous ? { ...previous, status: 'running' } : previous);
       } else {
         void run.refetch();
+      }
+    },
+  });
+  const answerGatewayInput = useMutation({
+    mutationFn: async (answer: string) => {
+      const request = gatewayInput;
+      const gateway = gatewayRef.current;
+      if (!request || !gateway || !request.requestId) {
+        throw new Error('This Hermes input request is no longer available');
+      }
+      const question = request.questions[request.questionIndex];
+      const method = `${request.kind}.respond`;
+      const valueKey = request.kind === 'clarify' ? 'answer' : request.kind === 'sudo' ? 'password' : 'value';
+      return gateway.request<{ status?: string; remaining?: string[] }>(method, {
+        request_id: request.requestId,
+        ...(question?.id ? { question_id: question.id } : {}),
+        [valueKey]: answer,
+      });
+    },
+    onSuccess: (result) => {
+      setGatewayInput((current) => {
+        if (!current) return null;
+        if (current.kind === 'clarify' && Array.isArray(result.remaining) && result.remaining.length > 0) {
+          const nextIndex = current.questions.findIndex((question) => question.id === result.remaining?.[0]);
+          return { ...current, questionIndex: nextIndex >= 0 ? nextIndex : current.questionIndex + 1 };
+        }
+        return null;
+      });
+      if (!Array.isArray(result.remaining) || result.remaining.length === 0) {
+        setGatewayRun((previous) => previous ? { ...previous, status: 'running' } : previous);
       }
     },
   });
@@ -728,12 +880,22 @@ export function HermesThreadScreen({
 
         {currentRun?.status === 'waiting_for_approval' ? (
           <ApprovalCard
+            approval={gatewayApproval}
             loading={approval.isPending}
             onChoose={(choice) => approval.mutate(choice)}
           />
         ) : null}
 
-        {active && currentRun?.status !== 'waiting_for_approval' ? (
+        {currentRun?.status === 'waiting_for_input' && gatewayInput ? (
+          <GatewayInputCard
+            key={`${gatewayInput.requestId}:${gatewayInput.questionIndex}`}
+            loading={answerGatewayInput.isPending}
+            onSubmit={(answer) => answerGatewayInput.mutate(answer)}
+            request={gatewayInput}
+          />
+        ) : null}
+
+        {active && currentRun?.status !== 'waiting_for_approval' && currentRun?.status !== 'waiting_for_input' ? (
           <View style={[styles.runStrip, { borderTopColor: colors.border }]}>
             <View style={[styles.pulse, { backgroundColor: colors.warning }]} />
             <AppText numberOfLines={1} style={[styles.runLabel, { color: colors.muted }]}>
@@ -949,9 +1111,11 @@ function MessageBubble({ message }: { message: HermesMessage }) {
 }
 
 function ApprovalCard({
+  approval,
   loading,
   onChoose,
 }: {
+  approval: GatewayApproval | null;
   loading: boolean;
   onChoose: (choice: 'once' | 'session' | 'always' | 'deny') => void;
 }) {
@@ -960,21 +1124,144 @@ function ApprovalCard({
     <Card style={[styles.approvalCard, { borderColor: colors.warning }]}>
       <AppText style={styles.approvalTitle}>Hermes needs approval</AppText>
       <AppText style={[styles.approvalDetail, { color: colors.muted }]}>
-        A protected action is waiting for your decision. Approve only if you trust the current task.
+        {approval?.detail ?? 'A protected action is waiting for your decision. Approve only if you trust the current task.'}
       </AppText>
       <View style={styles.approvalActions}>
-        <Button disabled={loading} onPress={() => onChoose('once')} style={styles.approvalButton}>
-          Allow once
-        </Button>
-        <Button disabled={loading} onPress={() => onChoose('session')} style={styles.approvalButton} tone="secondary">
-          This session
-        </Button>
-        <Button disabled={loading} onPress={() => onChoose('deny')} style={styles.approvalButton} tone="danger">
-          Deny
-        </Button>
+        {(approval?.choices ?? ['once', 'session', 'deny']).map((choice) => (
+          <Button
+            disabled={loading || (approval !== null && !approval.requestId)}
+            key={choice}
+            onPress={() => onChoose(choice)}
+            style={styles.approvalButton}
+            tone={choice === 'deny' ? 'danger' : choice === 'once' ? undefined : 'secondary'}>
+            {{ once: 'Allow once', session: 'This session', always: 'Always allow', deny: 'Deny' }[choice]}
+          </Button>
+        ))}
       </View>
     </Card>
   );
+}
+
+function normalizeGatewayApproval(payload?: Record<string, unknown> | null): GatewayApproval | null {
+  if (!payload) return null;
+  const requestId = typeof payload.request_id === 'string' ? payload.request_id : '';
+  const allowed = new Set(['once', 'session', 'always', 'deny']);
+  const choices = Array.isArray(payload.choices)
+    ? payload.choices.filter(
+        (choice): choice is GatewayApproval['choices'][number] =>
+          typeof choice === 'string' && allowed.has(choice),
+      )
+    : ['once', 'session', 'deny'] satisfies GatewayApproval['choices'];
+  const rawDetail = payload.description ?? payload.command ?? payload.reason;
+  return {
+    requestId,
+    choices: choices.length > 0 ? choices : ['deny'],
+    ...(typeof rawDetail === 'string' && rawDetail.trim() ? { detail: rawDetail.trim() } : {}),
+  };
+}
+
+function GatewayInputCard({
+  loading,
+  onSubmit,
+  request,
+}: {
+  loading: boolean;
+  onSubmit: (answer: string) => void;
+  request: GatewayInputRequest;
+}) {
+  const colors = useT3Theme();
+  const question = request.questions[request.questionIndex];
+  const [draft, setDraft] = useState('');
+  const [selected, setSelected] = useState<string[]>([]);
+  const secure = request.kind === 'sudo' || request.kind === 'secret';
+  const answer = question?.multiSelect
+    ? selected.length > 0 ? JSON.stringify(selected) : draft.trim()
+    : selected[0] ?? draft.trim();
+  const toggleChoice = (choice: string) => {
+    setDraft('');
+    setSelected((current) =>
+      question?.multiSelect
+        ? current.includes(choice)
+          ? current.filter((value) => value !== choice)
+          : [...current, choice]
+        : [choice],
+    );
+  };
+  return (
+    <Card style={[styles.approvalCard, { borderColor: colors.warning }]}>
+      <AppText style={styles.approvalTitle}>
+        {request.kind === 'clarify' ? 'Hermes has a question' : request.kind === 'sudo' ? 'Sudo password required' : 'Credential required'}
+      </AppText>
+      <AppText style={[styles.approvalDetail, { color: colors.muted }]}>
+        {question?.question || request.prompt}
+      </AppText>
+      {question?.choices.map((choice) => (
+        <Button
+          disabled={loading}
+          key={choice}
+          onPress={() => toggleChoice(choice)}
+          tone={selected.includes(choice) ? undefined : 'secondary'}>
+          {selected.includes(choice) ? `✓ ${choice}` : choice}
+        </Button>
+      ))}
+      <AppTextInput
+        autoCapitalize="none"
+        autoCorrect={false}
+        editable={!loading}
+        onChangeText={(value) => { setDraft(value); setSelected([]); }}
+        placeholder={secure ? 'Enter securely…' : question?.choices.length ? 'Or type another answer…' : 'Type your answer…'}
+        secureTextEntry={secure}
+        value={draft}
+      />
+      <Button disabled={loading || !answer} onPress={() => onSubmit(answer)}>
+        Continue
+      </Button>
+    </Card>
+  );
+}
+
+function normalizeGatewayInput(
+  type: string,
+  payload?: Record<string, unknown> | null,
+): GatewayInputRequest | null {
+  if (!payload) return null;
+  const requestId = typeof payload.request_id === 'string' ? payload.request_id : '';
+  if (!requestId) return null;
+  if (type === 'sudo.request') {
+    return { kind: 'sudo', requestId, prompt: 'Enter the password for the requested protected command.', questions: [], questionIndex: 0 };
+  }
+  if (type === 'secret.request') {
+    const prompt = typeof payload.prompt === 'string'
+      ? payload.prompt
+      : typeof payload.env_var === 'string'
+        ? `Enter ${payload.env_var}`
+        : 'Enter the requested credential.';
+    return { kind: 'secret', requestId, prompt, questions: [], questionIndex: 0 };
+  }
+  if (type !== 'clarify.request') return null;
+  const normalizeQuestion = (value: unknown): GatewayInputQuestion | null => {
+    if (!value || typeof value !== 'object') return null;
+    const candidate = value as Record<string, unknown>;
+    if (typeof candidate.question !== 'string' || !candidate.question.trim()) return null;
+    return {
+      ...(typeof candidate.qid === 'string' ? { id: candidate.qid } : {}),
+      question: candidate.question,
+      choices: Array.isArray(candidate.choices)
+        ? candidate.choices.filter((choice): choice is string => typeof choice === 'string')
+        : [],
+      multiSelect: candidate.multi_select === true,
+    };
+  };
+  const questions = Array.isArray(payload.questions)
+    ? payload.questions.map(normalizeQuestion).filter((question): question is GatewayInputQuestion => question !== null)
+    : [normalizeQuestion(payload)].filter((question): question is GatewayInputQuestion => question !== null);
+  if (questions.length === 0) return null;
+  const locked = payload.answers && typeof payload.answers === 'object'
+    ? new Set(Object.keys(payload.answers as Record<string, unknown>))
+    : new Set<string>();
+  const questionIndex = questions.findIndex((question) => !question.id || !locked.has(question.id));
+  if (questionIndex < 0) return null;
+  return { kind: 'clarify', requestId, prompt: '', questions, questionIndex };
 }
 
 function humanizeEvent(event: string) {

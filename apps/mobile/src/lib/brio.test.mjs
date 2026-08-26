@@ -38,6 +38,19 @@ test('decodes a legacy direct-pairing payload', () => {
   assert.deepEqual(decodePairingPayload(encoded), directPayload);
 });
 
+test('keeps Hermes serve address and credential separate from the direct API server', () => {
+  const payload = decodePairingPayload(JSON.stringify({
+    ...directPayload,
+    gateway_url: 'http://192.168.1.25:9119',
+    gateway_token: 'dashboard-secret',
+  }));
+  const connection = connectionFromPairingPayload(payload);
+  assert.equal(connection.url, directPayload.url);
+  assert.equal(connection.token, directPayload.token);
+  assert.equal(connection.gatewayUrl, 'http://192.168.1.25:9119');
+  assert.equal(connection.gatewayToken, 'dashboard-secret');
+});
+
 test('unwraps Brio mobile pairing deep links', () => {
   const encoded = Buffer.from(JSON.stringify(directPayload)).toString('base64url');
   const deepLink = `brio://pair?pairingPayload=${encodeURIComponent(encoded)}`;
@@ -94,6 +107,10 @@ test('rejects incomplete, unsupported, and unsafe pairing payloads', () => {
         JSON.stringify({ url: 'https://host#token=secret', token: 'secret', transport: 'direct' }),
       ),
     /invalid server address/,
+  );
+  assert.throws(
+    () => decodePairingPayload(JSON.stringify({ ...directPayload, gateway_url: 'http://host:9119' })),
+    /both an address and a token/,
   );
 });
 

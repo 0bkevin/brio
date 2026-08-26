@@ -53,6 +53,8 @@ export class HermesGatewayClient {
   private stateHandlers = new Set<(state: HermesGatewayState) => void>();
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
   private reconnectAttempts = 0;
+  private transportGeneration = 0;
+  private transportCycle = 0;
   private heartbeatTimer: ReturnType<typeof setInterval> | null = null;
   private lastInboundAt = 0;
   private lastSeenSequence = new Map<string, number>();
@@ -91,10 +93,18 @@ export class HermesGatewayClient {
     }
     this.stopped = false;
     this.setState(this.reconnectAttempts > 0 ? 'reconnecting' : 'connecting');
-    this.opening = (this.connection.transport === 'relay' ? this.openRelay() : this.openDirect())
-      .then(() => this.onTransportOpen())
+    const generation = ++this.transportGeneration;
+    this.opening = (this.connection.transport === 'relay'
+      ? this.openRelay(generation)
+      : this.openDirect(generation))
+      .then(() => {
+        if (generation !== this.transportGeneration) {
+          throw new Error('Hermes gateway connection was superseded');
+        }
+        return this.onTransportOpen(generation);
+      })
       .catch((reason) => {
-        this.setState('degraded');
+        if (generation === this.transportGeneration && !this.stopped) this.setState('degraded');
         throw reason;
       })
       .finally(() => {
@@ -139,17 +149,23 @@ export class HermesGatewayClient {
     this.stopHeartbeat();
     const transport = this.transport;
     this.transport = null;
+    this.transportGeneration += 1;
     transport?.close();
     this.rejectPending(new Error('Hermes gateway connection closed'));
     this.setState('closed');
   }
 
-  private openRelay(): Promise<void> {
-    return new Promise<void>((resolve, reject) => {
+  private async openRelay(generation: number): Promise<void> {
+    let channelTransport: GatewayTransport | null = null;
+    let abandoned = false;
+    const opened = new Promise<void>((resolve, reject) => {
       let settled = false;
       const timeout = setTimeout(() => {
         if (settled) return;
         settled = true;
+        abandoned = true;
+        channelTransport?.close();
+        if (this.transport === channelTransport) this.transport = null;
         reject(new Error('Hermes gateway channel timed out'));
       }, 15_000);
       void openRelayGatewayChannel(
@@ -157,16 +173,20 @@ export class HermesGatewayClient {
         scopedPath('/api/ws', this.profile),
         {
           onOpen: () => {
+            if (generation !== this.transportGeneration) return;
             if (!settled) {
               settled = true;
               clearTimeout(timeout);
               resolve();
             } else {
-              void this.onTransportOpen();
+              void this.onTransportOpen(generation);
             }
           },
-          onMessage: (data) => this.handleRawMessage(data),
+          onMessage: (data) => {
+            if (generation === this.transportGeneration) this.handleRawMessage(data);
+          },
           onClose: (error, retrying) => {
+            if (generation !== this.transportGeneration) return;
             if (!settled) {
               settled = true;
               clearTimeout(timeout);
@@ -176,7 +196,12 @@ export class HermesGatewayClient {
           },
         },
       ).then((channel) => {
-        this.transport = channel;
+        if (generation === this.transportGeneration && !abandoned) {
+          channelTransport = channel;
+          this.transport = channel;
+        } else {
+          channel.close();
+        }
       }, (reason) => {
         if (!settled) {
           settled = true;
@@ -185,37 +210,61 @@ export class HermesGatewayClient {
         }
       });
     });
+    await opened;
   }
 
-  private openDirect(): Promise<void> {
+  private openDirect(generation: number): Promise<void> {
     return new Promise<void>((resolve, reject) => {
       const socket = new WebSocket(directGatewayURL(this.connection, this.profile));
-      this.transport = {
+      const transport: GatewayTransport = {
         send: (data) => socket.send(data),
         close: () => socket.close(),
       };
-      const timeout = setTimeout(() => {
+      this.transport = transport;
+      let settled = false;
+      const fail = (error: Error) => {
+        if (settled || generation !== this.transportGeneration || this.transport !== transport) return;
+        settled = true;
+        clearTimeout(timeout);
+        this.transport = null;
         socket.close();
-        reject(new Error('Hermes gateway connection timed out'));
+        reject(error);
+      };
+      const timeout = setTimeout(() => {
+        fail(new Error('Hermes gateway connection timed out'));
       }, 15_000);
       socket.onopen = () => {
+        if (generation !== this.transportGeneration || this.transport !== transport) return;
+        if (settled) return;
+        settled = true;
         clearTimeout(timeout);
         resolve();
       };
-      socket.onmessage = (event) => this.handleRawMessage(String(event.data));
+      socket.onmessage = (event) => {
+        if (generation === this.transportGeneration && this.transport === transport) {
+          this.handleRawMessage(String(event.data));
+        }
+      };
       socket.onerror = () => {
-        clearTimeout(timeout);
-        reject(new Error('Hermes gateway connection failed'));
+        fail(new Error('Hermes gateway connection failed'));
       };
       socket.onclose = () => {
+        if (generation !== this.transportGeneration || this.transport !== transport) return;
         clearTimeout(timeout);
+        if (!settled) {
+          settled = true;
+          this.transport = null;
+          reject(new Error('Hermes gateway connection closed before opening'));
+          return;
+        }
         this.handleTransportClose(new Error('Hermes gateway connection closed'), false);
       };
     });
   }
 
-  private async onTransportOpen() {
-    if (this.stopped || !this.transport) return;
+  private async onTransportOpen(generation: number) {
+    if (this.stopped || !this.transport || generation !== this.transportGeneration) return;
+    const cycle = ++this.transportCycle;
     this.reconnectAttempts = 0;
     this.lastInboundAt = Date.now();
     if (this.lastSeenSequence.size === 0) {
@@ -244,7 +293,14 @@ export class HermesGatewayClient {
       const held = this.replayHold;
       this.replayHold = [];
       for (const event of held) this.dispatchIfNewer(event);
-      if (!this.stopped && this.transport) this.setState('open');
+      if (
+        !this.stopped &&
+        this.transport &&
+        generation === this.transportGeneration &&
+        cycle === this.transportCycle
+      ) {
+        this.setState('open');
+      }
     }
   }
 
@@ -324,6 +380,7 @@ export class HermesGatewayClient {
 
   private handleTransportClose(error: Error | undefined, retrying: boolean) {
     if (this.stopped) return;
+    this.transportCycle += 1;
     this.stopHeartbeat();
     this.rejectPending(error ?? new Error('Hermes gateway connection closed'));
     this.setState('reconnecting');
@@ -345,8 +402,13 @@ export class HermesGatewayClient {
   private invalidateTransport() {
     const transport = this.transport;
     this.transport = null;
+    this.transportGeneration += 1;
     transport?.close();
-    this.handleTransportClose(new Error('Hermes gateway transport was reset'), false);
+    if (this.stopped) return;
+    this.stopHeartbeat();
+    this.rejectPending(new Error('Hermes gateway transport was reset'));
+    this.setState('reconnecting');
+    this.scheduleReconnect();
   }
 
   private startHeartbeat() {
@@ -392,8 +454,9 @@ type CachedGateway = {
 const gatewayClients = new Map<string, CachedGateway>();
 
 export function acquireHermesGateway(connection: AgentConnection, profile: string) {
-  const credential = connection.transport === 'relay' ? connection.relayToken : connection.token;
-  const key = `${connection.id}\u0000${connection.url}\u0000${profile}\u0000${credential ?? ''}`;
+  const endpoint = connection.transport === 'relay' ? connection.url : connection.gatewayUrl ?? '';
+  const credential = connection.transport === 'relay' ? connection.relayToken : connection.gatewayToken;
+  const key = `${connection.id}\u0000${endpoint}\u0000${profile}\u0000${credential ?? ''}`;
   let cached = gatewayClients.get(key);
   if (!cached) {
     cached = {
@@ -430,7 +493,12 @@ export function acquireHermesGateway(connection: AgentConnection, profile: strin
 }
 
 function directGatewayURL(connection: AgentConnection, profile: string) {
-  const url = new URL(connection.url);
+  if (!connection.gatewayUrl || !connection.gatewayToken) {
+    throw new Error(
+      'Direct Hermes gateway is not configured; the API server and hermes serve use separate addresses and credentials',
+    );
+  }
+  const url = new URL(connection.gatewayUrl);
   if (url.protocol === 'http:') url.protocol = 'ws:';
   else if (url.protocol === 'https:') url.protocol = 'wss:';
   else if (url.protocol !== 'ws:' && url.protocol !== 'wss:') {
@@ -439,6 +507,6 @@ function directGatewayURL(connection: AgentConnection, profile: string) {
   url.pathname = `${url.pathname.replace(/\/+$/, '')}${scopedPath('/api/ws', profile)}`;
   url.search = '';
   url.hash = '';
-  url.searchParams.set('token', connection.token);
+  url.searchParams.set('token', connection.gatewayToken);
   return url.toString();
 }
