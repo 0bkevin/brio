@@ -19,8 +19,11 @@ import { useTheme } from '@/hooks/use-theme';
 import { getModelPreset, setModelPreset } from '@/lib/model-presets';
 import {
   aggregateSessionAnalytics,
+  modelCapabilityBadges,
+  modelCostLabel,
   modelIncompatibilities,
   modelIsUnavailable,
+  modelPricingFor,
   reasoningEffortChoices,
   selectedCapabilities,
   type ReasoningEffortChoice,
@@ -48,6 +51,7 @@ type ProviderFilter = 'favorites' | string;
 
 const EMPTY_OPTIONS: HermesModelOptions = { model: null, provider: null, providers: [] };
 const FAVORITE_MODELS_KEY = 'brio:favorite-models:v1';
+const favoriteModelKey = (provider: string, model: string) => `${provider}/${model}`;
 
 /**
  * Compact bar above the composer distinguishing "Profile default" from
@@ -248,6 +252,40 @@ function PanelTab({
   );
 }
 
+function ProviderChip({
+  active,
+  label,
+  onPress,
+}: {
+  active: boolean;
+  label: string;
+  onPress: () => void;
+}) {
+  const colors = useTheme();
+  return (
+    <Pressable
+      accessibilityRole="tab"
+      accessibilityState={{ selected: active }}
+      onPress={onPress}
+      style={({ pressed }) => [
+        styles.providerChip,
+        {
+          backgroundColor: active ? colors.accent : colors.backgroundElement,
+          borderColor: active ? colors.accent : colors.border,
+          opacity: pressed ? 0.7 : 1,
+        },
+      ]}>
+      <ThemedText
+        numberOfLines={1}
+        style={active ? { color: colors.accentText } : undefined}
+        themeColor={active ? undefined : 'textSecondary'}
+        type="smallBold">
+        {label}
+      </ThemedText>
+    </Pressable>
+  );
+}
+
 function ModelPickerPanel({
   onOverrideChange,
   options,
@@ -301,19 +339,14 @@ function ModelPickerPanel({
       .catch(() => undefined);
   }, []);
 
-  useEffect(() => {
-    if (providerFilter || safeOptions.providers.length === 0) return;
-    setProviderFilter(
-      safeOptions.providers.some((provider) => provider.slug === appliedProvider)
-        ? (appliedProvider ?? safeOptions.providers[0].slug)
-        : safeOptions.providers[0].slug,
-    );
-  }, [appliedProvider, providerFilter, safeOptions.providers]);
-
-  const favoriteKey = (provider: string, model: string) => `${provider}/${model}`;
+  const activeProviderFilter = providerFilter || (
+    safeOptions.providers.some((provider) => provider.slug === appliedProvider)
+      ? (appliedProvider ?? safeOptions.providers[0]?.slug ?? '')
+      : (safeOptions.providers[0]?.slug ?? '')
+  );
 
   const toggleFavorite = (provider: string, model: string) => {
-    const key = favoriteKey(provider, model);
+    const key = favoriteModelKey(provider, model);
     setFavoriteModels((current) => {
       const next = new Set(current);
       if (next.has(key)) next.delete(key);
@@ -334,14 +367,14 @@ function ModelPickerPanel({
           if (query) {
             return `${provider.name} ${provider.slug} ${model}`.toLowerCase().includes(query);
           }
-          if (providerFilter === 'favorites') {
-            return favoriteModels.has(favoriteKey(provider.slug, model));
+          if (activeProviderFilter === 'favorites') {
+            return favoriteModels.has(favoriteModelKey(provider.slug, model));
           }
-          return provider.slug === providerFilter;
+          return provider.slug === activeProviderFilter;
         }),
       }))
       .filter((group) => group.models.length > 0);
-  }, [favoriteModels, providerFilter, safeOptions.providers, search]);
+  }, [activeProviderFilter, favoriteModels, safeOptions.providers, search]);
 
   const applySelection = useCallback(
     async (provider: ModelOptionProvider, model: string) => {
@@ -467,13 +500,13 @@ function ModelPickerPanel({
           keyboardShouldPersistTaps="handled"
           showsHorizontalScrollIndicator={false}>
           <ProviderChip
-            active={providerFilter === 'favorites'}
+            active={activeProviderFilter === 'favorites'}
             label="★ Favorites"
             onPress={() => setProviderFilter('favorites')}
           />
           {safeOptions.providers.map((provider) => (
             <ProviderChip
-              active={providerFilter === provider.slug}
+              active={activeProviderFilter === provider.slug}
               key={provider.slug}
               label={provider.name}
               onPress={() => setProviderFilter(provider.slug)}
@@ -510,7 +543,13 @@ function ModelPickerPanel({
               const selected = provider.slug === effectiveProvider && model === effectiveModel;
               const isDefault =
                 provider.slug === safeOptions.provider && model === safeOptions.model;
-              const favorite = favoriteModels.has(favoriteKey(provider.slug, model));
+              const favorite = favoriteModels.has(favoriteModelKey(provider.slug, model));
+              const metadata = [
+                selected ? 'Selected' : null,
+                provider.backend_provider?.trim() || null,
+                ...modelCapabilityBadges(selectedCapabilities(safeOptions, provider.slug, model)),
+                modelCostLabel(modelPricingFor(provider, model)),
+              ].filter((value): value is string => Boolean(value));
               const first = index === 0;
               const last = index === models.length - 1;
               return (
@@ -541,7 +580,7 @@ function ModelPickerPanel({
                       {unavailable ? <Badge color={colors.textDisabled} label="Unavailable" /> : null}
                     </View>
                     <ThemedText numberOfLines={1} themeColor="textTertiary" type="small">
-                      {provider.name}{selected ? ' · Selected' : ''}
+                      {metadata.length ? metadata.join(' · ') : provider.name}
                     </ThemedText>
                   </View>
                   <Pressable
@@ -566,10 +605,10 @@ function ModelPickerPanel({
       {!optionsLoading && groups.length === 0 ? (
         <View style={styles.emptyModels}>
           <ThemedText style={styles.emptyTitle} type="smallBold">
-            {providerFilter === 'favorites' && !search.trim() ? 'No favorites yet' : 'No matching models'}
+            {activeProviderFilter === 'favorites' && !search.trim() ? 'No favorites yet' : 'No matching models'}
           </ThemedText>
           <ThemedText style={styles.emptyDetail} themeColor="textTertiary" type="small">
-            {providerFilter === 'favorites' && !search.trim()
+            {activeProviderFilter === 'favorites' && !search.trim()
               ? 'Tap the star beside any model to keep it close.'
               : 'Try a model name or another provider.'}
           </ThemedText>
@@ -760,7 +799,7 @@ function UsagePanel({
         }`;
 
   return (
-    <ScrollView contentContainerStyle={styles.usageContent}>
+    <ScrollView contentContainerStyle={styles.usageContent} style={styles.panelBody}>
       <ThemedText themeColor="textTertiary" type="eyebrow">Current session</ThemedText>
       <View style={[styles.usageCard, { borderColor: colors.border }]}>
         <UsageRow label="Input tokens" value={usage?.inputTokens} />
@@ -949,33 +988,72 @@ const styles = StyleSheet.create({
     borderWidth: StyleSheet.hairlineWidth,
     flexDirection: 'row',
     gap: Spacing.one,
-    height: 34,
-    maxWidth: 190,
-    paddingHorizontal: Spacing.three,
+    height: 36,
+    maxWidth: 220,
+    paddingHorizontal: 12,
   },
+  inlineMark: { borderRadius: 3, height: 6, width: 6 },
   inlineLabel: { flexShrink: 1 },
+  inlineDisclosure: { fontSize: 12, lineHeight: 16, marginLeft: 1 },
   modalRoot: { flex: 1 },
+  modalBackdrop: {
+    backgroundColor: 'rgba(0,0,0,0.58)',
+    flex: 1,
+    justifyContent: 'flex-end',
+  },
+  modalSheet: {
+    alignSelf: 'center',
+    borderTopLeftRadius: 28,
+    borderTopRightRadius: 28,
+    borderWidth: StyleSheet.hairlineWidth,
+    height: '90%',
+    maxWidth: 720,
+    overflow: 'hidden',
+    width: '100%',
+  },
+  sheetHandle: {
+    alignSelf: 'center',
+    borderRadius: 3,
+    height: 5,
+    marginTop: 9,
+    opacity: 0.8,
+    width: 42,
+  },
   modalHeader: {
     alignItems: 'center',
-    borderBottomWidth: StyleSheet.hairlineWidth,
     flexDirection: 'row',
-    justifyContent: 'space-between',
-    minHeight: 56,
-    paddingHorizontal: Spacing.three,
+    gap: Spacing.three,
+    minHeight: 72,
+    paddingHorizontal: Spacing.four,
+    paddingVertical: Spacing.two,
   },
-  headerAction: { alignItems: 'center', height: 44, justifyContent: 'center', width: 44 },
-  headerBack: { fontSize: 34, fontWeight: '300', lineHeight: 38 },
-  headerCheck: { fontSize: 19, fontWeight: '700', lineHeight: 24 },
-  headerTitle: { flex: 1, fontSize: 18, textAlign: 'left' },
-  panelSwitch: { flexDirection: 'row', gap: Spacing.two, paddingHorizontal: Spacing.four, paddingVertical: Spacing.two },
+  headerCopy: { flex: 1 },
+  headerTitle: { fontSize: 20, lineHeight: 25, textAlign: 'left' },
+  doneButton: {
+    alignItems: 'center',
+    borderRadius: 999,
+    justifyContent: 'center',
+    minHeight: 40,
+    paddingHorizontal: 18,
+  },
+  panelSwitch: {
+    borderRadius: 12,
+    flexDirection: 'row',
+    gap: 2,
+    marginHorizontal: Spacing.four,
+    padding: 3,
+  },
   panelTab: {
-    borderRadius: 10,
+    alignItems: 'center',
+    borderRadius: 9,
     borderWidth: StyleSheet.hairlineWidth,
+    flex: 1,
     minHeight: 36,
     paddingHorizontal: Spacing.three,
     justifyContent: 'center',
   },
-  pickerContent: { paddingBottom: Spacing.five, paddingTop: 4 },
+  panelBody: { flex: 1 },
+  pickerContent: { paddingBottom: 40, paddingTop: 4 },
   usageContent: { gap: Spacing.two, paddingBottom: Spacing.five, paddingHorizontal: Spacing.four, paddingTop: Spacing.two },
   stateRow: {
     alignItems: 'center',
@@ -986,24 +1064,36 @@ const styles = StyleSheet.create({
   },
   searchBox: {
     alignItems: 'center',
-    borderRadius: 12,
+    borderRadius: 14,
+    borderWidth: StyleSheet.hairlineWidth,
     flexDirection: 'row',
-    marginBottom: 8,
+    gap: Spacing.two,
+    marginBottom: 10,
     marginHorizontal: Spacing.four,
     marginTop: 12,
-    paddingHorizontal: Spacing.four,
+    paddingHorizontal: Spacing.three,
   },
+  searchIcon: { fontSize: 21, lineHeight: 24 },
   searchInput: { flex: 1, fontSize: 16, minHeight: 44, outlineStyle: 'none' } as never,
+  providerRail: { gap: Spacing.two, paddingBottom: Spacing.two, paddingHorizontal: Spacing.four },
+  providerChip: {
+    borderRadius: 999,
+    borderWidth: StyleSheet.hairlineWidth,
+    justifyContent: 'center',
+    minHeight: 36,
+    maxWidth: 210,
+    paddingHorizontal: 14,
+  },
   providerSection: { width: '100%' },
   groupHeader: {
     alignItems: 'center',
     flexDirection: 'row',
     gap: 8,
     marginHorizontal: Spacing.four,
-    marginTop: 4,
-    minHeight: 44,
+    marginTop: 2,
+    minHeight: 42,
     paddingHorizontal: 4,
-    paddingTop: 8,
+    paddingTop: 6,
   },
   providerMark: {
     alignItems: 'center',
@@ -1014,22 +1104,26 @@ const styles = StyleSheet.create({
   },
   providerMarkText: { fontSize: 11, lineHeight: 14 },
   providerName: { flex: 1 },
-  disclosure: { fontSize: 16, lineHeight: 18, width: 18 },
   modelRow: {
     alignItems: 'center',
     flexDirection: 'row',
-    gap: 8,
+    gap: 10,
     marginHorizontal: Spacing.four,
-    minHeight: 44,
-    paddingHorizontal: Spacing.four,
-    paddingVertical: 8,
+    minHeight: 58,
+    overflow: 'hidden',
+    paddingHorizontal: Spacing.three,
+    paddingVertical: 7,
   },
   modelRowFirst: { borderTopLeftRadius: 16, borderTopRightRadius: 16 },
   modelRowLast: { borderBottomLeftRadius: 16, borderBottomRightRadius: 16 },
   modelRowDivider: { borderBottomWidth: StyleSheet.hairlineWidth },
-  modelName: { flexShrink: 1, fontSize: 16, fontWeight: '600', lineHeight: 20 },
+  selectionBar: { alignSelf: 'stretch', borderRadius: 2, marginVertical: 3, width: 3 },
+  modelCopy: { flex: 1 },
+  modelTitleRow: { alignItems: 'center', flexDirection: 'row', gap: 7 },
+  modelName: { flexShrink: 1, fontSize: 16, fontWeight: '600', lineHeight: 21 },
   modelRowSpacer: { flex: 1 },
-  modelCheck: { fontSize: 16, fontWeight: '700', lineHeight: 20 },
+  favoriteButton: { alignItems: 'center', height: 42, justifyContent: 'center', width: 42 },
+  favoriteIcon: { fontSize: 21, lineHeight: 24 },
   badge: {
     borderRadius: 6,
     borderWidth: StyleSheet.hairlineWidth,
@@ -1037,7 +1131,9 @@ const styles = StyleSheet.create({
     paddingHorizontal: 6,
     paddingVertical: 1,
   },
-  emptyModels: { paddingHorizontal: Spacing.four, paddingVertical: 56, textAlign: 'center' },
+  emptyModels: { alignItems: 'center', gap: 4, paddingHorizontal: Spacing.four, paddingVertical: 56 },
+  emptyTitle: { textAlign: 'center' },
+  emptyDetail: { maxWidth: 280, textAlign: 'center' },
   optionsSection: { marginTop: 8, paddingBottom: 12 },
   sectionLabel: { paddingBottom: 8, paddingHorizontal: 20, paddingTop: 8 },
   optionsCard: { borderRadius: 16, marginHorizontal: Spacing.four, overflow: 'hidden' },

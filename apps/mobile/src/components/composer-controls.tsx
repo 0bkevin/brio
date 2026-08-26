@@ -306,6 +306,18 @@ export function ComposerControls({
           { backgroundColor: colors.panelStrong, borderColor: colors.border },
         ]}>
         <View style={expanded ? styles.expandedInputRow : styles.collapsedInputRow}>
+          {!expanded ? (
+            <Pressable
+              accessibilityLabel="Attach context"
+              hitSlop={4}
+              onPress={() => setPickerOpen(true)}
+              style={({ pressed }) => [
+                styles.compactAttach,
+                { backgroundColor: colors.backgroundSelected, opacity: pressed ? 0.65 : 1 },
+              ]}>
+              <ThemedText style={styles.compactAttachLabel} themeColor="textSecondary">+</ThemedText>
+            </Pressable>
+          ) : null}
           <TextInput
             accessibilityLabel="Ask Hermes anything"
             maxLength={20000}
@@ -352,8 +364,8 @@ export function ComposerControls({
               showsHorizontalScrollIndicator={false}>
               <ToolbarAction label="+" accessibilityLabel="Attach context" onPress={() => setPickerOpen(true)} />
               {modelControl}
-              <ToolbarAction label="Commands" onPress={() => setCommandsOpen(true)} />
-              {history.length > 0 ? <ToolbarAction label="History" onPress={() => setHistoryOpen(true)} /> : null}
+              <ToolbarAction accessibilityLabel="Commands" label="/" onPress={() => setCommandsOpen(true)} />
+              {history.length > 0 ? <ToolbarAction accessibilityLabel="Prompt history" label="↶" onPress={() => setHistoryOpen(true)} /> : null}
               {canUndo ? <ToolbarAction label="Undo" onPress={onUndo} /> : null}
               {canRedo ? <ToolbarAction label="Redo" onPress={onRedo} /> : null}
               {active ? <ToolbarAction disabled={!canSend} label="Redirect" onPress={() => onSend('redirect')} tone="warning" /> : null}
@@ -489,7 +501,7 @@ const styles = StyleSheet.create({
     borderRadius: 999,
     minHeight: 54,
     paddingBottom: 5,
-    paddingLeft: 18,
+    paddingLeft: 5,
     paddingRight: 5,
     paddingTop: 5,
   },
@@ -500,13 +512,15 @@ const styles = StyleSheet.create({
     paddingHorizontal: 14,
     paddingTop: 14,
   },
-  collapsedInputRow: { alignItems: 'center', flexDirection: 'row' },
+  collapsedInputRow: { alignItems: 'center', flexDirection: 'row', gap: 5 },
   expandedInputRow: { minHeight: 72 },
   input: { flex: 1, fontSize: 16, lineHeight: 23, outlineStyle: 'none' } as never,
-  inputCollapsed: { height: 36, paddingBottom: 4, paddingTop: 4 },
+  inputCollapsed: { height: 44, paddingBottom: 4, paddingHorizontal: 4, paddingTop: 4 },
   inputExpanded: { maxHeight: 150, minHeight: 72, paddingHorizontal: 4, paddingVertical: 4 },
   composerFooter: { alignItems: 'center', flexDirection: 'row', gap: Spacing.two },
   send: { alignItems: 'center', borderRadius: 22, height: 44, justifyContent: 'center', width: 44 },
+  compactAttach: { alignItems: 'center', borderRadius: 22, height: 44, justifyContent: 'center', width: 44 },
+  compactAttachLabel: { fontSize: 27, fontWeight: '300', lineHeight: 30 },
   attachmentList: { gap: Spacing.two, paddingBottom: Spacing.two },
   attachmentChip: { alignItems: 'center', borderRadius: 10, borderWidth: StyleSheet.hairlineWidth, flexDirection: 'row', gap: Spacing.two, paddingHorizontal: Spacing.two, paddingVertical: Spacing.one },
   completions: { borderRadius: 12, borderWidth: StyleSheet.hairlineWidth, marginBottom: Spacing.two, maxHeight: 220 },

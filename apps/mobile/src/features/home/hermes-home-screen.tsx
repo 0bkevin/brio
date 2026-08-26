@@ -264,7 +264,12 @@ export function HermesHomeScreen({ connection }: { connection: AgentConnection }
           <AppText style={styles.threadTitle}>New Thread</AppText>
         </View>
 
-        <View style={styles.conversationCanvas} />
+        <View style={styles.conversationCanvas}>
+          <EmptyState
+            detail="Describe the outcome you want. Brio will keep the session running even when you leave this screen."
+            title={`What should ${composerDestination} work on?`}
+          />
+        </View>
 
         <View style={[styles.composerDock, split && styles.composerDockWide]}>
           {startError ? (
@@ -293,68 +298,42 @@ export function HermesHomeScreen({ connection }: { connection: AgentConnection }
                 textAlignVertical="top"
                 value={draft}
               />
-              {!composerExpanded ? (
-                <Pressable
-                  accessibilityLabel="Send to Hermes"
-                  accessibilityRole="button"
-                  disabled={!canStart}
-                  onPress={() => void startNewTask()}
-                  style={({ pressed }) => [
-                    styles.sendButton,
-                    {
-                      backgroundColor: canStart ? colors.primary : colors.subtleStrong,
-                      opacity: pressed ? 0.65 : 1,
-                    },
-                  ]}>
-                  <AppText
-                    style={[
-                      styles.sendLabel,
-                      {
-                        color: canStart ? colors.primaryForeground : colors.tertiary,
-                      },
-                    ]}>
-                    {starting ? '…' : '↑'}
-                  </AppText>
-                </Pressable>
-              ) : null}
             </View>
-            {composerExpanded ? (
-              <View style={styles.promptFooter}>
-                <SessionModelControls
-                  onOverrideChange={(override) =>
-                    setNewThreadModels((current) => ({ ...current, [composerKey]: override }))
-                  }
-                  onOpenChange={setModelPickerOpen}
-                  options={modelOptions.data}
-                  optionsError={modelOptions.isError}
-                  optionsLoading={modelOptions.isLoading}
-                  showUsage={false}
-                  thread={newThread}
-                  variant="inline"
-                />
-                <View style={styles.footerSpacer} />
-                <Pressable
-                  accessibilityLabel="Send to Hermes"
-                  accessibilityRole="button"
-                  disabled={!canStart}
-                  onPress={() => void startNewTask()}
-                  style={({ pressed }) => [
-                    styles.sendButton,
-                    {
-                      backgroundColor: canStart ? colors.primary : colors.subtleStrong,
-                      opacity: pressed ? 0.65 : 1,
-                    },
+            <View style={styles.promptFooter}>
+              <SessionModelControls
+                onOverrideChange={(override) =>
+                  setNewThreadModels((current) => ({ ...current, [composerKey]: override }))
+                }
+                onOpenChange={setModelPickerOpen}
+                options={modelOptions.data}
+                optionsError={modelOptions.isError}
+                optionsLoading={modelOptions.isLoading}
+                showUsage={false}
+                thread={newThread}
+                variant="inline"
+              />
+              <View style={styles.footerSpacer} />
+              <Pressable
+                accessibilityLabel="Send to Hermes"
+                accessibilityRole="button"
+                disabled={!canStart}
+                onPress={() => void startNewTask()}
+                style={({ pressed }) => [
+                  styles.sendButton,
+                  {
+                    backgroundColor: canStart ? colors.primary : colors.subtleStrong,
+                    opacity: pressed ? 0.65 : 1,
+                  },
+                ]}>
+                <AppText
+                  style={[
+                    styles.sendLabel,
+                    { color: canStart ? colors.primaryForeground : colors.tertiary },
                   ]}>
-                  <AppText
-                    style={[
-                      styles.sendLabel,
-                      { color: canStart ? colors.primaryForeground : colors.tertiary },
-                    ]}>
-                    {starting ? '…' : '↑'}
-                  </AppText>
-                </Pressable>
-              </View>
-            ) : null}
+                  {starting ? '…' : '↑'}
+                </AppText>
+              </Pressable>
+            </View>
           </View>
         </View>
       </KeyboardAvoidingView>
@@ -640,12 +619,11 @@ const styles = StyleSheet.create({
     overflow: 'hidden',
   },
   promptComposerCollapsed: {
-    borderRadius: T3Radius.pill,
-    minHeight: 54,
-    paddingBottom: 5,
-    paddingLeft: 0,
-    paddingRight: 5,
-    paddingTop: 5,
+    borderRadius: 26,
+    minHeight: 104,
+    paddingBottom: 7,
+    paddingHorizontal: 10,
+    paddingTop: 8,
   },
   promptComposerExpanded: {
     borderRadius: 26,
@@ -661,7 +639,7 @@ const styles = StyleSheet.create({
     fontSize: 17,
     lineHeight: 24,
   },
-  promptInputCollapsed: { borderWidth: 0, height: 36, minHeight: 36, paddingHorizontal: 18, paddingVertical: 4 },
+  promptInputCollapsed: { borderWidth: 0, height: 44, minHeight: 44, paddingHorizontal: T3Spacing.xs, paddingVertical: 4 },
   promptInputExpanded: { borderWidth: 0, maxHeight: 150, minHeight: 78, paddingHorizontal: T3Spacing.xs, paddingTop: T3Spacing.xs },
   promptFooter: { alignItems: 'center', flexDirection: 'row', gap: T3Spacing.md },
   footerSpacer: { flex: 1 },
