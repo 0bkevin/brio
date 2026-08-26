@@ -1,4 +1,4 @@
-import { useCallback, useMemo, useState } from 'react';
+import { useCallback, useMemo, useRef, useState } from 'react';
 import {
   ActivityIndicator,
   Modal,
@@ -16,11 +16,8 @@ import { useTheme } from '@/hooks/use-theme';
 import { getModelPreset, setModelPreset } from '@/lib/model-presets';
 import {
   aggregateSessionAnalytics,
-  modelCapabilityBadges,
-  modelCostLabel,
   modelIncompatibilities,
   modelIsUnavailable,
-  modelPricingFor,
   reasoningEffortChoices,
   selectedCapabilities,
   type ReasoningEffortChoice,
@@ -36,6 +33,11 @@ export type SessionModelControlsProps = {
   /** Loaded sessions feed the analytics panel; insertion/backend order is kept. */
   sessions?: HermesSession[];
   onOverrideChange: (override: ChatModelOverride | undefined) => void;
+  onOpenChange?: (open: boolean) => void;
+  /** T3-style composer control: only the effective model name in a small pill. */
+  variant?: 'bar' | 'inline';
+  /** New-thread pickers do not have session usage to display yet. */
+  showUsage?: boolean;
 };
 
 type PanelKind = 'closed' | 'models' | 'usage';
@@ -53,9 +55,19 @@ export function SessionModelControls({
   optionsError,
   sessions,
   onOverrideChange,
+  onOpenChange,
+  variant = 'bar',
+  showUsage = true,
 }: SessionModelControlsProps) {
   const colors = useTheme();
   const [panel, setPanel] = useState<PanelKind>('closed');
+  const [draftOverride, setDraftOverride] = useState<ChatModelOverride | undefined>(
+    thread.modelOverride,
+  );
+  const [draftDirty, setDraftDirty] = useState(false);
+  const [pickerSession, setPickerSession] = useState(0);
+  const draftOverrideRef = useRef<ChatModelOverride | undefined>(thread.modelOverride);
+  const draftDirtyRef = useRef(false);
 
   const override = thread.modelOverride;
   const loadingSummary = optionsLoading && !options;
@@ -73,6 +85,33 @@ export function SessionModelControls({
   } else {
     summaryLabel = 'Profile default · unknown';
   }
+  const inlineLabel =
+    override?.model ??
+    options?.model ??
+    (loadingSummary ? 'Loading models…' : errorSummary ? 'Models unavailable' : 'Choose model');
+  const openModels = () => {
+    draftOverrideRef.current = override;
+    draftDirtyRef.current = false;
+    setDraftOverride(override);
+    setDraftDirty(false);
+    setPickerSession((current) => current + 1);
+    setPanel('models');
+    onOpenChange?.(true);
+  };
+  const dismissPanel = () => {
+    setPanel('closed');
+    onOpenChange?.(false);
+  };
+  const commitAndClose = () => {
+    if (draftDirtyRef.current) onOverrideChange(draftOverrideRef.current);
+    dismissPanel();
+  };
+  const stageOverride = (nextOverride: ChatModelOverride | undefined) => {
+    draftOverrideRef.current = nextOverride;
+    draftDirtyRef.current = true;
+    setDraftOverride(nextOverride);
+    setDraftDirty(true);
+  };
 
   return (
     <>
@@ -81,63 +120,83 @@ export function SessionModelControls({
           override ? 'Session model picker: session override active' : 'Session model picker: profile default active'
         }
         accessibilityRole="button"
-        onPress={() => setPanel('models')}
+        onPress={openModels}
         style={({ pressed }) => [
-          styles.bar,
+          variant === 'inline' ? styles.inline : styles.bar,
           {
-            backgroundColor: colors.panel,
+            backgroundColor:
+              variant === 'inline' ? colors.backgroundSelected : colors.panel,
             borderColor: override ? colors.accent : colors.border,
             opacity: pressed ? 0.72 : 1,
           },
         ]}>
-        <View
-          style={[
-            styles.barDot,
-            { backgroundColor: override ? colors.warning : colors.success },
-          ]}
-        />
-        <ThemedText numberOfLines={1} style={styles.barLabel} themeColor="textSecondary" type="small">
-          {summaryLabel}
+        {variant === 'bar' ? (
+          <View
+            style={[
+              styles.barDot,
+              { backgroundColor: override ? colors.warning : colors.success },
+            ]}
+          />
+        ) : null}
+        <ThemedText
+          numberOfLines={1}
+          style={variant === 'inline' ? styles.inlineLabel : styles.barLabel}
+          themeColor="textSecondary"
+          type="smallBold">
+          {variant === 'inline' ? inlineLabel : summaryLabel}
         </ThemedText>
-        <ThemedText themeColor="textTertiary" type="small">▾</ThemedText>
+        <ThemedText themeColor="textTertiary" type="small">›</ThemedText>
       </Pressable>
 
       <Modal
         animationType="slide"
-        onRequestClose={() => setPanel('closed')}
+        onRequestClose={dismissPanel}
         transparent={false}
         visible={panel !== 'closed'}>
         <View style={[styles.modalRoot, { backgroundColor: colors.background }]}>
           <View style={[styles.modalHeader, { borderColor: colors.border }]}>
-            <ThemedText type="smallBold">Model &amp; session</ThemedText>
             <Pressable
-              accessibilityLabel="Close model picker"
+              accessibilityLabel="Cancel thread settings"
               accessibilityRole="button"
-              onPress={() => setPanel('closed')}>
-              <ThemedText themeColor="textSecondary" type="smallBold">Done</ThemedText>
+              hitSlop={10}
+              onPress={dismissPanel}
+              style={styles.headerAction}>
+              <ThemedText style={styles.headerBack} type="default">‹</ThemedText>
+            </Pressable>
+            <ThemedText style={styles.headerTitle} type="subtitle">Thread settings</ThemedText>
+            <Pressable
+              accessibilityLabel={draftDirty ? 'Save thread settings' : 'Done'}
+              accessibilityRole="button"
+              hitSlop={10}
+              onPress={commitAndClose}
+              style={styles.headerAction}>
+              <ThemedText style={styles.headerCheck} type="default">✓</ThemedText>
             </Pressable>
           </View>
-          <View style={styles.panelSwitch}>
-            <PanelTab
-              active={panel === 'models'}
-              label="Model"
-              onPress={() => setPanel('models')}
-            />
-            <PanelTab
-              active={panel === 'usage'}
-              label="Usage"
-              onPress={() => setPanel('usage')}
-            />
-          </View>
-          {panel === 'usage' ? (
+          {showUsage ? (
+            <View style={styles.panelSwitch}>
+              <PanelTab
+                active={panel === 'models'}
+                label="Model"
+                onPress={() => setPanel('models')}
+              />
+              <PanelTab
+                active={panel === 'usage'}
+                label="Usage"
+                onPress={() => setPanel('usage')}
+              />
+            </View>
+          ) : null}
+          {showUsage && panel === 'usage' ? (
             <UsagePanel sessions={sessions} thread={thread} />
           ) : (
             <ModelPickerPanel
-              onOverrideChange={onOverrideChange}
+              key={pickerSession}
+              onOverrideChange={stageOverride}
               options={options}
               optionsError={optionsError}
               optionsLoading={optionsLoading}
-              override={override}
+              override={draftOverride}
               thread={thread}
             />
           )}
@@ -191,6 +250,7 @@ function ModelPickerPanel({
 }) {
   const colors = useTheme();
   const [search, setSearch] = useState('');
+  const [providerExpansion, setProviderExpansion] = useState<Record<string, boolean>>({});
   // A pending change awaits explicit confirmation when switching models — or
   // clearing the override back to the profile default — on a thread that
   // already has traffic (prompt cache may be invalidated).
@@ -201,6 +261,7 @@ function ModelPickerPanel({
   >(null);
   const [draftEffort, setDraftEffort] = useState<string | null>(null);
   const [draftFast, setDraftFast] = useState<boolean | null>(null);
+  const [reasoningExpanded, setReasoningExpanded] = useState(false);
 
   const safeOptions = options ?? EMPTY_OPTIONS;
   const effectiveProvider = override?.provider ?? safeOptions.provider ?? null;
@@ -210,26 +271,44 @@ function ModelPickerPanel({
     [safeOptions, effectiveProvider, effectiveModel],
   );
 
-  // Search filters dynamically but never reorders: providers stay in backend
-  // order and models stay in each provider's backend order.
+  const appliedProvider = thread.modelOverride?.provider ?? safeOptions.provider ?? null;
+
+  // Search filters dynamically but never reorders. A narrowed catalog expands
+  // matching providers; otherwise the applied and primary providers start open.
   const groups = useMemo(() => {
     const query = search.trim().toLowerCase();
-    if (!query) {
-      return safeOptions.providers.map((provider) => ({ provider, models: provider.models ?? [] }));
-    }
     return safeOptions.providers
       .map((provider) => ({
         provider,
-        matchesProvider:
-          provider.name.toLowerCase().includes(query) || provider.slug.toLowerCase().includes(query),
-        models: (provider.models ?? []).filter((model) => model.toLowerCase().includes(query)),
-      }))
-      .map(({ provider, matchesProvider, models }) => ({
-        provider,
-        models: matchesProvider ? (provider.models ?? []) : models,
+        models:
+          !query ||
+          provider.name.toLowerCase().includes(query) ||
+          provider.slug.toLowerCase().includes(query)
+            ? (provider.models ?? [])
+            : (provider.models ?? []).filter((model) => model.toLowerCase().includes(query)),
       }))
       .filter((group) => group.models.length > 0);
   }, [safeOptions.providers, search]);
+
+  function providerIsExpanded(provider: ModelOptionProvider) {
+    if (search.trim()) return true;
+    const explicit = providerExpansion[provider.slug];
+    if (explicit !== undefined) return explicit;
+    const providerIdentity = [provider.slug, provider.name, provider.backend_provider]
+      .filter((value): value is string => typeof value === 'string')
+      .join(' ')
+      .toLowerCase();
+    return (
+      provider.slug === appliedProvider ||
+      providerIdentity.includes('codex') ||
+      providerIdentity.includes('claude')
+    );
+  }
+
+  function toggleProvider(provider: ModelOptionProvider) {
+    const current = providerIsExpanded(provider);
+    setProviderExpansion((values) => ({ ...values, [provider.slug]: !current }));
+  }
 
   const applySelection = useCallback(
     async (provider: ModelOptionProvider, model: string) => {
@@ -257,6 +336,10 @@ function ModelPickerPanel({
 
   function chooseModel(provider: ModelOptionProvider, model: string) {
     if (modelIsUnavailable(provider, model)) return;
+    if (provider.slug === safeOptions.provider && model === safeOptions.model) {
+      requestProfileDefault();
+      return;
+    }
     const changed = provider.slug !== effectiveProvider || model !== effectiveModel;
     const hasTraffic = thread.messages.length > 0 || Boolean(thread.lastResponseId);
     if (changed && hasTraffic) {
@@ -322,158 +405,185 @@ function ModelPickerPanel({
         </View>
       ) : null}
 
-      <View
-        style={[styles.searchBox, { backgroundColor: colors.backgroundElement, borderColor: colors.border }]}>
-        <ThemedText themeColor="textTertiary">⌕</ThemedText>
+      <View style={[styles.searchBox, { backgroundColor: colors.panel }]}>
         <TextInput
-          accessibilityLabel="Search models"
+          accessibilityLabel="Find a model"
+          autoCapitalize="none"
+          autoCorrect={false}
           onChangeText={setSearch}
-          placeholder="Search providers or models"
+          placeholder="Find a model"
           placeholderTextColor={colors.textTertiary}
           style={[styles.searchInput, { color: colors.text }]}
           value={search}
         />
       </View>
 
-      <Pressable
-        accessibilityLabel="Use profile default"
-        accessibilityRole="button"
-        onPress={requestProfileDefault}
-        style={({ pressed }) => [
-          styles.defaultAction,
-          {
-            backgroundColor: override ? colors.backgroundElement : colors.backgroundSelected,
-            borderColor: colors.border,
-            opacity: pressed ? 0.72 : 1,
-          },
-        ]}>
-        <ThemedText type={override ? 'small' : 'smallBold'}>
-          {options?.provider && options?.model
-            ? `Use profile default · ${options.provider}/${options.model}`
-            : 'Use profile default'}
-        </ThemedText>
-        {!override ? <ThemedText style={{ color: colors.success }} type="small">✓</ThemedText> : null}
-      </Pressable>
-
       {groups.map(({ provider, models }) => {
-        const providerCaps = selectedCapabilities(safeOptions, provider.slug, null);
+        const expanded = providerIsExpanded(provider);
+        const narrowed = search.trim().length > 0;
         return (
-          <View key={provider.slug}>
-            <View style={styles.groupHeader}>
-              <ThemedText themeColor="textTertiary" type="eyebrow">{provider.name}</ThemedText>
-              {provider.authenticated === false ? (
-                <Badge color={colors.warning} label="Not authenticated" />
+          <View key={provider.slug} style={styles.providerSection}>
+            <Pressable
+              accessibilityLabel={`${provider.name}, ${models.length} models`}
+              accessibilityRole="button"
+              accessibilityState={{ expanded }}
+              disabled={narrowed}
+              onPress={() => toggleProvider(provider)}
+              style={({ pressed }) => [styles.groupHeader, { opacity: pressed ? 0.6 : 1 }]}>
+              <View style={[styles.providerMark, { backgroundColor: colors.backgroundSelected }]}>
+                <ThemedText
+                  style={styles.providerMarkText}
+                  themeColor="textSecondary"
+                  type="smallBold">
+                  {(provider.name.trim()[0] ?? provider.slug.trim()[0] ?? '•').toUpperCase()}
+                </ThemedText>
+              </View>
+              <ThemedText
+                numberOfLines={1}
+                style={styles.providerName}
+                themeColor="textSecondary"
+                type="smallBold">
+                {provider.name}
+              </ThemedText>
+              {!narrowed && !expanded ? (
+                <ThemedText themeColor="textTertiary" type="small">{models.length}</ThemedText>
               ) : null}
-              {provider.free_tier === true ? <Badge color={colors.success} label="Free tier" /> : null}
-              {typeof provider.warning === 'string' && provider.warning.trim() ? (
-                <Badge color={colors.warning} label={provider.warning.trim()} />
+              {!narrowed ? (
+                <ThemedText style={styles.disclosure} themeColor="textTertiary" type="small">
+                  {expanded ? '⌃' : '⌄'}
+                </ThemedText>
               ) : null}
-              {provider.is_user_defined === true ? (
-                <Badge color={colors.textTertiary} label="Custom" />
-              ) : null}
-              {!providerCaps ? <Badge color={colors.textTertiary} label="capabilities unknown" /> : null}
-            </View>
-            {models.map((model) => {
+            </Pressable>
+            {expanded ? models.map((model, index) => {
               const unavailable = modelIsUnavailable(provider, model);
               const selected = provider.slug === effectiveProvider && model === effectiveModel;
-              const caps = selectedCapabilities(safeOptions, provider.slug, model);
-              const pricing = modelPricingFor(provider, model);
-              const cost = modelCostLabel(pricing);
-              const badges = modelCapabilityBadges(caps);
+              const isDefault =
+                provider.slug === safeOptions.provider && model === safeOptions.model;
+              const first = index === 0;
+              const last = index === models.length - 1;
               return (
                 <Pressable
                   key={model}
                   accessibilityLabel={`Select model ${provider.name} ${model}${unavailable ? ', unavailable' : ''}`}
-                  accessibilityRole="button"
+                  accessibilityRole="radio"
+                  accessibilityState={{ checked: selected, disabled: unavailable }}
                   disabled={unavailable}
                   onPress={() => chooseModel(provider, model)}
                   style={({ pressed }) => [
                     styles.modelRow,
+                    first ? styles.modelRowFirst : null,
+                    last ? styles.modelRowLast : styles.modelRowDivider,
                     {
-                      backgroundColor: selected ? colors.backgroundSelected : 'transparent',
-                      borderColor: selected ? colors.border : 'transparent',
+                      backgroundColor: colors.panel,
+                      borderColor: colors.border,
                       opacity: unavailable ? 0.4 : pressed ? 0.72 : 1,
                     },
                   ]}>
-                  <View style={styles.modelCopy}>
-                    <View style={styles.modelTitleRow}>
-                      <ThemedText numberOfLines={1} type="smallBold">{model}</ThemedText>
-                      {selected ? (
-                        <ThemedText style={{ color: colors.success }} type="small">✓</ThemedText>
-                      ) : null}
-                    </View>
-                    <ThemedText themeColor="textTertiary" type="small">
-                      {cost ?? 'Cost unavailable'}
-                    </ThemedText>
-                    <View style={styles.badgeRow}>
-                      {badges.length ? (
-                        badges.map((badge) => (
-                          <Badge key={badge} color={colors.textTertiary} label={badge} />
-                        ))
-                      ) : (
-                        <Badge color={colors.textDisabled} label="capabilities unknown" />
-                      )}
-                      {unavailable ? <Badge color={colors.danger} label="Unavailable" /> : null}
-                    </View>
-                  </View>
+                  <ThemedText numberOfLines={1} style={styles.modelName} type="default">
+                    {model}
+                  </ThemedText>
+                  {isDefault ? <Badge color={colors.textTertiary} label="Default" /> : null}
+                  {unavailable ? <Badge color={colors.textDisabled} label="Unavailable" /> : null}
+                  <View style={styles.modelRowSpacer} />
+                  {selected ? (
+                    <ThemedText style={styles.modelCheck} type="default">✓</ThemedText>
+                  ) : null}
                 </Pressable>
               );
-            })}
+            }) : null}
           </View>
         );
       })}
       {!optionsLoading && groups.length === 0 ? (
         <ThemedText style={styles.emptyModels} themeColor="textTertiary" type="small">
-          No models match “{search.trim()}”.
+          No matching models
         </ThemedText>
       ) : null}
 
-      {effortChoices.length ? (
-        <View style={[styles.settingBlock, { borderColor: colors.border }]}>
-          <ThemedText type="smallBold">Reasoning effort</ThemedText>
-          <View style={styles.choiceRow}>
-            {effortChoices.map((choice) => {
-              const active = (draftEffort ?? override?.reasoningEffort) === choice;
-              return (
+      {effortChoices.length || effectiveCaps?.fast === true ? (
+        <View style={styles.optionsSection}>
+          <ThemedText style={styles.sectionLabel} themeColor="textSecondary" type="smallBold">
+            Options
+          </ThemedText>
+          <View style={[styles.optionsCard, { backgroundColor: colors.panel }]}>
+            {effortChoices.length ? (
+              <>
                 <Pressable
-                  key={choice}
-                  accessibilityLabel={`Reasoning effort ${choice}`}
+                  accessibilityLabel="Reasoning effort"
                   accessibilityRole="button"
-                  accessibilityState={{ selected: active }}
-                  onPress={() => {
-                    setDraftEffort(choice);
-                    void updateOverride({ reasoningEffort: choice });
-                  }}
+                  accessibilityState={{ expanded: reasoningExpanded }}
+                  onPress={() => setReasoningExpanded((expanded) => !expanded)}
                   style={[
-                    styles.choice,
-                    {
-                      backgroundColor: active ? colors.accent : colors.backgroundElement,
-                      borderColor: colors.border,
-                    },
+                    styles.optionRow,
+                    effectiveCaps?.fast === true || reasoningExpanded
+                      ? {
+                          borderBottomColor: colors.border,
+                          borderBottomWidth: StyleSheet.hairlineWidth,
+                        }
+                      : null,
                   ]}>
-                  <ThemedText
-                    style={{ color: active ? colors.accentText : colors.text }}
-                    type="small">
-                    {choice}
+                  <ThemedText type="smallBold">Reasoning effort</ThemedText>
+                  <View style={styles.modelRowSpacer} />
+                  <ThemedText themeColor="textSecondary" type="small">
+                    {draftEffort ?? override?.reasoningEffort ?? 'Default'}
                   </ThemedText>
+                  <ThemedText themeColor="textTertiary" type="small">›</ThemedText>
                 </Pressable>
-              );
-            })}
+                {reasoningExpanded ? (
+                  <View
+                    style={[
+                      styles.reasoningChoices,
+                      effectiveCaps?.fast === true
+                        ? {
+                            borderBottomColor: colors.border,
+                            borderBottomWidth: StyleSheet.hairlineWidth,
+                          }
+                        : null,
+                    ]}>
+                    {effortChoices.map((choice) => {
+                      const active = (draftEffort ?? override?.reasoningEffort) === choice;
+                      return (
+                        <Pressable
+                          key={choice}
+                          accessibilityLabel={`Reasoning effort ${choice}`}
+                          accessibilityRole="radio"
+                          accessibilityState={{ checked: active }}
+                          onPress={() => {
+                            setDraftEffort(choice);
+                            setReasoningExpanded(false);
+                            void updateOverride({ reasoningEffort: choice });
+                          }}
+                          style={[
+                            styles.choice,
+                            {
+                              backgroundColor: active
+                                ? colors.backgroundSelected
+                                : colors.backgroundElement,
+                            },
+                          ]}>
+                          <ThemedText type={active ? 'smallBold' : 'small'}>{choice}</ThemedText>
+                        </Pressable>
+                      );
+                    })}
+                  </View>
+                ) : null}
+              </>
+            ) : null}
+            {effectiveCaps?.fast === true ? (
+              <View style={styles.optionRow}>
+                <ThemedText type="smallBold">Fast mode</ThemedText>
+                <View style={styles.modelRowSpacer} />
+                <Switch
+                  accessibilityLabel="Fast mode toggle"
+                  onValueChange={(value) => {
+                    setDraftFast(value);
+                    void updateOverride({ fast: value });
+                  }}
+                  value={draftFast ?? override?.fast ?? false}
+                />
+              </View>
+            ) : null}
           </View>
-        </View>
-      ) : null}
-
-      {effectiveCaps?.fast === true ? (
-        <View style={[styles.settingBlock, { borderColor: colors.border }]}>
-          <ThemedText type="smallBold">Fast mode</ThemedText>
-          <Switch
-            accessibilityLabel="Fast mode toggle"
-            onValueChange={(value) => {
-              setDraftFast(value);
-              void updateOverride({ fast: value });
-            }}
-            value={draftFast ?? override?.fast ?? false}
-          />
         </View>
       ) : null}
 
@@ -756,6 +866,18 @@ const styles = StyleSheet.create({
   },
   barDot: { borderRadius: 4, height: 7, width: 7 },
   barLabel: { flex: 1 },
+  inline: {
+    alignItems: 'center',
+    alignSelf: 'flex-start',
+    borderRadius: 999,
+    borderWidth: StyleSheet.hairlineWidth,
+    flexDirection: 'row',
+    gap: Spacing.one,
+    height: 34,
+    maxWidth: 190,
+    paddingHorizontal: Spacing.three,
+  },
+  inlineLabel: { flexShrink: 1 },
   modalRoot: { flex: 1 },
   modalHeader: {
     alignItems: 'center',
@@ -763,8 +885,12 @@ const styles = StyleSheet.create({
     flexDirection: 'row',
     justifyContent: 'space-between',
     minHeight: 56,
-    paddingHorizontal: Spacing.four,
+    paddingHorizontal: Spacing.three,
   },
+  headerAction: { alignItems: 'center', height: 44, justifyContent: 'center', width: 44 },
+  headerBack: { fontSize: 34, fontWeight: '300', lineHeight: 38 },
+  headerCheck: { fontSize: 19, fontWeight: '700', lineHeight: 24 },
+  headerTitle: { flex: 1, fontSize: 18, textAlign: 'left' },
   panelSwitch: { flexDirection: 'row', gap: Spacing.two, paddingHorizontal: Spacing.four, paddingVertical: Spacing.two },
   panelTab: {
     borderRadius: 10,
@@ -773,42 +899,61 @@ const styles = StyleSheet.create({
     paddingHorizontal: Spacing.three,
     justifyContent: 'center',
   },
-  pickerContent: { paddingBottom: Spacing.five, paddingHorizontal: Spacing.four, paddingTop: Spacing.two },
+  pickerContent: { paddingBottom: Spacing.five, paddingTop: 4 },
   usageContent: { gap: Spacing.two, paddingBottom: Spacing.five, paddingHorizontal: Spacing.four, paddingTop: Spacing.two },
-  stateRow: { alignItems: 'center', flexDirection: 'row', gap: Spacing.two, paddingVertical: Spacing.two },
-  searchBox: {
+  stateRow: {
     alignItems: 'center',
-    borderRadius: 10,
-    borderWidth: StyleSheet.hairlineWidth,
     flexDirection: 'row',
     gap: Spacing.two,
-    marginBottom: Spacing.two,
-    paddingHorizontal: Spacing.three,
-  },
-  searchInput: { flex: 1, fontSize: 14, minHeight: 40, outlineStyle: 'none' } as never,
-  defaultAction: {
-    alignItems: 'center',
-    borderRadius: 10,
-    borderWidth: StyleSheet.hairlineWidth,
-    flexDirection: 'row',
-    gap: Spacing.two,
-    justifyContent: 'space-between',
-    marginBottom: Spacing.three,
-    minHeight: 44,
-    paddingHorizontal: Spacing.three,
-  },
-  groupHeader: { alignItems: 'center', flexDirection: 'row', flexWrap: 'wrap', gap: Spacing.one, marginTop: Spacing.two, paddingHorizontal: Spacing.one },
-  modelRow: {
-    borderRadius: 10,
-    borderWidth: StyleSheet.hairlineWidth,
-    marginBottom: Spacing.one,
-    minHeight: 56,
-    paddingHorizontal: Spacing.three,
+    paddingHorizontal: Spacing.four,
     paddingVertical: Spacing.two,
   },
-  modelCopy: { gap: 2 },
-  modelTitleRow: { alignItems: 'center', flexDirection: 'row', gap: Spacing.two, justifyContent: 'space-between' },
-  badgeRow: { alignItems: 'center', flexDirection: 'row', flexWrap: 'wrap', gap: Spacing.one, marginTop: 2 },
+  searchBox: {
+    alignItems: 'center',
+    borderRadius: 12,
+    flexDirection: 'row',
+    marginBottom: 8,
+    marginHorizontal: Spacing.four,
+    marginTop: 12,
+    paddingHorizontal: Spacing.four,
+  },
+  searchInput: { flex: 1, fontSize: 16, minHeight: 44, outlineStyle: 'none' } as never,
+  providerSection: { width: '100%' },
+  groupHeader: {
+    alignItems: 'center',
+    flexDirection: 'row',
+    gap: 8,
+    marginHorizontal: Spacing.four,
+    marginTop: 4,
+    minHeight: 44,
+    paddingHorizontal: 4,
+    paddingTop: 8,
+  },
+  providerMark: {
+    alignItems: 'center',
+    borderRadius: 8,
+    height: 22,
+    justifyContent: 'center',
+    width: 22,
+  },
+  providerMarkText: { fontSize: 11, lineHeight: 14 },
+  providerName: { flex: 1 },
+  disclosure: { fontSize: 16, lineHeight: 18, width: 18 },
+  modelRow: {
+    alignItems: 'center',
+    flexDirection: 'row',
+    gap: 8,
+    marginHorizontal: Spacing.four,
+    minHeight: 44,
+    paddingHorizontal: Spacing.four,
+    paddingVertical: 8,
+  },
+  modelRowFirst: { borderTopLeftRadius: 16, borderTopRightRadius: 16 },
+  modelRowLast: { borderBottomLeftRadius: 16, borderBottomRightRadius: 16 },
+  modelRowDivider: { borderBottomWidth: StyleSheet.hairlineWidth },
+  modelName: { flexShrink: 1, fontSize: 16, fontWeight: '600', lineHeight: 20 },
+  modelRowSpacer: { flex: 1 },
+  modelCheck: { fontSize: 16, fontWeight: '700', lineHeight: 20 },
   badge: {
     borderRadius: 6,
     borderWidth: StyleSheet.hairlineWidth,
@@ -816,19 +961,27 @@ const styles = StyleSheet.create({
     paddingHorizontal: 6,
     paddingVertical: 1,
   },
-  emptyModels: { paddingVertical: Spacing.three, textAlign: 'center' },
-  settingBlock: {
-    borderRadius: 12,
-    borderWidth: StyleSheet.hairlineWidth,
+  emptyModels: { paddingHorizontal: Spacing.four, paddingVertical: 56, textAlign: 'center' },
+  optionsSection: { marginTop: 8, paddingBottom: 12 },
+  sectionLabel: { paddingBottom: 8, paddingHorizontal: 20, paddingTop: 8 },
+  optionsCard: { borderRadius: 16, marginHorizontal: Spacing.four, overflow: 'hidden' },
+  optionRow: {
+    alignItems: 'center',
+    flexDirection: 'row',
+    gap: 8,
+    minHeight: 48,
+    paddingHorizontal: Spacing.four,
+    paddingVertical: 6,
+  },
+  reasoningChoices: {
+    flexDirection: 'row',
+    flexWrap: 'wrap',
     gap: Spacing.two,
-    marginTop: Spacing.three,
     padding: Spacing.three,
   },
-  choiceRow: { flexDirection: 'row', flexWrap: 'wrap', gap: Spacing.two },
   choice: {
     alignItems: 'center',
     borderRadius: 9,
-    borderWidth: StyleSheet.hairlineWidth,
     minHeight: 34,
     justifyContent: 'center',
     paddingHorizontal: Spacing.three,

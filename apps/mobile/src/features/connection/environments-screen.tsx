@@ -1,6 +1,5 @@
 import { useQuery } from '@tanstack/react-query';
 import { useRouter } from 'expo-router';
-import { SymbolView } from 'expo-symbols';
 import { useState } from 'react';
 import { Alert, Platform, Pressable, ScrollView, StyleSheet, View } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
@@ -39,13 +38,6 @@ export function EnvironmentsScreen() {
           </Card>
         ) : (
           <Card style={styles.emptyCard}>
-            <View style={[styles.emptyIcon, { backgroundColor: colors.subtle }]}>
-              <SymbolView
-                name="point.3.connected.trianglepath.dotted"
-                size={22}
-                tintColor={colors.secondary}
-              />
-            </View>
             <AppText style={styles.emptyTitle}>No environments connected</AppText>
             <AppText style={[styles.emptyDetail, { color: colors.muted }]}>
               Add a Hermes machine to access its conversations and tools.
@@ -166,12 +158,9 @@ function EnvironmentRow({ active, connection }: { active: boolean; connection: A
             {statusLabel}
           </AppText>
         </View>
-        <SymbolView
-          name="chevron.down"
-          size={13}
-          tintColor={colors.tertiary}
-          style={{ transform: [{ rotate: expanded ? '180deg' : '0deg' }] }}
-        />
+        <AppText style={[styles.expandLabel, { color: colors.tertiary }]}>
+          {expanded ? '⌃' : '⌄'}
+        </AppText>
       </Pressable>
 
       {expanded ? (
@@ -256,13 +245,6 @@ const styles = StyleSheet.create({
   },
   divider: { height: StyleSheet.hairlineWidth, marginLeft: 42 },
   emptyCard: { alignItems: 'center', gap: T3Spacing.md, padding: T3Spacing.xxl },
-  emptyIcon: {
-    alignItems: 'center',
-    borderRadius: T3Radius.medium,
-    height: 50,
-    justifyContent: 'center',
-    width: 50,
-  },
   emptyTitle: { fontFamily: T3Typography.bold, fontSize: 17, textAlign: 'center' },
   emptyDetail: { fontSize: 13, lineHeight: 19, textAlign: 'center' },
   note: { fontSize: 12, lineHeight: 17, textAlign: 'center' },
@@ -278,6 +260,7 @@ const styles = StyleSheet.create({
   rowName: { flexShrink: 1, fontFamily: T3Typography.bold, fontSize: 15, lineHeight: 20 },
   rowURL: { fontSize: 12, lineHeight: 17 },
   rowStatus: { fontSize: 11, lineHeight: 15 },
+  expandLabel: { fontFamily: T3Typography.bold, fontSize: 17, lineHeight: 21 },
   activeBadge: { borderRadius: T3Radius.pill, paddingHorizontal: T3Spacing.sm, paddingVertical: 2 },
   activeText: { fontFamily: T3Typography.bold, fontSize: 10, lineHeight: 14 },
   expanded: { borderTopWidth: StyleSheet.hairlineWidth, gap: T3Spacing.md, padding: T3Spacing.lg },

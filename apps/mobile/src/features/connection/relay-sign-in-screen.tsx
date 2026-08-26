@@ -1,7 +1,6 @@
 import { useAuth, useClerk, useUser } from '@clerk/expo';
 import * as Device from 'expo-device';
 import { Stack, useRouter } from 'expo-router';
-import { SymbolView } from 'expo-symbols';
 import type { ReactNode } from 'react';
 import { useEffect, useLayoutEffect, useRef, useState } from 'react';
 import {
@@ -353,7 +352,7 @@ function RelayScreenFrame({
               onPress={close}
               style={({ pressed }) => [styles.headerIcon, { opacity: pressed ? 0.5 : 1 }]}
             >
-              <SymbolView name="xmark" size={17} tintColor={colors.foreground} />
+              <AppText style={styles.headerClose}>Close</AppText>
             </Pressable>
           ),
           title: 'Connect Relay',
@@ -370,9 +369,6 @@ function RelayScreenFrame({
           showsVerticalScrollIndicator={false}
         >
           <View style={styles.intro}>
-            <View style={[styles.heroIcon, { backgroundColor: colors.subtleStrong }]}>
-              <SymbolView name="network" size={25} tintColor={colors.foreground} />
-            </View>
             <AppText style={styles.title}>{title}</AppText>
             <AppText style={[styles.detail, { color: colors.muted }]}>{detail}</AppText>
           </View>
@@ -433,7 +429,8 @@ function explainRelayError(reason: unknown) {
 
 const styles = StyleSheet.create({
   safe: { flex: 1 },
-  headerIcon: { alignItems: 'center', height: 40, justifyContent: 'center', width: 40 },
+  headerIcon: { alignItems: 'center', height: 40, justifyContent: 'center', minWidth: 58 },
+  headerClose: { fontFamily: T3Typography.bold, fontSize: 13, lineHeight: 17 },
   content: {
     alignSelf: 'center',
     gap: T3Spacing.lg,
@@ -447,14 +444,6 @@ const styles = StyleSheet.create({
     gap: T3Spacing.sm,
     marginBottom: T3Spacing.sm,
     paddingHorizontal: T3Spacing.md,
-  },
-  heroIcon: {
-    alignItems: 'center',
-    borderRadius: T3Radius.medium,
-    height: 52,
-    justifyContent: 'center',
-    marginBottom: T3Spacing.xs,
-    width: 52,
   },
   title: {
     fontFamily: T3Typography.bold,

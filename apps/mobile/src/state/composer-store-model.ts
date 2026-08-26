@@ -1,3 +1,5 @@
+import type { ChatModelOverride } from './chat-thread-model.ts';
+
 export type QueuedPromptState = 'pending' | 'sending' | 'failed';
 export type PromptDeliveryMode = 'queue' | 'redirect';
 
@@ -15,6 +17,8 @@ export type QueuedPrompt = {
   text: string;
   attachments: ComposerAttachment[];
   deliveryMode: PromptDeliveryMode;
+  /** Runtime choice captured when the prompt was queued. */
+  modelOverride?: ChatModelOverride;
   createdAt: number;
   state: QueuedPromptState;
   attemptedAt?: number;
@@ -104,6 +108,7 @@ export function enqueueComposerDraft(
   id: string,
   createdAt: number,
   deliveryMode: PromptDeliveryMode = 'queue',
+  modelOverride?: ChatModelOverride,
 ): EnqueuedComposerDraft | null {
   const text = state.drafts[threadKey] ?? '';
   const attachments = state.attachments[threadKey] ?? [];
@@ -113,6 +118,7 @@ export function enqueueComposerDraft(
     text,
     attachments,
     deliveryMode,
+    ...(modelOverride ? { modelOverride } : {}),
     createdAt,
     state: 'pending',
   };
@@ -303,6 +309,7 @@ function storedQueuedPrompt(value: unknown): QueuedPrompt | null {
   const candidate = value as Partial<QueuedPrompt>;
   const attachments = candidate.attachments ?? [];
   const deliveryMode = candidate.deliveryMode ?? 'queue';
+  const modelOverride = storedModelOverride(candidate.modelOverride);
   if (!(
     typeof candidate.id === 'string' &&
     candidate.id.length > 0 &&
@@ -312,6 +319,7 @@ function storedQueuedPrompt(value: unknown): QueuedPrompt | null {
     attachments.every(isComposerAttachment) &&
     (candidate.text.trim().length > 0 || attachments.length > 0) &&
     isPromptDeliveryMode(deliveryMode) &&
+    (candidate.modelOverride === undefined || modelOverride !== null) &&
     typeof candidate.createdAt === 'number' &&
     Number.isFinite(candidate.createdAt) &&
     isQueuedPromptState(candidate.state) &&
@@ -319,7 +327,39 @@ function storedQueuedPrompt(value: unknown): QueuedPrompt | null {
       (typeof candidate.attemptedAt === 'number' && Number.isFinite(candidate.attemptedAt))) &&
     (candidate.error === undefined || typeof candidate.error === 'string')
   )) return null;
-  return { ...candidate, attachments, deliveryMode } as QueuedPrompt;
+  return {
+    ...candidate,
+    attachments,
+    deliveryMode,
+    ...(modelOverride ? { modelOverride } : {}),
+  } as QueuedPrompt;
+}
+
+function storedModelOverride(value: unknown): ChatModelOverride | null {
+  if (value === undefined) return null;
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+  const candidate = value as Partial<ChatModelOverride>;
+  if (
+    typeof candidate.provider !== 'string' ||
+    !candidate.provider.trim() ||
+    candidate.provider.length > 256 ||
+    typeof candidate.model !== 'string' ||
+    !candidate.model.trim() ||
+    candidate.model.length > 256 ||
+    (candidate.reasoningEffort !== undefined &&
+      (typeof candidate.reasoningEffort !== 'string' ||
+        !candidate.reasoningEffort.trim() ||
+        candidate.reasoningEffort.length > 64)) ||
+    (candidate.fast !== undefined && typeof candidate.fast !== 'boolean')
+  ) {
+    return null;
+  }
+  return {
+    provider: candidate.provider,
+    model: candidate.model,
+    ...(candidate.reasoningEffort ? { reasoningEffort: candidate.reasoningEffort } : {}),
+    ...(typeof candidate.fast === 'boolean' ? { fast: candidate.fast } : {}),
+  };
 }
 
 function normalizeQueuedPrompt(prompt: QueuedPrompt): QueuedPrompt {

@@ -18,6 +18,7 @@ import {
   type PromptDeliveryMode,
   type StoredComposerState,
 } from '@/state/composer-store-model';
+import type { ChatModelOverride } from '@/state/chat-thread-model';
 
 const STORAGE_KEY = 'brio.composer.v1';
 const DRAFT_SAVE_DELAY_MS = 250;
@@ -32,7 +33,11 @@ type ComposerState = StoredComposerState & {
   ensureSessionId: (threadKey: string, proposedId: string) => Promise<string>;
   addAttachment: (threadKey: string, attachment: ComposerAttachment) => Promise<void>;
   removeAttachment: (threadKey: string, attachmentId: string) => Promise<boolean>;
-  enqueueDraft: (threadKey: string, deliveryMode?: PromptDeliveryMode) => Promise<QueuedPrompt | null>;
+  enqueueDraft: (
+    threadKey: string,
+    deliveryMode?: PromptDeliveryMode,
+    modelOverride?: ChatModelOverride,
+  ) => Promise<QueuedPrompt | null>;
   undoDraft: (threadKey: string) => void;
   redoDraft: (threadKey: string) => void;
   claimNext: (threadKey: string) => Promise<QueuedPrompt | null>;
@@ -175,13 +180,14 @@ export const useComposerStore = create<ComposerState>((set, get) => {
       set(storedSlice(next));
       return save(next);
     },
-    enqueueDraft: async (threadKey, deliveryMode = 'queue') => {
+    enqueueDraft: async (threadKey, deliveryMode = 'queue', modelOverride) => {
       const enqueued = enqueueComposerDraft(
         storedSlice(get()),
         threadKey,
         promptId(),
         Date.now(),
         deliveryMode,
+        modelOverride,
       );
       if (!enqueued) return null;
       set(storedSlice(enqueued.state));

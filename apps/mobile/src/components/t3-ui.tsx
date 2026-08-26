@@ -178,7 +178,7 @@ export function EmptyState({
   const colors = useT3Theme();
   return (
     <View style={styles.empty}>
-      {loading ? <ActivityIndicator /> : <View style={[styles.emptyMark, { backgroundColor: colors.subtle }]} />}
+      {loading ? <ActivityIndicator /> : null}
       <AppText style={styles.emptyTitle}>{title}</AppText>
       <AppText style={[styles.emptyDetail, { color: colors.muted }]}>{detail}</AppText>
       {action}
@@ -246,7 +246,6 @@ const styles = StyleSheet.create({
     justifyContent: 'center',
     padding: T3Spacing.huge,
   },
-  emptyMark: { borderRadius: 16, height: 48, marginBottom: T3Spacing.xs, width: 48 },
   emptyTitle: { fontFamily: T3Typography.bold, fontSize: 18, lineHeight: 23, textAlign: 'center' },
   emptyDetail: { fontSize: 14, lineHeight: 19, maxWidth: 360, textAlign: 'center' },
 });

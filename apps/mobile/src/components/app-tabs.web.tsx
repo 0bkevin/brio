@@ -6,7 +6,6 @@ import {
   type TabListProps,
   type TabTriggerSlotProps,
 } from 'expo-router/ui';
-import { SymbolView, type SymbolViewProps } from 'expo-symbols';
 import { Pressable, StyleSheet, View } from 'react-native';
 
 import { SectionLabel, StatusBadge, ThemeSwitcher } from './dashboard';
@@ -31,10 +30,10 @@ export default function AppTabs() {
       <TabList asChild>
         <SidebarNav>
           <TabTrigger name="chat" href="/" asChild>
-            <SidebarButton icon="message" label="Chat" />
+            <SidebarButton label="Chat" />
           </TabTrigger>
           <TabTrigger name="manage" href="/explore" asChild>
-            <SidebarButton icon="gearshape" label="Manage" />
+            <SidebarButton label="Manage" />
           </TabTrigger>
         </SidebarNav>
       </TabList>
@@ -56,10 +55,10 @@ function SidebarNav({ children, compact, ...props }: TabListProps & { compact?: 
       ]}>
       <View style={[styles.brandBlock, compact && styles.compactHidden, { borderColor: colors.border }]}>
         <ThemedText type="brand" style={styles.brandText}>
-          Brio
+          Hermes
         </ThemedText>
         <ThemedText type="small" themeColor="textSecondary">
-          Hermes Agent
+          Connected agent
         </ThemedText>
       </View>
 
@@ -94,11 +93,10 @@ function SidebarNav({ children, compact, ...props }: TabListProps & { compact?: 
 }
 
 function SidebarButton({
-  icon,
   isFocused,
   label,
   ...props
-}: TabTriggerSlotProps & { icon: SymbolViewProps['name']; label: string }) {
+}: TabTriggerSlotProps & { label: string }) {
   const colors = useTheme();
 
   return (
@@ -112,7 +110,6 @@ function SidebarButton({
           opacity: pressed ? 0.75 : 1,
         },
       ]}>
-      <SymbolView name={icon} size={16} tintColor={isFocused ? colors.text : colors.textSecondary} />
       <ThemedText type="eyebrow" themeColor={isFocused ? 'text' : 'textSecondary'} style={styles.navLabel}>
         {label}
       </ThemedText>

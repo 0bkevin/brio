@@ -38,6 +38,8 @@ export function ComposerControls({
   draft,
   history,
   hydrated,
+  forceExpanded = false,
+  modelControl,
   onAddAttachment,
   onDraftChange,
   onRedo,
@@ -45,6 +47,7 @@ export function ComposerControls({
   onSend,
   onUndo,
   profile,
+  sendDisabled = false,
   sessionId,
 }: {
   active: boolean;
@@ -55,6 +58,8 @@ export function ComposerControls({
   draft: string;
   history: string[];
   hydrated: boolean;
+  forceExpanded?: boolean;
+  modelControl?: ReactNode;
   onAddAttachment: (attachment: ComposerAttachment) => Promise<void>;
   onDraftChange: (text: string) => void;
   onRedo: () => void;
@@ -62,6 +67,7 @@ export function ComposerControls({
   onSend: (mode: PromptDeliveryMode) => void;
   onUndo: () => void;
   profile: string;
+  sendDisabled?: boolean;
   sessionId: string;
 }) {
   const colors = useTheme();
@@ -70,6 +76,7 @@ export function ComposerControls({
   const [pickerOpen, setPickerOpen] = useState(false);
   const [historyOpen, setHistoryOpen] = useState(false);
   const [commandsOpen, setCommandsOpen] = useState(false);
+  const [inputFocused, setInputFocused] = useState(false);
   const [uploads, setUploads] = useState<UploadState[]>([]);
   const [error, setError] = useState('');
   const token = completionToken(draft);
@@ -94,7 +101,21 @@ export function ComposerControls({
     enabled: commandsOpen,
     staleTime: 60_000,
   });
-  const canSend = hydrated && (Boolean(draft.trim()) || attachments.length > 0) && uploads.length === 0;
+  const canSend =
+    hydrated &&
+    !sendDisabled &&
+    (Boolean(draft.trim()) || attachments.length > 0) &&
+    uploads.length === 0;
+  const expanded =
+    forceExpanded ||
+    inputFocused ||
+    pickerOpen ||
+    historyOpen ||
+    commandsOpen ||
+    attachments.length > 0 ||
+    uploads.length > 0 ||
+    Boolean(error) ||
+    Boolean(incomingShare.error);
 
   const uploadSources = useCallback(async (sources: AttachmentSource[]) => {
     setPickerOpen(false);
@@ -278,34 +299,74 @@ export function ComposerControls({
         </View>
       ) : null}
 
-      <View style={styles.toolbar}>
-        <ToolbarAction label="Attach" onPress={() => setPickerOpen(true)} />
-        <ToolbarAction label="Commands" onPress={() => setCommandsOpen(true)} />
-        <ToolbarAction label="History" onPress={() => setHistoryOpen(true)} />
-        <ToolbarAction disabled={!canUndo} label="Undo" onPress={onUndo} />
-        <ToolbarAction disabled={!canRedo} label="Redo" onPress={onRedo} />
-        {active ? <ToolbarAction disabled={!canSend} label="Redirect" onPress={() => onSend('redirect')} tone="warning" /> : null}
-      </View>
-
-      <View style={[styles.composer, { backgroundColor: colors.panelStrong, borderColor: colors.border }]}>
-        <TextInput
-          accessibilityLabel="Message Brio"
-          maxLength={20000}
-          multiline
-          onChangeText={onDraftChange}
-          placeholder={active ? 'Queue a follow-up or redirect this run…' : 'Message Brio…'}
-          placeholderTextColor={colors.textTertiary}
-          style={[styles.input, { color: colors.text }]}
-          textAlignVertical="top"
-          value={draft}
-        />
-        <Pressable
-          accessibilityLabel={active ? 'Queue message' : 'Send message'}
-          disabled={!canSend}
-          onPress={() => onSend('queue')}
-          style={({ pressed }) => [styles.send, { backgroundColor: canSend ? colors.accent : colors.backgroundSelected, opacity: pressed ? 0.72 : 1 }]}>
-          <ThemedText style={{ color: canSend ? colors.accentText : colors.textDisabled, fontSize: 20 }}>↑</ThemedText>
-        </Pressable>
+      <View
+        style={[
+          styles.composer,
+          expanded ? styles.composerExpanded : styles.composerCollapsed,
+          { backgroundColor: colors.panelStrong, borderColor: colors.border },
+        ]}>
+        <View style={expanded ? styles.expandedInputRow : styles.collapsedInputRow}>
+          <TextInput
+            accessibilityLabel="Ask Hermes anything"
+            maxLength={20000}
+            multiline
+            onBlur={() => setInputFocused(false)}
+            onChangeText={onDraftChange}
+            onFocus={() => setInputFocused(true)}
+            placeholder={active ? 'Ask a follow-up…' : 'Ask Hermes anything…'}
+            placeholderTextColor={colors.textTertiary}
+            scrollEnabled={expanded}
+            style={[
+              styles.input,
+              expanded ? styles.inputExpanded : styles.inputCollapsed,
+              { color: colors.text },
+            ]}
+            textAlignVertical={expanded ? 'top' : 'center'}
+            value={draft}
+          />
+          {!expanded ? (
+            <Pressable
+              accessibilityLabel={active ? 'Queue message' : 'Send message'}
+              disabled={!canSend}
+              onPress={() => onSend('queue')}
+              style={({ pressed }) => [
+                styles.send,
+                {
+                  backgroundColor: canSend ? colors.accent : colors.backgroundSelected,
+                  opacity: pressed ? 0.72 : 1,
+                },
+              ]}>
+              <ThemedText
+                style={{ color: canSend ? colors.accentText : colors.textDisabled, fontSize: 20 }}>
+                ↑
+              </ThemedText>
+            </Pressable>
+          ) : null}
+        </View>
+        {expanded ? (
+          <View style={styles.composerFooter}>
+            <ScrollView
+              contentContainerStyle={styles.toolbar}
+              horizontal
+              keyboardShouldPersistTaps="handled"
+              showsHorizontalScrollIndicator={false}>
+              <ToolbarAction label="+" accessibilityLabel="Attach context" onPress={() => setPickerOpen(true)} />
+              {modelControl}
+              <ToolbarAction label="Commands" onPress={() => setCommandsOpen(true)} />
+              {history.length > 0 ? <ToolbarAction label="History" onPress={() => setHistoryOpen(true)} /> : null}
+              {canUndo ? <ToolbarAction label="Undo" onPress={onUndo} /> : null}
+              {canRedo ? <ToolbarAction label="Redo" onPress={onRedo} /> : null}
+              {active ? <ToolbarAction disabled={!canSend} label="Redirect" onPress={() => onSend('redirect')} tone="warning" /> : null}
+            </ScrollView>
+            <Pressable
+              accessibilityLabel={active ? 'Queue message' : 'Send message'}
+              disabled={!canSend}
+              onPress={() => onSend('queue')}
+              style={({ pressed }) => [styles.send, { backgroundColor: canSend ? colors.accent : colors.backgroundSelected, opacity: pressed ? 0.72 : 1 }]}>
+              <ThemedText style={{ color: canSend ? colors.accentText : colors.textDisabled, fontSize: 20 }}>↑</ThemedText>
+            </Pressable>
+          </View>
+        ) : null}
       </View>
 
       <PickerModal onClose={() => setPickerOpen(false)} onDocuments={() => void chooseDocuments()} onImages={() => void chooseImages()} onPhoto={() => void takePhoto()} visible={pickerOpen} />
@@ -328,11 +389,18 @@ function AttachmentChip({ detail, name, onRemove, tone = 'normal' }: { detail: s
   );
 }
 
-function ToolbarAction({ disabled, label, onPress, tone = 'normal' }: { disabled?: boolean; label: string; onPress: () => void; tone?: 'normal' | 'warning' }) {
+function ToolbarAction({ accessibilityLabel, disabled, label, onPress, tone = 'normal' }: { accessibilityLabel?: string; disabled?: boolean; label: string; onPress: () => void; tone?: 'normal' | 'warning' }) {
   const colors = useTheme();
   return (
-    <Pressable accessibilityLabel={label} disabled={disabled} onPress={onPress}>
-      <ThemedText style={{ color: tone === 'warning' ? colors.warning : colors.textSecondary, opacity: disabled ? 0.35 : 1 }} type="smallBold">{label}</ThemedText>
+    <Pressable
+      accessibilityLabel={accessibilityLabel ?? label}
+      disabled={disabled}
+      onPress={onPress}
+      style={({ pressed }) => [
+        styles.toolbarAction,
+        { backgroundColor: colors.backgroundSelected, opacity: disabled ? 0.35 : pressed ? 0.6 : 1 },
+      ]}>
+      <ThemedText style={{ color: tone === 'warning' ? colors.warning : colors.textSecondary }} type="smallBold">{label}</ThemedText>
     </Pressable>
   );
 }
@@ -414,10 +482,31 @@ function formatBytes(value: number) {
 }
 
 const styles = StyleSheet.create({
-  toolbar: { alignItems: 'center', flexDirection: 'row', flexWrap: 'wrap', gap: Spacing.three, paddingBottom: Spacing.two },
-  composer: { alignItems: 'flex-end', borderRadius: 18, borderWidth: StyleSheet.hairlineWidth, flexDirection: 'row', gap: Spacing.two, minHeight: 58, padding: Spacing.two, paddingLeft: Spacing.three },
-  input: { flex: 1, fontSize: 16, lineHeight: 23, maxHeight: 150, minHeight: 40, outlineStyle: 'none', paddingBottom: 8, paddingTop: 8 } as never,
-  send: { alignItems: 'center', borderRadius: 13, height: 42, justifyContent: 'center', width: 42 },
+  toolbar: { alignItems: 'center', flexDirection: 'row', gap: Spacing.two, paddingRight: Spacing.two },
+  toolbarAction: { borderRadius: 999, minHeight: 34, justifyContent: 'center', paddingHorizontal: 11 },
+  composer: { borderWidth: StyleSheet.hairlineWidth, overflow: 'hidden' },
+  composerCollapsed: {
+    borderRadius: 999,
+    minHeight: 54,
+    paddingBottom: 5,
+    paddingLeft: 18,
+    paddingRight: 5,
+    paddingTop: 5,
+  },
+  composerExpanded: {
+    borderRadius: 26,
+    minHeight: 140,
+    paddingBottom: 6,
+    paddingHorizontal: 14,
+    paddingTop: 14,
+  },
+  collapsedInputRow: { alignItems: 'center', flexDirection: 'row' },
+  expandedInputRow: { minHeight: 72 },
+  input: { flex: 1, fontSize: 16, lineHeight: 23, outlineStyle: 'none' } as never,
+  inputCollapsed: { height: 36, paddingBottom: 4, paddingTop: 4 },
+  inputExpanded: { maxHeight: 150, minHeight: 72, paddingHorizontal: 4, paddingVertical: 4 },
+  composerFooter: { alignItems: 'center', flexDirection: 'row', gap: Spacing.two },
+  send: { alignItems: 'center', borderRadius: 22, height: 44, justifyContent: 'center', width: 44 },
   attachmentList: { gap: Spacing.two, paddingBottom: Spacing.two },
   attachmentChip: { alignItems: 'center', borderRadius: 10, borderWidth: StyleSheet.hairlineWidth, flexDirection: 'row', gap: Spacing.two, paddingHorizontal: Spacing.two, paddingVertical: Spacing.one },
   completions: { borderRadius: 12, borderWidth: StyleSheet.hairlineWidth, marginBottom: Spacing.two, maxHeight: 220 },

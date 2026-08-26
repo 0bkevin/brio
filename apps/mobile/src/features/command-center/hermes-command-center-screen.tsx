@@ -1,6 +1,5 @@
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { useRouter } from 'expo-router';
-import { SymbolView } from 'expo-symbols';
 import { useMemo, useState } from 'react';
 import type { ReactNode } from 'react';
 import { Alert, Pressable, ScrollView, StyleSheet, View } from 'react-native';
@@ -150,8 +149,8 @@ export function HermesCommandCenterScreen({ connection }: { connection: AgentCon
             <Pressable
               accessibilityLabel="Refresh Command Center"
               onPress={() => void refresh()}
-              style={({ pressed }) => [styles.iconButton, { backgroundColor: colors.subtleStrong, opacity: pressed ? 0.55 : 1 }]}>
-              <SymbolView name="arrow.clockwise" size={17} tintColor={colors.foreground} />
+              style={({ pressed }) => [styles.refreshButton, { backgroundColor: colors.subtleStrong, opacity: pressed ? 0.55 : 1 }]}>
+              <AppText style={styles.refreshLabel}>Refresh</AppText>
             </Pressable>
           </View>
           {environments.length > 1 ? (
@@ -740,7 +739,8 @@ const styles = StyleSheet.create({
   heroTitle: { alignItems: 'center', flexDirection: 'row', gap: T3Spacing.md },
   title: { fontFamily: T3Typography.bold, fontSize: 26, lineHeight: 32 },
   caption: { fontSize: 13, lineHeight: 18 },
-  iconButton: { alignItems: 'center', borderRadius: T3Radius.medium, height: 42, justifyContent: 'center', width: 42 },
+  refreshButton: { alignItems: 'center', borderRadius: T3Radius.pill, justifyContent: 'center', minHeight: 38, paddingHorizontal: T3Spacing.md },
+  refreshLabel: { fontFamily: T3Typography.bold, fontSize: 12, lineHeight: 16 },
   chips: { flexDirection: 'row', gap: T3Spacing.sm },
   chip: { borderRadius: T3Radius.pill, maxWidth: 240, paddingHorizontal: T3Spacing.lg, paddingVertical: 9 },
   environmentChip: { alignItems: 'center', borderRadius: T3Radius.pill, borderWidth: StyleSheet.hairlineWidth, flexDirection: 'row', gap: T3Spacing.sm, maxWidth: 220, paddingHorizontal: T3Spacing.md, paddingVertical: 8 },

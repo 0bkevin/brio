@@ -455,7 +455,8 @@ export function modelCostLabel(pricing?: ModelPricing | null): string | null {
   const input = typeof pricing.input === 'string' ? pricing.input.trim() : '';
   const output = typeof pricing.output === 'string' ? pricing.output.trim() : '';
   if (!input || !output) return null;
-  return `$${input} in · $${output} out per Mtok`;
+  const currency = (value: string) => (value.startsWith('$') ? value : `$${value}`);
+  return `${currency(input)} in · ${currency(output)} out per Mtok`;
 }
 
 export type ReasoningEffortChoice = 'none' | 'low' | 'medium' | 'high';
