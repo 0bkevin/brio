@@ -225,6 +225,7 @@ func connect(ctx context.Context, cfg Config) error {
 
 	slog.Info("connected relay tunnel", "agent_id", cfg.AgentID)
 	requests := make(chan struct{}, maxConcurrentRequests)
+	channels := map[string]chan Frame{}
 	for {
 		_, data, err := conn.Read(connCtx)
 		if err != nil {
@@ -236,6 +237,62 @@ func connect(ctx context.Context, cfg Config) error {
 		}
 		switch frame.Type {
 		case "request":
+		case "channel_open":
+			if _, exists := channels[frame.ID]; exists {
+				if err := emit(Frame{Type: "channel_error", ID: frame.ID, Code: "DUPLICATE_CHANNEL", Message: "channel is already open"}); err != nil {
+					return err
+				}
+				continue
+			}
+			input := make(chan Frame, 32)
+			channels[frame.ID] = input
+			input <- frame
+			go func(id string, frames <-chan Frame) {
+				for {
+					select {
+					case <-connCtx.Done():
+						return
+					case next, ok := <-frames:
+						if !ok {
+							// A locally closed input without an explicit close frame
+							// means the channel hit its bounded queue. Drain ordering
+							// is now complete, so release the upstream WebSocket too.
+							_ = cfg.Handler(connCtx, Frame{Type: "channel_close", ID: id}, emit)
+							return
+						}
+						if err := cfg.Handler(connCtx, next, emit); err != nil {
+							slog.Warn("tunnel channel handler failed", "channel_id", id, "error", err)
+							return
+						}
+						if next.Type == "channel_close" {
+							return
+						}
+					}
+				}
+			}(frame.ID, input)
+			continue
+		case "channel_data", "channel_close":
+			input := channels[frame.ID]
+			if input == nil {
+				if err := emit(Frame{Type: "channel_error", ID: frame.ID, Code: "CHANNEL_NOT_OPEN", Message: "channel is not open"}); err != nil {
+					return err
+				}
+				continue
+			}
+			select {
+			case input <- frame:
+				if frame.Type == "channel_close" {
+					delete(channels, frame.ID)
+					close(input)
+				}
+			default:
+				delete(channels, frame.ID)
+				close(input)
+				if err := emit(Frame{Type: "channel_error", ID: frame.ID, Code: "CHANNEL_BACKPRESSURE", Message: "channel input buffer is full"}); err != nil {
+					return err
+				}
+			}
+			continue
 		case "ping":
 			if err := emit(Frame{Type: "pong", ID: frame.ID}); err != nil {
 				return err

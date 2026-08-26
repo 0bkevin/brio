@@ -13,6 +13,7 @@ This project uses a control-plane enrollment model as the primary way to connect
   - `brio setup` enables the stock Hermes API server in `~/.hermes/.env`, claims an enrollment code, persists state under `~/.brio/`, and installs/starts the service.
   - `brio connect` keeps an outbound WebSocket tunnel to the relay (no local HTTP listener).
   - Forwards `/v1/responses`, `/v1/runs...`, `/api/jobs...`, `/api/sessions`, `/api/sessions/{id}/messages`, `/v1/capabilities`, and `/health` (plus `/chat/responses` and `/capabilities` aliases) to the Hermes API server with the local `API_SERVER_KEY`.
+  - Transparently terminates multiplexed Relay channels at `hermes serve /api/ws`, injecting the local control token so Mobile can use Hermes-native JSON-RPC events without receiving that credential.
   - Serves `/v1/memory` from `~/.hermes/memories` directly (legacy `/memory` too); session state remains owned and shaped by the Hermes API server.
   - Everything else is a 404 error frame; there are no file/config/gateway/skills/tools/logs endpoints anymore.
 - hermes-agent (stock)
@@ -22,6 +23,7 @@ This project uses a control-plane enrollment model as the primary way to connect
   - Lists owned agents.
   - Generates enrollment codes.
   - Connects to enrolled agents through the relay.
+  - Uses a transport-independent `HermesGatewayClient` for live conversations; runtimes without the gateway degrade to `/v1/runs/{id}/events` SSE rather than interval polling.
 
 ## Preferred User Flow
 

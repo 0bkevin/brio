@@ -48,12 +48,14 @@ type Client struct {
 
 	HTTP *http.Client
 
-	controlOnce  sync.Once
-	controlApp   *app
-	composerMu   sync.Mutex
-	profileApps  sync.Map // profile name -> *app
-	profilesOnce sync.Once
-	profileMgr   *ProfileManager
+	controlOnce     sync.Once
+	controlApp      *app
+	composerMu      sync.Mutex
+	profileApps     sync.Map // profile name -> *app
+	profilesOnce    sync.Once
+	profileMgr      *ProfileManager
+	gatewayMu       sync.Mutex
+	gatewayChannels map[string]*gatewayChannel
 }
 
 // ControlEndpoint points at one `hermes serve` control plane instance.
@@ -287,11 +289,16 @@ func (c *Client) Close() {
 		value.(*app).control.Close()
 		return true
 	})
+	c.closeGatewayChannels()
 }
 
 // Serve handles one tunnel request frame and emits response, stream, or
 // error frames. It returns a non-nil error only when emit fails.
 func (c *Client) Serve(ctx context.Context, frame tunnel.Frame, emit func(tunnel.Frame) error) error {
+	switch frame.Type {
+	case "channel_open", "channel_data", "channel_close":
+		return c.serveGatewayChannel(ctx, frame, emit)
+	}
 	method := frame.Method
 	if method == "" {
 		method = http.MethodGet

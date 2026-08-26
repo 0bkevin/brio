@@ -7,7 +7,20 @@
   "properties": {
     "type": {
       "type": "string",
-      "enum": ["request", "response", "stream_chunk", "stream_end", "error", "ping", "pong"]
+      "enum": [
+        "request",
+        "response",
+        "stream_chunk",
+        "stream_end",
+        "error",
+        "ping",
+        "pong",
+        "channel_open",
+        "channel_opened",
+        "channel_data",
+        "channel_close",
+        "channel_error"
+      ]
     },
     "id": {
       "type": "string",

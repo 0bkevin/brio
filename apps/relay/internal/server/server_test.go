@@ -82,6 +82,141 @@ func TestHubKeepsStreamingRequestPendingUntilTerminalFrame(t *testing.T) {
 	}
 }
 
+func TestHubRoutesMultiplexedChannelBidirectionallyUntilClose(t *testing.T) {
+	h := newHub()
+	mobile := testPeer("mobile", "agent-1")
+	companion := testPeer("companion", "agent-1")
+	h.add(mobile)
+	h.add(companion)
+
+	h.route(mobile, []byte(`{"type":"channel_open","id":"ws-1","path":"/api/ws"}`))
+	if got := readFrame(t, companion); got.Type != "channel_open" || got.ID != "ws-1" {
+		t.Fatalf("companion got %+v, want channel_open ws-1", got)
+	}
+	h.route(companion, mustJSON(tunnelFrame{Type: "channel_opened", ID: "ws-1"}))
+	if got := readFrame(t, mobile); got.Type != "channel_opened" {
+		t.Fatalf("mobile got %+v, want channel_opened", got)
+	}
+
+	h.route(mobile, []byte(`{"type":"channel_data","id":"ws-1","data":"request"}`))
+	if got := readFrame(t, companion); got.Type != "channel_data" {
+		t.Fatalf("companion got %+v, want channel_data", got)
+	}
+	h.route(companion, []byte(`{"type":"channel_data","id":"ws-1","data":"event"}`))
+	if got := readFrame(t, mobile); got.Type != "channel_data" {
+		t.Fatalf("mobile got %+v, want channel_data", got)
+	}
+
+	h.route(mobile, mustJSON(tunnelFrame{Type: "channel_close", ID: "ws-1"}))
+	if got := readFrame(t, companion); got.Type != "channel_close" {
+		t.Fatalf("companion got %+v, want channel_close", got)
+	}
+	h.mu.Lock()
+	_, pending := h.pending["agent-1"]["ws-1"]
+	h.mu.Unlock()
+	if pending {
+		t.Fatal("channel stayed pending after requester close")
+	}
+}
+
+func TestHubRejectsChannelDataFromAnotherMobile(t *testing.T) {
+	h := newHub()
+	mobileA := testPeer("mobile", "agent-1")
+	mobileB := testPeer("mobile", "agent-1")
+	companion := testPeer("companion", "agent-1")
+	h.add(mobileA)
+	h.add(mobileB)
+	h.add(companion)
+	h.route(mobileA, mustJSON(tunnelFrame{Type: "channel_open", ID: "ws-1"}))
+	_ = readFrame(t, companion)
+
+	h.route(mobileB, mustJSON(tunnelFrame{Type: "channel_data", ID: "ws-1"}))
+	if got := readFrame(t, mobileB); got.Type != "channel_error" || got.Code != "CHANNEL_NOT_OPEN" {
+		t.Fatalf("mobile B got %+v, want CHANNEL_NOT_OPEN", got)
+	}
+	assertNoFrame(t, companion)
+}
+
+func TestHubClosesChannelWhenCompanionDisconnects(t *testing.T) {
+	h := newHub()
+	mobile := testPeer("mobile", "agent-1")
+	companion := testPeer("companion", "agent-1")
+	h.add(mobile)
+	h.add(companion)
+	h.route(mobile, mustJSON(tunnelFrame{Type: "channel_open", ID: "ws-1"}))
+	_ = readFrame(t, companion)
+
+	h.remove(companion)
+	if got := readFrame(t, mobile); got.Type != "channel_error" || got.Code != "COMPANION_DISCONNECTED" {
+		t.Fatalf("mobile got %+v, want companion disconnect channel error", got)
+	}
+}
+
+func TestHubTellsCompanionToCloseChannelWhenMobileDisconnects(t *testing.T) {
+	h := newHub()
+	mobile := testPeer("mobile", "agent-1")
+	companion := testPeer("companion", "agent-1")
+	h.add(mobile)
+	h.add(companion)
+	h.route(mobile, mustJSON(tunnelFrame{Type: "channel_open", ID: "ws-1"}))
+	_ = readFrame(t, companion)
+
+	h.remove(mobile)
+	if got := readFrame(t, companion); got.Type != "channel_close" || got.ID != "ws-1" {
+		t.Fatalf("companion got %+v, want channel_close ws-1", got)
+	}
+}
+
+func TestHubClosesUpstreamChannelWhenMobileBackpressures(t *testing.T) {
+	h := newHub()
+	mobile := testPeer("mobile", "agent-1")
+	companion := testPeer("companion", "agent-1")
+	h.add(mobile)
+	h.add(companion)
+	h.pending["agent-1"] = map[string]pendingRequest{
+		"ws-1": {requester: mobile, companion: companion, createdAt: time.Now().UTC(), channel: true},
+	}
+	for len(mobile.send) < cap(mobile.send) {
+		mobile.send <- []byte(`{"type":"ping","id":"fill"}`)
+	}
+
+	h.route(companion, []byte(`{"type":"channel_data","id":"ws-1","data":"event"}`))
+	if got := readFrame(t, companion); got.Type != "channel_close" || got.ID != "ws-1" {
+		t.Fatalf("companion got %+v, want channel_close ws-1", got)
+	}
+	h.mu.Lock()
+	_, pending := h.pending["agent-1"]["ws-1"]
+	h.mu.Unlock()
+	if pending {
+		t.Fatal("backpressured channel stayed pending")
+	}
+}
+
+func TestHubRejectsChannelInputWhenCompanionBackpressures(t *testing.T) {
+	h := newHub()
+	mobile := testPeer("mobile", "agent-1")
+	companion := testPeer("companion", "agent-1")
+	h.add(mobile)
+	h.add(companion)
+	h.pending["agent-1"] = map[string]pendingRequest{
+		"ws-1": {requester: mobile, companion: companion, createdAt: time.Now().UTC(), channel: true},
+	}
+	for len(companion.send) < cap(companion.send) {
+		companion.send <- []byte(`{"type":"ping","id":"fill"}`)
+	}
+
+	h.route(mobile, []byte(`{"type":"channel_data","id":"ws-1","data":"request"}`))
+	if got := readFrame(t, mobile); got.Type != "channel_error" || got.Code != "COMPANION_BACKPRESSURE" {
+		t.Fatalf("mobile got %+v, want COMPANION_BACKPRESSURE", got)
+	}
+	h.mu.Lock()
+	_, pending := h.pending["agent-1"]["ws-1"]
+	h.mu.Unlock()
+	if pending {
+		t.Fatal("backpressured channel stayed pending")
+	}
+}
+
 func TestHubReturnsOfflineWhenNoCompanionConnected(t *testing.T) {
 	h := newHub()
 	mobile := testPeer("mobile", "agent-1")

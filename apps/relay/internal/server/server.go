@@ -75,6 +75,7 @@ type pendingRequest struct {
 	requester *peer
 	companion *peer
 	createdAt time.Time
+	channel   bool
 }
 
 type peer struct {
@@ -801,10 +802,17 @@ func (h *hub) removeLocked(p *peer) bool {
 		for id, req := range requests {
 			switch {
 			case req.requester == p:
+				if req.channel {
+					h.enqueueLocked(req.companion, mustJSON(tunnelFrame{Type: "channel_close", ID: id}))
+				}
 				delete(requests, id)
 			case req.companion == p:
 				delete(requests, id)
-				h.enqueueLocked(req.requester, errorFrame(id, "COMPANION_DISCONNECTED", "companion disconnected before responding"))
+				if req.channel {
+					h.enqueueLocked(req.requester, channelErrorFrame(id, "COMPANION_DISCONNECTED", "companion disconnected while the channel was open"))
+				} else {
+					h.enqueueLocked(req.requester, errorFrame(id, "COMPANION_DISCONNECTED", "companion disconnected before responding"))
+				}
 			}
 		}
 		if len(requests) == 0 {
@@ -942,39 +950,81 @@ func (h *hub) routeFrame(from *peer, data []byte, frame tunnelFrame, parseErr er
 
 	switch from.role {
 	case "mobile":
-		if frame.Type != "request" {
-			h.enqueueLocked(from, errorFrame(frame.ID, "BAD_FRAME", "mobile clients may only send request frames"))
+		if frame.Type == "channel_data" || frame.Type == "channel_close" {
+			requests := h.pending[from.agentID]
+			req, ok := requests[frame.ID]
+			if !ok || !req.channel || req.requester != from {
+				h.enqueueLocked(from, channelErrorFrame(frame.ID, "CHANNEL_NOT_OPEN", "channel is not open"))
+				return
+			}
+			req.createdAt = now
+			requests[frame.ID] = req
+			if !h.enqueueLocked(req.companion, data) {
+				delete(requests, frame.ID)
+				h.enqueueLocked(from, channelErrorFrame(frame.ID, "COMPANION_BACKPRESSURE", "companion is not accepting channel frames"))
+				if len(requests) == 0 {
+					delete(h.pending, from.agentID)
+				}
+				return
+			}
+			if frame.Type == "channel_close" {
+				delete(requests, frame.ID)
+				if len(requests) == 0 {
+					delete(h.pending, from.agentID)
+				}
+			}
+			return
+		}
+		if frame.Type != "request" && frame.Type != "channel_open" {
+			h.enqueueLocked(from, errorFrame(frame.ID, "BAD_FRAME", "mobile clients may only send request or channel frames"))
 			return
 		}
 		companion := h.selectCompanionLocked(from.agentID)
 		if companion == nil {
-			h.enqueueLocked(from, errorFrame(frame.ID, "AGENT_OFFLINE", "no companion is connected for this agent"))
+			if frame.Type == "channel_open" {
+				h.enqueueLocked(from, channelErrorFrame(frame.ID, "AGENT_OFFLINE", "no companion is connected for this agent"))
+			} else {
+				h.enqueueLocked(from, errorFrame(frame.ID, "AGENT_OFFLINE", "no companion is connected for this agent"))
+			}
 			return
 		}
 		if h.pending[from.agentID] == nil {
 			h.pending[from.agentID] = map[string]pendingRequest{}
 		}
 		if _, exists := h.pending[from.agentID][frame.ID]; exists {
-			h.enqueueLocked(from, errorFrame(frame.ID, "DUPLICATE_REQUEST_ID", "a relay request with this frame id is already pending"))
+			if frame.Type == "channel_open" {
+				h.enqueueLocked(from, channelErrorFrame(frame.ID, "DUPLICATE_CHANNEL_ID", "a relay channel with this id is already open"))
+			} else {
+				h.enqueueLocked(from, errorFrame(frame.ID, "DUPLICATE_REQUEST_ID", "a relay request with this frame id is already pending"))
+			}
 			return
 		}
 		if len(h.pending[from.agentID]) >= maxPendingRequestsPerAgent || h.pendingForPeerLocked(from) >= maxPendingRequestsPerPeer {
-			h.enqueueLocked(from, errorFrame(frame.ID, "RELAY_BACKPRESSURE", "too many relay requests are pending"))
+			if frame.Type == "channel_open" {
+				h.enqueueLocked(from, channelErrorFrame(frame.ID, "RELAY_BACKPRESSURE", "too many relay channels or requests are open"))
+			} else {
+				h.enqueueLocked(from, errorFrame(frame.ID, "RELAY_BACKPRESSURE", "too many relay requests are pending"))
+			}
 			return
 		}
-		h.pending[from.agentID][frame.ID] = pendingRequest{requester: from, companion: companion, createdAt: now}
+		h.pending[from.agentID][frame.ID] = pendingRequest{
+			requester: from,
+			companion: companion,
+			createdAt: now,
+			channel:   frame.Type == "channel_open",
+		}
 		if !h.enqueueLocked(companion, data) {
 			delete(h.pending[from.agentID], frame.ID)
 			if len(h.pending[from.agentID]) == 0 {
 				delete(h.pending, from.agentID)
 			}
-			h.enqueueLocked(from, errorFrame(frame.ID, "COMPANION_BACKPRESSURE", "companion is not accepting relay frames"))
+			if frame.Type == "channel_open" {
+				h.enqueueLocked(from, channelErrorFrame(frame.ID, "COMPANION_BACKPRESSURE", "companion is not accepting channel frames"))
+			} else {
+				h.enqueueLocked(from, errorFrame(frame.ID, "COMPANION_BACKPRESSURE", "companion is not accepting relay frames"))
+			}
 		}
 	case "companion":
-		if !isCompanionResponseFrame(frame.Type) {
-			h.enqueueLocked(from, errorFrame(frame.ID, "BAD_FRAME", "companion clients may only send response, stream, or error frames"))
-			return
-		}
 		requests := h.pending[from.agentID]
 		req, ok := requests[frame.ID]
 		if !ok {
@@ -983,8 +1033,33 @@ func (h *hub) routeFrame(from *peer, data []byte, frame tunnelFrame, parseErr er
 		if req.companion != from {
 			return
 		}
-		if !h.enqueueLocked(req.requester, data) || isTerminalFrame(frame.Type) {
-			delete(requests, frame.ID)
+		if req.channel {
+			if !isCompanionChannelFrame(frame.Type) {
+				h.enqueueLocked(from, channelErrorFrame(frame.ID, "BAD_FRAME", "companion sent an invalid channel frame"))
+				return
+			}
+			req.createdAt = now
+			requests[frame.ID] = req
+			delivered := h.enqueueLocked(req.requester, data)
+			if !delivered {
+				// The requester can no longer consume this stream. Best-effort a
+				// close back to the connector so its upstream Hermes socket is not
+				// left alive after Relay drops the channel for backpressure.
+				h.enqueueLocked(from, mustJSON(tunnelFrame{Type: "channel_close", ID: frame.ID}))
+			}
+			if !delivered || isTerminalChannelFrame(frame.Type) {
+				delete(requests, frame.ID)
+			}
+		} else {
+			if !isCompanionResponseFrame(frame.Type) {
+				h.enqueueLocked(from, errorFrame(frame.ID, "BAD_FRAME", "companion clients may only send response, stream, or error frames"))
+				return
+			}
+			if !h.enqueueLocked(req.requester, data) || isTerminalFrame(frame.Type) {
+				delete(requests, frame.ID)
+			}
+		}
+		if _, exists := requests[frame.ID]; !exists {
 			if len(requests) == 0 {
 				delete(h.pending, from.agentID)
 			}
@@ -1024,6 +1099,9 @@ func (h *hub) pruneLoop(ctx context.Context) {
 func (h *hub) pruneLocked(now time.Time) {
 	for agentID, requests := range h.pending {
 		for id, req := range requests {
+			if req.channel {
+				continue
+			}
 			if now.Sub(req.createdAt) <= pendingRequestTTL {
 				continue
 			}
@@ -1105,8 +1183,20 @@ func isTerminalFrame(frameType string) bool {
 	return frameType == "response" || frameType == "stream_end" || frameType == "error"
 }
 
+func isCompanionChannelFrame(frameType string) bool {
+	return frameType == "channel_opened" || frameType == "channel_data" || frameType == "channel_close" || frameType == "channel_error"
+}
+
+func isTerminalChannelFrame(frameType string) bool {
+	return frameType == "channel_close" || frameType == "channel_error"
+}
+
 func errorFrame(id string, code string, message string) []byte {
 	return mustJSON(tunnelFrame{Type: "error", ID: id, Code: code, Message: message})
+}
+
+func channelErrorFrame(id string, code string, message string) []byte {
+	return mustJSON(tunnelFrame{Type: "channel_error", ID: id, Code: code, Message: message})
 }
 
 func mustJSON(v any) []byte {
