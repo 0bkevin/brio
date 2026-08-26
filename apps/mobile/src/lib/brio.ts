@@ -33,6 +33,16 @@ export type AgentConnection = {
   agentName?: string;
 };
 
+export class BrioRequestError extends Error {
+  readonly status: number;
+
+  constructor(message: string, status: number) {
+    super(message);
+    this.name = 'BrioRequestError';
+    this.status = status;
+  }
+}
+
 export type HealthResponse = {
   ok?: boolean;
   status?: string;
@@ -125,6 +135,11 @@ export type HermesSession = {
   ended_at?: number | null;
   message_count: number;
   title?: string;
+};
+
+export type HermesSessionCreateResponse = {
+  object: 'hermes.session';
+  session: HermesSession;
 };
 
 export type HermesMessage = {
@@ -523,7 +538,10 @@ export async function brioFetch<T>(
   const text = await response.text();
   const body = text ? JSON.parse(text) : null;
   if (!response.ok) {
-    throw new Error(apiErrorMessage(body?.error ?? body?.message, `Request failed: ${response.status}`));
+    throw new BrioRequestError(
+      apiErrorMessage(body?.error ?? body?.message, `Request failed: ${response.status}`),
+      response.status,
+    );
   }
   return body as T;
 }
@@ -680,6 +698,46 @@ export async function listSessions(connection: AgentConnection, limit = 100, pro
     `${scopedPath('/api/sessions', profile)}?limit=${limit}`,
   );
   return normalizeSessionList(response);
+}
+
+export function createSession(
+  connection: AgentConnection,
+  sessionId: string,
+  profile?: string,
+) {
+  return brioFetch<HermesSessionCreateResponse>(
+    connection,
+    scopedPath('/api/sessions', profile),
+    {
+      method: 'POST',
+      body: JSON.stringify({ id: sessionId, source: 'api_server' }),
+    },
+  );
+}
+
+export async function ensureSession(
+  connection: AgentConnection,
+  sessionId: string,
+  profile?: string,
+  modelPayload?: HermesSessionModelPayload,
+) {
+  let session: HermesSessionCreateResponse;
+  try {
+    session = await createSession(connection, sessionId, profile);
+  } catch (createError) {
+    try {
+      session = await brioFetch<HermesSessionCreateResponse>(
+        connection,
+        scopedPath(`/api/sessions/${encodeURIComponent(sessionId)}`, profile),
+      );
+    } catch {
+      throw createError;
+    }
+  }
+  if (modelPayload) {
+    await setSessionModel(connection, sessionId, modelPayload, profile);
+  }
+  return session;
 }
 
 export function searchSessions(connection: AgentConnection, query: string, profile?: string) {
@@ -2164,7 +2222,7 @@ class RelaySocketClient {
           : undefined,
         `Request failed: ${frame.status}`,
       );
-      pending.reject(new Error(message));
+      pending.reject(new BrioRequestError(message, frame.status ?? 500));
       return;
     }
 

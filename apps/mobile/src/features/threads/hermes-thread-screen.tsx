@@ -1,6 +1,6 @@
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { useRouter } from 'expo-router';
-import { useEffect, useId, useRef, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import {
   FlatList,
   KeyboardAvoidingView,
@@ -18,6 +18,8 @@ import { CHAT_CONTENT_MAX_WIDTH, T3Radius, T3Spacing, T3Typography } from '@/con
 import { useT3Theme } from '@/hooks/use-t3-theme';
 import {
   approveRun,
+  BrioRequestError,
+  ensureSession,
   deleteAttachmentUpload,
   dispatchComposerCommand,
   getRun,
@@ -98,6 +100,12 @@ type GatewayInputRequest = {
   questionIndex: number;
 };
 
+function createDraftSessionId() {
+  const timestamp = Date.now().toString(36);
+  const entropy = Math.random().toString(36).slice(2, 12);
+  return `brio_new_${timestamp}_${entropy}`;
+}
+
 export function HermesThreadScreen({
   connection,
   initialModelOverride,
@@ -113,10 +121,13 @@ export function HermesThreadScreen({
   const router = useRouter();
   const queryClient = useQueryClient();
   const listRef = useRef<FlatList<FeedItem>>(null);
-  const generatedSessionId = `brio_new_${useId().replace(/[^a-z0-9_-]/gi, '')}`;
-  const sessionId = routeSessionId === 'new' ? generatedSessionId : routeSessionId;
-  const runKey = `${connection.id}:${profile}:${sessionId}`;
   const composerKey = `${connection.id}:${profile}:${routeSessionId}`;
+  const [generatedSessionId] = useState(createDraftSessionId);
+  const persistedDraftSessionId = useComposerStore((state) => state.sessionIds[composerKey]);
+  const sessionId = routeSessionId === 'new'
+    ? (persistedDraftSessionId ?? generatedSessionId)
+    : routeSessionId;
+  const runKey = `${connection.id}:${profile}:${sessionId}`;
   const [modelOverride, setModelOverride] = useState<ChatModelOverride | undefined>(
     initialModelOverride,
   );
@@ -134,6 +145,7 @@ export function HermesThreadScreen({
   const setActiveRun = useRunStore((state) => state.setActiveRun);
   const clearActiveRun = useRunStore((state) => state.clearActiveRun);
   const composerHydrated = useComposerStore((state) => state.hydrated);
+  const ensureComposerSessionId = useComposerStore((state) => state.ensureSessionId);
   const draft = useComposerStore((state) => state.drafts[composerKey] ?? '');
   const attachments = useComposerStore(
     (state) => state.attachments[composerKey] ?? EMPTY_COMPOSER_ATTACHMENTS,
@@ -163,6 +175,11 @@ export function HermesThreadScreen({
     content: string;
     timestamp: number;
   } | null>(null);
+
+  useEffect(() => {
+    if (routeSessionId !== 'new' || !composerHydrated) return;
+    void ensureComposerSessionId(composerKey, generatedSessionId);
+  }, [composerHydrated, composerKey, ensureComposerSessionId, generatedSessionId, routeSessionId]);
 
   const messages = useQuery({
     queryKey: ['session-messages', connection.id, connection.url, profile, sessionId],
@@ -205,6 +222,28 @@ export function HermesThreadScreen({
   const currentRun = gatewayRun ?? run.data;
   const terminal = currentRun && ['completed', 'failed', 'cancelled'].includes(currentRun.status);
   const active = Boolean(runId && !terminal);
+
+  useEffect(() => {
+    if (
+      !runId ||
+      runId.startsWith('gateway:') ||
+      !(run.error instanceof BrioRequestError) ||
+      run.error.status !== 404
+    ) {
+      return;
+    }
+    const timer = setTimeout(() => {
+      const hasQueuedPrompts = queue.length > 0;
+      if (hasQueuedPrompts) void setQueuePaused(composerKey, true);
+      setComposerError(
+        hasQueuedPrompts
+          ? 'Hermes no longer has the previous run. Queued prompts are paused because its delivery could not be verified.'
+          : 'Hermes no longer has the previous run. Its final delivery could not be verified.',
+      );
+      clearActiveRun(runKey);
+    }, 0);
+    return () => clearTimeout(timer);
+  }, [clearActiveRun, composerKey, queue.length, run.error, runId, runKey, setQueuePaused]);
 
   useEffect(() => {
     const acquired = acquireHermesGateway(connection, profile);
@@ -494,7 +533,18 @@ export function HermesThreadScreen({
     mutationFn: async (queuedPrompt: QueuedPrompt) => {
       const input = queuedPrompt.text.trim();
       const promptModelOverride = queuedPrompt.modelOverride ?? modelOverride;
+      const persistedModel = promptModelOverride
+        ? {
+            provider: promptModelOverride.provider,
+            model: promptModelOverride.model,
+            model_options: buildRuntimeModelOptions(promptModelOverride),
+            require_model_lock: true,
+          }
+        : undefined;
       if (input.startsWith('/') && queuedPrompt.attachments.length === 0) {
+        if (routeSessionId === 'new') {
+          await ensureSession(connection, sessionId, profile, persistedModel);
+        }
         const response = await dispatchComposerCommand(
           connection,
           sessionId,
@@ -588,6 +638,16 @@ export function HermesThreadScreen({
           if (gatewayPromptStarted) throw reason;
           setGatewayState('degraded');
         }
+      }
+
+      // The Runs and Responses APIs interpret session_id as an existing
+      // persisted session. The draft route's generated id is only a local
+      // correlation key, so create its Hermes session before degrading from
+      // the WebSocket gateway to REST. Without this step the run is accepted
+      // asynchronously, navigation succeeds, and transcript loading then
+      // fails with "Session not found: brio_new_...".
+      if (routeSessionId === 'new') {
+        await ensureSession(connection, sessionId, profile, persistedModel);
       }
 
       if (advancedPrompt) {
