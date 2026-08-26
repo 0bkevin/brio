@@ -18,6 +18,7 @@ import { CHAT_CONTENT_MAX_WIDTH, T3Radius, T3Spacing, T3Typography } from '@/con
 import { useT3Theme } from '@/hooks/use-t3-theme';
 import {
   approveRun,
+  BrioRequestError,
   ensureSession,
   deleteAttachmentUpload,
   dispatchComposerCommand,
@@ -221,6 +222,28 @@ export function HermesThreadScreen({
   const currentRun = gatewayRun ?? run.data;
   const terminal = currentRun && ['completed', 'failed', 'cancelled'].includes(currentRun.status);
   const active = Boolean(runId && !terminal);
+
+  useEffect(() => {
+    if (
+      !runId ||
+      runId.startsWith('gateway:') ||
+      !(run.error instanceof BrioRequestError) ||
+      run.error.status !== 404
+    ) {
+      return;
+    }
+    const timer = setTimeout(() => {
+      const hasQueuedPrompts = queue.length > 0;
+      if (hasQueuedPrompts) void setQueuePaused(composerKey, true);
+      setComposerError(
+        hasQueuedPrompts
+          ? 'Hermes no longer has the previous run. Queued prompts are paused because its delivery could not be verified.'
+          : 'Hermes no longer has the previous run. Its final delivery could not be verified.',
+      );
+      clearActiveRun(runKey);
+    }, 0);
+    return () => clearTimeout(timer);
+  }, [clearActiveRun, composerKey, queue.length, run.error, runId, runKey, setQueuePaused]);
 
   useEffect(() => {
     const acquired = acquireHermesGateway(connection, profile);
@@ -510,9 +533,17 @@ export function HermesThreadScreen({
     mutationFn: async (queuedPrompt: QueuedPrompt) => {
       const input = queuedPrompt.text.trim();
       const promptModelOverride = queuedPrompt.modelOverride ?? modelOverride;
+      const persistedModel = promptModelOverride
+        ? {
+            provider: promptModelOverride.provider,
+            model: promptModelOverride.model,
+            model_options: buildRuntimeModelOptions(promptModelOverride),
+            require_model_lock: true,
+          }
+        : undefined;
       if (input.startsWith('/') && queuedPrompt.attachments.length === 0) {
         if (routeSessionId === 'new') {
-          await ensureSession(connection, sessionId, profile);
+          await ensureSession(connection, sessionId, profile, persistedModel);
         }
         const response = await dispatchComposerCommand(
           connection,
@@ -616,7 +647,7 @@ export function HermesThreadScreen({
       // asynchronously, navigation succeeds, and transcript loading then
       // fails with "Session not found: brio_new_...".
       if (routeSessionId === 'new') {
-        await ensureSession(connection, sessionId, profile);
+        await ensureSession(connection, sessionId, profile, persistedModel);
       }
 
       if (advancedPrompt) {
