@@ -127,6 +127,11 @@ export type HermesSession = {
   title?: string;
 };
 
+export type HermesSessionCreateResponse = {
+  object: 'hermes.session';
+  session: HermesSession;
+};
+
 export type HermesMessage = {
   role: string;
   content: string;
@@ -680,6 +685,40 @@ export async function listSessions(connection: AgentConnection, limit = 100, pro
     `${scopedPath('/api/sessions', profile)}?limit=${limit}`,
   );
   return normalizeSessionList(response);
+}
+
+export function createSession(
+  connection: AgentConnection,
+  sessionId: string,
+  profile?: string,
+) {
+  return brioFetch<HermesSessionCreateResponse>(
+    connection,
+    scopedPath('/api/sessions', profile),
+    {
+      method: 'POST',
+      body: JSON.stringify({ id: sessionId, source: 'brio' }),
+    },
+  );
+}
+
+export async function ensureSession(
+  connection: AgentConnection,
+  sessionId: string,
+  profile?: string,
+) {
+  try {
+    return await createSession(connection, sessionId, profile);
+  } catch (createError) {
+    try {
+      return await brioFetch<HermesSessionCreateResponse>(
+        connection,
+        scopedPath(`/api/sessions/${encodeURIComponent(sessionId)}`, profile),
+      );
+    } catch {
+      throw createError;
+    }
+  }
 }
 
 export function searchSessions(connection: AgentConnection, query: string, profile?: string) {

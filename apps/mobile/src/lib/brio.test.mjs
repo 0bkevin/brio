@@ -17,6 +17,8 @@ import {
   aggregateRootAgentUsage,
   brioFetch,
   connectionFromPairingPayload,
+  createSession,
+  ensureSession,
   decodePairingPayload,
   extractPairingPayload,
   filterAgentsForControlSession,
@@ -41,6 +43,70 @@ test('normalizes current Hermes list envelopes without breaking legacy responses
   assert.deepEqual(normalizeSessionList({ sessions }).sessions, sessions);
   assert.deepEqual(normalizeMessageList({ data: messages }).messages, messages);
   assert.deepEqual(normalizeMessageList({ messages }).messages, messages);
+});
+
+test('creates a persisted Hermes session before a REST-backed new thread starts', async () => {
+  const originalFetch = globalThis.fetch;
+  let request;
+  globalThis.fetch = async (input, init) => {
+    request = { input: String(input), init };
+    return new Response(JSON.stringify({
+      object: 'hermes.session',
+      session: { id: 'brio_new_test', source: 'brio', started_at: 1, message_count: 0 },
+    }), { status: 201, headers: { 'Content-Type': 'application/json' } });
+  };
+  try {
+    const created = await createSession({
+      id: 'direct-1',
+      name: 'Hermes',
+      mode: 'self_hosted',
+      transport: 'direct',
+      status: 'online',
+      capabilities: {},
+      url: 'http://127.0.0.1:8787',
+      token: 'secret',
+    }, 'brio_new_test', 'coder');
+    assert.equal(created.session.id, 'brio_new_test');
+    assert.equal(request.input, 'http://127.0.0.1:8787/p/coder/api/sessions');
+    assert.equal(request.init.method, 'POST');
+    assert.deepEqual(JSON.parse(request.init.body), { id: 'brio_new_test', source: 'brio' });
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test('reuses a session created by an earlier failed REST attempt', async () => {
+  const originalFetch = globalThis.fetch;
+  const requests = [];
+  globalThis.fetch = async (input, init) => {
+    requests.push({ input: String(input), init });
+    if (init?.method === 'POST') {
+      return new Response(JSON.stringify({
+        error: { message: 'Session already exists: brio_new_retry' },
+      }), { status: 409, headers: { 'Content-Type': 'application/json' } });
+    }
+    return new Response(JSON.stringify({
+      object: 'hermes.session',
+      session: { id: 'brio_new_retry', source: 'brio', started_at: 1, message_count: 0 },
+    }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+  };
+  try {
+    const existing = await ensureSession({
+      id: 'direct-1',
+      name: 'Hermes',
+      mode: 'self_hosted',
+      transport: 'direct',
+      status: 'online',
+      capabilities: {},
+      url: 'http://127.0.0.1:8787',
+      token: 'secret',
+    }, 'brio_new_retry');
+    assert.equal(existing.session.id, 'brio_new_retry');
+    assert.equal(requests.length, 2);
+    assert.equal(requests[1].input, 'http://127.0.0.1:8787/api/sessions/brio_new_retry');
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
 });
 
 test('normalizes native Hermes health and capabilities for connection screens', () => {
