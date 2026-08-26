@@ -34,7 +34,10 @@ export type AgentConnection = {
 };
 
 export type HealthResponse = {
-  ok: boolean;
+  ok?: boolean;
+  status?: string;
+  platform?: string;
+  version?: string;
   agent_ok?: boolean;
   agent_kind?: string;
   agent_name?: string;
@@ -49,6 +52,7 @@ export type HealthResponse = {
 
 export type CapabilitiesResponse = {
   companion?: Record<string, unknown>;
+  features?: Record<string, unknown>;
   hermes?: unknown;
 };
 
@@ -135,6 +139,92 @@ export type HermesSearchResult = {
   role: string;
   snippet: string;
 };
+
+type HermesSessionListEnvelope = {
+  sessions?: HermesSession[];
+  data?: HermesSession[];
+  error?: string;
+};
+
+type HermesMessageListEnvelope = {
+  messages?: HermesMessage[];
+  data?: HermesMessage[];
+  error?: string;
+};
+
+export function normalizeSessionList(response: HermesSessionListEnvelope) {
+  return { ...response, sessions: response.sessions ?? response.data ?? [] };
+}
+
+export function normalizeMessageList(response: HermesMessageListEnvelope) {
+  return { ...response, messages: response.messages ?? response.data ?? [] };
+}
+
+type HermesControlFileEntry = Omit<Partial<HermesFileEntry>, 'size'> & {
+  is_directory?: boolean;
+  size?: number | null;
+};
+type HermesControlFileList = {
+  path: string;
+  entries?: HermesControlFileEntry[];
+  roots?: string[];
+  root?: string | null;
+  locked_root?: string | null;
+  error?: string;
+};
+
+export function normalizeFileList(response: HermesControlFileList) {
+  const roots = response.roots ?? [response.root, response.locked_root].filter(
+    (value): value is string => Boolean(value),
+  );
+  return {
+    ...response,
+    entries: (response.entries ?? []).map((entry) => ({
+      ...entry,
+      name: entry.name ?? '',
+      path: entry.path ?? '',
+      dir: entry.dir ?? entry.is_directory ?? false,
+      size: entry.size ?? 0,
+    })),
+    roots: Array.from(new Set(roots)),
+  };
+}
+
+type HermesControlSkill = Partial<HermesSkill> & { provenance?: string };
+
+export function normalizeSkills(response: HermesControlSkill[] | { skills?: HermesControlSkill[] }) {
+  const skills = Array.isArray(response) ? response : (response.skills ?? []);
+  return {
+    skills: skills.map((skill) => ({
+      name: skill.name ?? 'Unnamed skill',
+      category: skill.category ?? '',
+      path: skill.path ?? skill.provenance ?? skill.name ?? 'unknown',
+      description: skill.description ?? '',
+      enabled: skill.enabled ?? false,
+    })),
+  };
+}
+
+type HermesControlToolset = {
+  name?: string;
+  platform?: string;
+  enabled?: boolean;
+};
+
+export function normalizeToolsets(
+  response: HermesControlToolset[] | { toolsets?: Record<string, string[]>; error?: string },
+) {
+  if (!Array.isArray(response)) {
+    return { toolsets: response.toolsets ?? {}, error: response.error };
+  }
+  const toolsets: Record<string, string[]> = {};
+  for (const item of response) {
+    if (!item.enabled || !item.name) continue;
+    const platform = item.platform || 'cli';
+    (toolsets[platform] ??= []).push(item.name);
+  }
+  return { toolsets };
+}
 
 export type HermesRunStatus = {
   object: 'hermes.run';
@@ -433,8 +523,7 @@ export async function brioFetch<T>(
   const text = await response.text();
   const body = text ? JSON.parse(text) : null;
   if (!response.ok) {
-    const message = body?.error ?? body?.message ?? `Request failed: ${response.status}`;
-    throw new Error(message);
+    throw new Error(apiErrorMessage(body?.error ?? body?.message, `Request failed: ${response.status}`));
   }
   return body as T;
 }
@@ -447,17 +536,34 @@ function requestTimeoutForPath(path: string) {
       : 15_000;
 }
 
-export function getHealth(
+export async function getHealth(
   connection: Pick<AgentConnection, 'url' | 'token'> & Partial<AgentConnection>,
   signal?: AbortSignal,
 ) {
-  return brioFetch<HealthResponse>(connection, '/health', { signal });
+  return normalizeHealth(await brioFetch<HealthResponse>(connection, '/health', { signal }));
 }
 
-export function getCapabilities(
+export async function getCapabilities(
   connection: Pick<AgentConnection, 'url' | 'token'> & Partial<AgentConnection>,
 ) {
-  return brioFetch<CapabilitiesResponse>(connection, '/capabilities');
+  return normalizeCapabilities(await brioFetch<CapabilitiesResponse>(connection, '/capabilities'));
+}
+
+export function normalizeHealth(response: HealthResponse): HealthResponse {
+  if (response.status !== 'ok' || response.platform !== 'hermes-agent') return response;
+  return {
+    ...response,
+    ok: true,
+    agent_ok: true,
+    agent_kind: response.agent_kind ?? 'hermes',
+    agent_name: response.agent_name ?? 'Hermes Agent',
+    hermes_ok: true,
+  };
+}
+
+export function normalizeCapabilities(response: CapabilitiesResponse): CapabilitiesResponse {
+  if (response.companion || !response.features) return response;
+  return { ...response, companion: response.features };
 }
 
 export function getComposerCapabilities(connection: AgentConnection, profile?: string) {
@@ -568,25 +674,27 @@ export function interruptComposerSession(connection: AgentConnection, sessionId:
   });
 }
 
-export function listSessions(connection: AgentConnection, limit = 100, profile?: string) {
-  return brioFetch<{ sessions: HermesSession[]; error?: string }>(
+export async function listSessions(connection: AgentConnection, limit = 100, profile?: string) {
+  const response = await brioFetch<HermesSessionListEnvelope>(
     connection,
-    `${scopedPath('/sessions', profile)}?limit=${limit}`,
+    `${scopedPath('/api/sessions', profile)}?limit=${limit}`,
   );
+  return normalizeSessionList(response);
 }
 
 export function searchSessions(connection: AgentConnection, query: string, profile?: string) {
   return brioFetch<{ results: HermesSearchResult[]; error?: string }>(
     connection,
-    `${scopedPath('/sessions/search', profile)}?q=${encodeURIComponent(query)}&limit=100`,
+    `${scopedPath('/api/sessions/search', profile)}?q=${encodeURIComponent(query)}&limit=100`,
   );
 }
 
-export function getSessionMessages(connection: AgentConnection, sessionId: string, profile?: string) {
-  return brioFetch<{ messages: HermesMessage[]; error?: string }>(
+export async function getSessionMessages(connection: AgentConnection, sessionId: string, profile?: string) {
+  const response = await brioFetch<HermesMessageListEnvelope>(
     connection,
-    scopedPath(`/sessions/${encodeURIComponent(sessionId)}/messages`, profile),
+    scopedPath(`/api/sessions/${encodeURIComponent(sessionId)}/messages`, profile),
   );
+  return normalizeMessageList(response);
 }
 
 export function startRun(
@@ -748,13 +856,12 @@ export function stopRun(connection: AgentConnection, runId: string, profile?: st
   );
 }
 
-export function listFiles(connection: AgentConnection, path?: string) {
-  return brioFetch<{
-    path: string;
-    entries: HermesFileEntry[];
-    roots?: string[];
-    error?: string;
-  }>(connection, `/files${path ? `?path=${encodeURIComponent(path)}` : ''}`);
+export async function listFiles(connection: AgentConnection, path?: string) {
+  const response = await brioFetch<HermesControlFileList>(
+    connection,
+    `/files${path ? `?path=${encodeURIComponent(path)}` : ''}`,
+  );
+  return normalizeFileList(response);
 }
 
 export function readFile(connection: AgentConnection, path: string) {
@@ -796,15 +903,22 @@ export function updateRawConfig(connection: AgentConnection, yaml: string) {
   });
 }
 
-export function listSkills(connection: AgentConnection) {
-  return brioFetch<{ skills: HermesSkill[] }>(connection, '/skills');
+export async function listSkills(connection: AgentConnection) {
+  const response = await brioFetch<HermesControlSkill[] | { skills?: HermesControlSkill[] }>(
+    connection,
+    '/skills',
+  );
+  return normalizeSkills(response);
 }
 
-export function getToolsets(connection: AgentConnection) {
-  return brioFetch<{ toolsets: Record<string, string[]>; error?: string }>(
+export async function getToolsets(connection: AgentConnection) {
+  const response = await brioFetch<
+    HermesControlToolset[] | { toolsets?: Record<string, string[]>; error?: string }
+  >(
     connection,
     '/tools/toolsets',
   );
+  return normalizeToolsets(response);
 }
 
 export function updateToolset(
@@ -820,11 +934,18 @@ export function updateToolset(
   );
 }
 
-export function getGatewayStatus(connection: AgentConnection) {
-  return brioFetch<{ running: boolean; status?: unknown; raw?: string }>(
+export async function getGatewayStatus(connection: AgentConnection) {
+  const response = await brioFetch<{
+    running?: boolean;
+    gateway_running?: boolean;
+    status?: unknown;
+    raw?: string;
+    [key: string]: unknown;
+  }>(
     connection,
     '/gateway/status',
   );
+  return { ...response, running: response.running ?? response.gateway_running ?? false };
 }
 
 export function restartGateway(connection: AgentConnection) {
@@ -2037,10 +2158,12 @@ class RelaySocketClient {
     }
 
     if ((frame.status ?? 500) >= 400) {
-      const message =
+      const message = apiErrorMessage(
         typeof frame.body === 'object' && frame.body && 'error' in frame.body
-          ? String((frame.body as { error?: unknown }).error)
-          : `Request failed: ${frame.status}`;
+          ? (frame.body as { error?: unknown }).error
+          : undefined,
+        `Request failed: ${frame.status}`,
+      );
       pending.reject(new Error(message));
       return;
     }
@@ -2094,6 +2217,17 @@ class RelaySocketClient {
       void this.connect().catch(() => this.scheduleReconnect());
     }, delay);
   }
+}
+
+function apiErrorMessage(value: unknown, fallback: string): string {
+  if (typeof value === 'string' && value.trim()) return value;
+  if (value && typeof value === 'object') {
+    const nested = value as { message?: unknown; detail?: unknown; code?: unknown };
+    for (const candidate of [nested.message, nested.detail, nested.code]) {
+      if (typeof candidate === 'string' && candidate.trim()) return candidate;
+    }
+  }
+  return fallback;
 }
 
 function relayChannelID() {

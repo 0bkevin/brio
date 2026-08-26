@@ -3,7 +3,7 @@ import { ActivityIndicator, Pressable, ScrollView, StyleSheet, View } from 'reac
 import { SafeAreaView } from 'react-native-safe-area-context';
 
 import { DashboardCard, SectionLabel, StatusBadge } from '@/components/dashboard';
-import { brioFetch, getCapabilities, getHealth } from '@/lib/brio';
+import { getCapabilities, getHealth, getMemory, listSessions } from '@/lib/brio';
 import { ThemedText } from '@/components/themed-text';
 import { ThemedView } from '@/components/themed-view';
 import { BottomTabInset, MaxContentWidth, Spacing } from '@/constants/theme';
@@ -26,12 +26,12 @@ export default function ManageScreen() {
   });
   const sessions = useQuery({
     queryKey: ['sessions', connection?.url],
-    queryFn: () => brioFetch<{ sessions: unknown[] }>(connection!, '/sessions?limit=5'),
+    queryFn: () => listSessions(connection!, 5),
     enabled: Boolean(connection),
   });
   const memory = useQuery({
     queryKey: ['memory', connection?.url],
-    queryFn: () => brioFetch<{ memory: string; user: string }>(connection!, '/memory'),
+    queryFn: () => getMemory(connection!),
     enabled: Boolean(connection),
   });
 

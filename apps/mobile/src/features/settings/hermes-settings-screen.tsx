@@ -146,7 +146,7 @@ export function HermesSettingsScreen({ connection }: { connection: AgentConnecti
           </View>
         </Section>
 
-        <AppText style={[styles.footer, { color: colors.tertiary }]}>Brio · Hermes mobile control plane</AppText>
+        <AppText style={[styles.footer, { color: colors.tertiary }]}>Hermes mobile control</AppText>
       </ScrollView>
 
       {panel ? (

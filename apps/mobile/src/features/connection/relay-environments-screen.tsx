@@ -1,7 +1,6 @@
 import { useClerk } from '@clerk/expo';
 import { useMutation, useQuery } from '@tanstack/react-query';
 import * as Clipboard from 'expo-clipboard';
-import { SymbolView } from 'expo-symbols';
 import { useEffect, useState } from 'react';
 import { RefreshControl, ScrollView, StyleSheet, View } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
@@ -243,13 +242,6 @@ function RelayEnvironmentsContent({
             </Card>
           ) : (
             <Card style={styles.messageCard}>
-              <View style={[styles.emptyIcon, { backgroundColor: colors.subtle }]}>
-                <SymbolView
-                  name="externaldrive.connected.to.line.below"
-                  size={21}
-                  tintColor={colors.secondary}
-                />
-              </View>
               <AppText style={styles.messageTitle}>No Relay environments yet</AppText>
               <AppText style={[styles.message, { color: colors.muted }]}>
                 Generate an enrollment code below to attach a Hermes machine.
@@ -410,13 +402,6 @@ const styles = StyleSheet.create({
   messageCard: { alignItems: 'center', gap: T3Spacing.md, padding: T3Spacing.xxl },
   messageTitle: { fontFamily: T3Typography.bold, fontSize: 16, textAlign: 'center' },
   message: { fontSize: 13, lineHeight: 19, textAlign: 'center' },
-  emptyIcon: {
-    alignItems: 'center',
-    borderRadius: T3Radius.medium,
-    height: 48,
-    justifyContent: 'center',
-    width: 48,
-  },
   formCard: { gap: T3Spacing.md, padding: T3Spacing.lg },
   cardTitle: { fontFamily: T3Typography.bold, fontSize: 16, lineHeight: 21 },
   cardDetail: { fontSize: 13, lineHeight: 19 },

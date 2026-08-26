@@ -3,17 +3,10 @@ import { Buffer } from 'node:buffer';
 import test from 'node:test';
 
 import {
-  aggregateRootAgentUsage,
-  connectionFromPairingPayload,
-  decodePairingPayload,
-  extractPairingPayload,
-  filterAgentsForControlSession,
-  finalizeConnection,
-  getHealth,
-  normalizeConnectionURL,
-  parseGoalStatus,
-  parseHeartbeatStatus,
-} from './brio.ts';
+  explainConnectionError,
+  friendlyPayloadError,
+  validateManualConnection,
+} from '../features/connection/connection-experience.ts';
 import {
   removeStoredConnection,
   removeStoredConnectionsWhere,
@@ -21,10 +14,93 @@ import {
   validStoredConnections,
 } from '../state/connection-store-model.ts';
 import {
-  explainConnectionError,
-  friendlyPayloadError,
-  validateManualConnection,
-} from '../features/connection/connection-experience.ts';
+  aggregateRootAgentUsage,
+  brioFetch,
+  connectionFromPairingPayload,
+  decodePairingPayload,
+  extractPairingPayload,
+  filterAgentsForControlSession,
+  finalizeConnection,
+  getHealth,
+  normalizeMessageList,
+  normalizeCapabilities,
+  normalizeFileList,
+  normalizeHealth,
+  normalizeSessionList,
+  normalizeSkills,
+  normalizeToolsets,
+  normalizeConnectionURL,
+  parseGoalStatus,
+  parseHeartbeatStatus,
+} from './brio.ts';
+
+test('normalizes current Hermes list envelopes without breaking legacy responses', () => {
+  const sessions = [{ id: 's1' }];
+  const messages = [{ role: 'assistant', content: 'ok' }];
+  assert.deepEqual(normalizeSessionList({ data: sessions }).sessions, sessions);
+  assert.deepEqual(normalizeSessionList({ sessions }).sessions, sessions);
+  assert.deepEqual(normalizeMessageList({ data: messages }).messages, messages);
+  assert.deepEqual(normalizeMessageList({ messages }).messages, messages);
+});
+
+test('normalizes native Hermes health and capabilities for connection screens', () => {
+  assert.deepEqual(
+    normalizeHealth({ status: 'ok', platform: 'hermes-agent', version: '0.20.5' }),
+    {
+      status: 'ok',
+      platform: 'hermes-agent',
+      version: '0.20.5',
+      ok: true,
+      agent_ok: true,
+      agent_kind: 'hermes',
+      agent_name: 'Hermes Agent',
+      hermes_ok: true,
+    },
+  );
+  assert.deepEqual(
+    normalizeCapabilities({ features: { responses_api: true, audio_api: false } }).companion,
+    { responses_api: true, audio_api: false },
+  );
+});
+
+test('normalizes current Hermes dashboard resources for the Mobile screens', () => {
+  const files = normalizeFileList({
+    path: '/workspace',
+    entries: [{ name: 'src', path: '/workspace/src', is_directory: true, size: null }],
+    root: '/workspace',
+  });
+  assert.equal(files.entries[0].dir, true);
+  assert.equal(files.entries[0].size, 0);
+  assert.deepEqual(files.roots, ['/workspace']);
+
+  const skills = normalizeSkills([
+    { name: 'browser', category: 'web', provenance: 'bundled', enabled: true },
+  ]);
+  assert.equal(skills.skills[0].path, 'bundled');
+
+  const toolsets = normalizeToolsets([
+    { name: 'browser', platform: 'cli', enabled: true },
+    { name: 'vision', platform: 'cli', enabled: false },
+  ]);
+  assert.deepEqual(toolsets.toolsets, { cli: ['browser'] });
+});
+
+test('surfaces structured API errors as useful messages', async () => {
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async () =>
+    new Response(JSON.stringify({ error: { code: 'not_found', message: 'Session does not exist' } }), {
+      headers: { 'Content-Type': 'application/json' },
+      status: 404,
+    });
+  try {
+    await assert.rejects(
+      brioFetch({ url: 'http://127.0.0.1:8787', token: 'secret', transport: 'direct' }, '/missing'),
+      /Session does not exist/,
+    );
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
 
 const directPayload = {
   url: 'http://192.168.1.25:8787',

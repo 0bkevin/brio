@@ -1,9 +1,12 @@
 import { useQuery } from '@tanstack/react-query';
-import { useRouter } from 'expo-router';
-import { SymbolView } from 'expo-symbols';
+import { useRouter, type Href } from 'expo-router';
 import { useEffect, useMemo, useState } from 'react';
 import {
   FlatList,
+  KeyboardAvoidingView,
+  Modal,
+  PanResponder,
+  Platform,
   Pressable,
   RefreshControl,
   ScrollView,
@@ -13,11 +16,13 @@ import {
 } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 
+import { SessionModelControls } from '@/components/session-model-controls';
 import { AppText, AppTextInput, EmptyState, StatusDot } from '@/components/t3-ui';
 import { SPLIT_LAYOUT_MIN_WIDTH, T3Radius, T3Spacing, T3Typography } from '@/constants/t3-theme';
 import { useT3Theme } from '@/hooks/use-t3-theme';
 import {
   getHealth,
+  getModelOptions,
   listSessions,
   searchSessions,
   type AgentConnection,
@@ -32,14 +37,28 @@ import {
   type HermesProfile,
 } from '@/lib/profiles';
 import { resolveBrioDeepLink } from '@/lib/profiles-model';
+import { modelIncompatibilities, selectedCapabilities } from '@/lib/session-runtime';
+import { useComposerStore } from '@/state/composer-store';
+import type { ChatModelOverride, ChatThread } from '@/state/chat-thread-model';
 import { useDeepLinkStore } from '@/state/deep-link-store';
 import { useProfileStore } from '@/state/profile-store';
+
+const SWIPE_DISTANCE = 64;
 
 export function HermesHomeScreen({ connection }: { connection: AgentConnection }) {
   const colors = useT3Theme();
   const router = useRouter();
   const { width } = useWindowDimensions();
+  const [historyOpen, setHistoryOpen] = useState(false);
+  const [settingsOpen, setSettingsOpen] = useState(false);
   const [search, setSearch] = useState('');
+  const [startError, setStartError] = useState('');
+  const [starting, setStarting] = useState(false);
+  const [composerFocused, setComposerFocused] = useState(false);
+  const [modelPickerOpen, setModelPickerOpen] = useState(false);
+  const [newThreadModels, setNewThreadModels] = useState<
+    Record<string, ChatModelOverride | undefined>
+  >({});
   const agentId = environmentId(connection);
   const storedProfiles = useProfileStore((state) => state.activeProfiles);
   const setActiveProfile = useProfileStore((state) => state.setActiveProfile);
@@ -61,6 +80,14 @@ export function HermesHomeScreen({ connection }: { connection: AgentConnection }
     : profilesQuery.data
       ? profileName(profilesQuery.data.active)
       : DEFAULT_PROFILE_NAME;
+  const activeProfileData = profiles.find((profile) => profile.name === activeProfile);
+  const composerKey = `${connection.id}:${activeProfile}:new`;
+  const newThreadModel = newThreadModels[composerKey];
+  const composerHydrated = useComposerStore((state) => state.hydrated);
+  const draft = useComposerStore((state) => state.drafts[composerKey] ?? '');
+  const setDraft = useComposerStore((state) => state.setDraft);
+  const enqueueDraft = useComposerStore((state) => state.enqueueDraft);
+
   useEffect(() => {
     if (!pendingDeepLink || !profilesQuery.data) return;
     const resolved = resolveBrioDeepLink(pendingDeepLink, agentId, profiles);
@@ -87,10 +114,17 @@ export function HermesHomeScreen({ connection }: { connection: AgentConnection }
     router,
     setActiveProfile,
   ]);
+
   const health = useQuery({
     queryKey: ['home-health', connection.id, connection.url],
     queryFn: () => getHealth(connection),
     refetchInterval: 15_000,
+  });
+  const modelOptions = useQuery({
+    queryKey: ['model-options', connection.id, connection.url, activeProfile],
+    queryFn: () => getModelOptions(connection, false, activeProfile),
+    staleTime: 5 * 60_000,
+    retry: 1,
   });
   const sessions = useQuery({
     queryKey: ['sessions', connection.id, connection.url, activeProfile],
@@ -118,187 +152,419 @@ export function HermesHomeScreen({ connection }: { connection: AgentConnection }
     );
   }, [resultIds, search, sessions.data?.sessions]);
   const split = width >= SPLIT_LAYOUT_MIN_WIDTH;
-  const threadPath = (sessionId: string) =>
-    `/thread/${encodeURIComponent(sessionId)}${
-      isNamedProfile(activeProfile) ? `?profile=${encodeURIComponent(activeProfile)}` : ''
-    }` as const;
-  const startNewTask = () => {
-    const sessionId = `brio_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
-    router.push(threadPath(sessionId));
+  const threadPath = (sessionId: string, override?: ChatModelOverride) => {
+    const params: string[] = [];
+    if (isNamedProfile(activeProfile)) {
+      params.push(`profile=${encodeURIComponent(activeProfile)}`);
+    }
+    if (override) {
+      params.push(`provider=${encodeURIComponent(override.provider)}`);
+      params.push(`model=${encodeURIComponent(override.model)}`);
+      if (override.reasoningEffort) {
+        params.push(`effort=${encodeURIComponent(override.reasoningEffort)}`);
+      }
+      if (typeof override.fast === 'boolean') params.push(`fast=${String(override.fast)}`);
+    }
+    return `/thread/${encodeURIComponent(sessionId)}${params.length ? `?${params.join('&')}` : ''}` as const;
   };
 
+  const homeSwipe = useMemo(
+    () =>
+      createHorizontalSwipe({
+        onLeft: () => setHistoryOpen(true),
+        onRight: () => setSettingsOpen(true),
+      }),
+    [],
+  );
+  const historySwipe = useMemo(
+    () => createHorizontalSwipe({ onRight: () => setHistoryOpen(false) }),
+    [],
+  );
+  const settingsSwipe = useMemo(
+    () => createHorizontalSwipe({ onLeft: () => setSettingsOpen(false) }),
+    [],
+  );
+
+  const startNewTask = async () => {
+    if (!composerHydrated || !draft.trim() || starting) return;
+    setStartError('');
+    setStarting(true);
+    try {
+      const queued = await enqueueDraft(composerKey, 'queue', newThreadModel);
+      if (!queued) {
+        setStartError('Write a message for Hermes before starting.');
+        return;
+      }
+      router.push(threadPath('new', newThreadModel));
+    } catch (reason) {
+      setStartError(reason instanceof Error ? reason.message : 'Could not start this conversation.');
+    } finally {
+      setStarting(false);
+    }
+  };
+  const openThread = (sessionId: string) => {
+    setHistoryOpen(false);
+    router.push(threadPath(sessionId));
+  };
+  const openTool = (href: Href) => {
+    setSettingsOpen(false);
+    router.push(href);
+  };
+  const agentStatus = activeProfileData?.gateway_running === false
+    ? 'offline'
+    : health.isError
+      ? 'error'
+      : health.data?.hermes_ok
+        ? 'online'
+        : 'busy';
+  const newThread: ChatThread = {
+    id: 'new',
+    profile: activeProfile,
+    title: 'New Thread',
+    createdAt: 0,
+    updatedAt: 0,
+    messages: [],
+    ...(newThreadModel ? { modelOverride: newThreadModel } : {}),
+  };
+  const composerDestination =
+    activeProfileData?.alias_name?.trim() || connection.name?.trim() || 'Hermes';
+  const selectedModelBlocked = Boolean(
+    newThreadModel &&
+      modelIncompatibilities(
+        selectedCapabilities(
+          modelOptions.data ?? { model: null, provider: null, providers: [] },
+          newThreadModel.provider,
+          newThreadModel.model,
+        ),
+        { vision: false, tools: true },
+      ).length,
+  );
+  const canStart =
+    composerHydrated && Boolean(draft.trim()) && !starting && !selectedModelBlocked;
+  const composerExpanded = composerFocused || modelPickerOpen;
+
   return (
-    <SafeAreaView edges={['top', 'left', 'right']} style={[styles.safe, { backgroundColor: colors.screen }]}>
-      <View style={[styles.header, { borderBottomColor: colors.border }]}>
-        <View style={styles.brandRow}>
+    <SafeAreaView
+      {...(historyOpen || settingsOpen ? {} : homeSwipe.panHandlers)}
+      edges={['top', 'bottom', 'left', 'right']}
+      style={[styles.safe, { backgroundColor: colors.screen }]}>
+      <KeyboardAvoidingView
+        behavior={Platform.OS === 'ios' ? 'padding' : 'height'}
+        style={styles.safe}>
+        <View style={[styles.threadHeader, { borderBottomColor: colors.border }]}>
           <Pressable
-            accessibilityHint="Opens saved environments"
-            accessibilityLabel={`Current environment: ${connection.name || 'Hermes'}`}
+            accessibilityHint="Opens conversation history"
+            accessibilityLabel="Conversation history"
             accessibilityRole="button"
             hitSlop={8}
-            onPress={() => router.push('/environments')}
-            style={({ pressed }) => [styles.environmentButton, { opacity: pressed ? 0.6 : 1 }]}
-          >
-            <AppText style={styles.brand}>Brio</AppText>
-            <View style={styles.environmentRow}>
-              <StatusDot status={health.data?.hermes_ok ? 'online' : health.isError ? 'error' : 'busy'} />
-              <AppText numberOfLines={1} style={[styles.environment, { color: colors.muted }]}>
-                {connection.name || 'Hermes'}
-              </AppText>
-              <SymbolView name="chevron.down" size={10} tintColor={colors.tertiary} />
-            </View>
+            onPress={() => setHistoryOpen(true)}
+            style={({ pressed }) => [styles.backButton, { opacity: pressed ? 0.5 : 1 }]}>
+            <AppText style={styles.backChevron}>‹</AppText>
           </Pressable>
-          <View style={styles.headerActions}>
-            <HeaderButton
-              accessibilityLabel="Manage Hermes profiles"
-              icon="person.2"
-              onPress={() => router.push('/profiles')}
-            />
-            <HeaderButton
-              accessibilityLabel="Open Command Center"
-              icon="square.grid.2x2"
-              onPress={() => router.push('/command-center')}
-            />
-            <HeaderButton
-              accessibilityLabel="Browse files"
-              icon="folder"
-              onPress={() => router.push('/files')}
-            />
-            <HeaderButton
-              accessibilityLabel="Open settings"
-              icon="gearshape"
-              onPress={() => router.push('/settings')}
-            />
-          </View>
+          <AppText style={styles.threadTitle}>New Thread</AppText>
         </View>
-        {profiles.length > 1 ? (
-          <ScrollView
-            contentContainerStyle={styles.profileChips}
-            horizontal
-            showsHorizontalScrollIndicator={false}>
-            {profiles.map((profile) => {
-              const selected = profile.name === activeProfile;
-              return (
+
+        <View style={styles.conversationCanvas} />
+
+        <View style={[styles.composerDock, split && styles.composerDockWide]}>
+          {startError ? (
+            <AppText style={[styles.startError, { color: colors.danger }]}>{startError}</AppText>
+          ) : null}
+          <View
+            style={[
+              styles.promptComposer,
+              composerExpanded ? styles.promptComposerExpanded : styles.promptComposerCollapsed,
+              { backgroundColor: colors.cardAlt, borderColor: colors.border },
+            ]}>
+            <View style={composerExpanded ? styles.expandedInputRow : styles.collapsedInputRow}>
+              <AppTextInput
+                accessibilityLabel="Describe a coding task"
+                maxLength={20000}
+                multiline
+                onChangeText={(value) => setDraft(composerKey, value)}
+                onBlur={() => setComposerFocused(false)}
+                onFocus={() => setComposerFocused(true)}
+                placeholder={`Describe a coding task in ${composerDestination}`}
+                style={[
+                  styles.promptInput,
+                  composerExpanded ? styles.promptInputExpanded : styles.promptInputCollapsed,
+                  { backgroundColor: 'transparent', borderColor: 'transparent' },
+                ]}
+                textAlignVertical="top"
+                value={draft}
+              />
+              {!composerExpanded ? (
                 <Pressable
-                  accessibilityLabel={`Switch to profile ${profile.name}`}
+                  accessibilityLabel="Send to Hermes"
                   accessibilityRole="button"
-                  accessibilityState={{ selected }}
-                  key={profile.name}
-                  onPress={() =>
-                    void setActiveProfile(
-                      agentId,
-                      isNamedProfile(profile.name) ? profile.name : undefined,
-                    )
-                  }
+                  disabled={!canStart}
+                  onPress={() => void startNewTask()}
                   style={({ pressed }) => [
-                    styles.profileChip,
+                    styles.sendButton,
                     {
-                      backgroundColor: selected ? colors.primary : colors.subtleStrong,
-                      borderColor: selected ? colors.primary : colors.border,
+                      backgroundColor: canStart ? colors.primary : colors.subtleStrong,
                       opacity: pressed ? 0.65 : 1,
                     },
                   ]}>
-                  <StatusDot status={profile.gateway_running ? 'online' : 'offline'} />
                   <AppText
-                    numberOfLines={1}
                     style={[
-                      styles.profileLabel,
-                      { color: selected ? colors.primaryForeground : colors.foreground },
+                      styles.sendLabel,
+                      {
+                        color: canStart ? colors.primaryForeground : colors.tertiary,
+                      },
                     ]}>
-                    {profile.name}
+                    {starting ? '…' : '↑'}
                   </AppText>
                 </Pressable>
-              );
-            })}
-          </ScrollView>
-        ) : null}
-        <AppTextInput
-          accessibilityLabel="Search conversations"
-          onChangeText={setSearch}
-          placeholder="Search"
-          returnKeyType="search"
-          style={[styles.search, { backgroundColor: colors.subtleStrong, borderColor: 'transparent' }]}
-          value={search}
-        />
-      </View>
+              ) : null}
+            </View>
+            {composerExpanded ? (
+              <View style={styles.promptFooter}>
+                <SessionModelControls
+                  onOverrideChange={(override) =>
+                    setNewThreadModels((current) => ({ ...current, [composerKey]: override }))
+                  }
+                  onOpenChange={setModelPickerOpen}
+                  options={modelOptions.data}
+                  optionsError={modelOptions.isError}
+                  optionsLoading={modelOptions.isLoading}
+                  showUsage={false}
+                  thread={newThread}
+                  variant="inline"
+                />
+                <View style={styles.footerSpacer} />
+                <Pressable
+                  accessibilityLabel="Send to Hermes"
+                  accessibilityRole="button"
+                  disabled={!canStart}
+                  onPress={() => void startNewTask()}
+                  style={({ pressed }) => [
+                    styles.sendButton,
+                    {
+                      backgroundColor: canStart ? colors.primary : colors.subtleStrong,
+                      opacity: pressed ? 0.65 : 1,
+                    },
+                  ]}>
+                  <AppText
+                    style={[
+                      styles.sendLabel,
+                      { color: canStart ? colors.primaryForeground : colors.tertiary },
+                    ]}>
+                    {starting ? '…' : '↑'}
+                  </AppText>
+                </Pressable>
+              </View>
+            ) : null}
+          </View>
+        </View>
+      </KeyboardAvoidingView>
 
-      {sessions.isLoading ? (
-        <EmptyState detail="Loading your Hermes conversations." loading title="Connecting to Hermes" />
-      ) : sessions.isError ? (
-        <EmptyState
-          action={
-            <Pressable onPress={() => void sessions.refetch()} style={styles.retry}>
-              <AppText style={{ color: colors.userBubble }}>Try again</AppText>
-            </Pressable>
-          }
-          detail={sessions.error instanceof Error ? sessions.error.message : 'The environment is unavailable.'}
-          title="Environment unavailable"
-        />
-      ) : (
-        <FlatList
-          contentContainerStyle={[
-            styles.listContent,
-            split && styles.listContentWide,
-            visibleSessions.length === 0 && styles.emptyList,
-          ]}
-          data={visibleSessions}
-          keyExtractor={(item) => item.id}
-          ListEmptyComponent={
-            <EmptyState
-              detail={
-                search
-                  ? 'No messages or sessions match this search.'
-                  : 'Start a task to create your first Hermes conversation.'
-              }
-              title={search ? 'No results' : 'No conversations yet'}
+      <Modal animationType="fade" onRequestClose={() => setHistoryOpen(false)} visible={historyOpen}>
+        <SafeAreaView
+          {...historySwipe.panHandlers}
+          edges={['top', 'bottom', 'left', 'right']}
+          style={[styles.panel, { backgroundColor: colors.screen }]}>
+          <PanelHeader
+            detail="Swipe right to return"
+            onClose={() => setHistoryOpen(false)}
+            title="History"
+          />
+          <View style={[styles.panelSearch, split && styles.panelWide]}>
+            <AppTextInput
+              accessibilityLabel="Search conversations"
+              onChangeText={setSearch}
+              placeholder="Search conversations"
+              returnKeyType="search"
+              style={[
+                styles.search,
+                { backgroundColor: colors.subtleStrong, borderColor: 'transparent' },
+              ]}
+              value={search}
             />
-          }
-          refreshControl={
-            <RefreshControl refreshing={sessions.isRefetching} onRefresh={() => void sessions.refetch()} />
-          }
-          renderItem={({ item }) => (
-            <SessionRow session={item} onPress={() => router.push(threadPath(item.id))} />
-          )}
-        />
-      )}
+          </View>
+          <FlatList
+            contentContainerStyle={[
+              styles.historyContent,
+              split && styles.panelWide,
+              visibleSessions.length === 0 && styles.emptyHistory,
+            ]}
+            data={sessions.isError ? [] : visibleSessions}
+            keyExtractor={(item) => item.id}
+            ListEmptyComponent={
+              sessions.isLoading ? (
+                <EmptyState
+                  detail="Loading your Hermes conversations."
+                  loading
+                  title="Connecting to Hermes"
+                />
+              ) : sessions.isError ? (
+                <EmptyState
+                  action={
+                    <Pressable onPress={() => void sessions.refetch()} style={styles.retry}>
+                      <AppText style={{ color: colors.userBubble }}>Try again</AppText>
+                    </Pressable>
+                  }
+                  detail={
+                    sessions.error instanceof Error
+                      ? sessions.error.message
+                      : 'The environment is unavailable.'
+                  }
+                  title="History unavailable"
+                />
+              ) : (
+                <EmptyState
+                  detail={
+                    search
+                      ? 'No messages or conversations match this search.'
+                      : 'Your conversations with Hermes will appear here.'
+                  }
+                  title={search ? 'No results' : 'No conversations yet'}
+                />
+              )
+            }
+            refreshControl={
+              <RefreshControl
+                refreshing={sessions.isRefetching}
+                onRefresh={() => void sessions.refetch()}
+              />
+            }
+            renderItem={({ item }) => (
+              <SessionRow session={item} onPress={() => openThread(item.id)} />
+            )}
+          />
+        </SafeAreaView>
+      </Modal>
 
-      <Pressable
-        accessibilityLabel="Start a new task"
-        accessibilityRole="button"
-        onPress={startNewTask}
-        style={({ pressed }) => [
-          styles.fab,
-          { backgroundColor: colors.primary, opacity: pressed ? 0.72 : 1 },
-        ]}>
-        <SymbolView name="plus" size={22} tintColor={colors.primaryForeground} />
-        {split ? (
-          <AppText style={[styles.fabLabel, { color: colors.primaryForeground }]}>New task</AppText>
-        ) : null}
-      </Pressable>
+      <Modal animationType="fade" onRequestClose={() => setSettingsOpen(false)} visible={settingsOpen}>
+        <SafeAreaView
+          {...settingsSwipe.panHandlers}
+          edges={['top', 'bottom', 'left', 'right']}
+          style={[styles.panel, { backgroundColor: colors.screen }]}>
+          <PanelHeader
+            detail="Swipe left to return"
+            onClose={() => setSettingsOpen(false)}
+            title="Settings & tools"
+          />
+          <ScrollView
+            contentContainerStyle={[styles.settingsContent, split && styles.panelWide]}
+            showsVerticalScrollIndicator={false}>
+            <Pressable
+              accessibilityLabel={`Current environment: ${connection.name || 'Hermes'}`}
+              accessibilityRole="button"
+              onPress={() => openTool('/environments')}
+              style={({ pressed }) => [
+                styles.environmentCard,
+                {
+                  backgroundColor: colors.card,
+                  borderColor: colors.border,
+                  opacity: pressed ? 0.6 : 1,
+                },
+              ]}>
+              <StatusDot status={agentStatus} />
+              <View style={styles.environmentCopy}>
+                <AppText style={styles.environmentName}>{connection.name || 'Hermes'}</AppText>
+                <AppText numberOfLines={1} style={[styles.environmentMeta, { color: colors.muted }]}>
+                  {activeProfile}
+                  {activeProfileData?.model ? ` · ${activeProfileData.model}` : ''}
+                </AppText>
+              </View>
+              <AppText style={{ color: colors.tertiary }}>›</AppText>
+            </Pressable>
+            <View style={[styles.menu, { backgroundColor: colors.card, borderColor: colors.border }]}>
+              <MenuRow
+                detail="Agents, models, and identity"
+                label="Profiles"
+                onPress={() => openTool('/profiles')}
+              />
+              <MenuRow
+                detail="Runs, sessions, and controls"
+                label="Command Center"
+                onPress={() => openTool('/command-center')}
+              />
+              <MenuRow
+                detail="Browse the connected workspace"
+                label="Files"
+                onPress={() => openTool('/files')}
+              />
+              <MenuRow
+                detail="Hermes and connection preferences"
+                label="Settings"
+                onPress={() => openTool('/settings')}
+              />
+            </View>
+          </ScrollView>
+        </SafeAreaView>
+      </Modal>
     </SafeAreaView>
   );
 }
 
-function HeaderButton({
-  accessibilityLabel,
-  icon,
-  onPress,
+function createHorizontalSwipe({
+  onLeft,
+  onRight,
 }: {
-  accessibilityLabel: string;
-  icon: 'folder' | 'gearshape' | 'person.2' | 'square.grid.2x2';
-  onPress: () => void;
+  onLeft?: () => void;
+  onRight?: () => void;
+}) {
+  const wantsHorizontalSwipe = (_: unknown, gesture: { dx: number; dy: number }) =>
+    Math.abs(gesture.dx) > 18 && Math.abs(gesture.dx) > Math.abs(gesture.dy) * 1.4;
+  return PanResponder.create({
+    onMoveShouldSetPanResponder: wantsHorizontalSwipe,
+    onMoveShouldSetPanResponderCapture: wantsHorizontalSwipe,
+    onPanResponderRelease: (_, gesture) => {
+      if (gesture.dx <= -SWIPE_DISTANCE) onLeft?.();
+      if (gesture.dx >= SWIPE_DISTANCE) onRight?.();
+    },
+    onPanResponderTerminationRequest: () => true,
+  });
+}
+
+function PanelHeader({
+  detail,
+  onClose,
+  title,
+}: {
+  detail: string;
+  onClose: () => void;
+  title: string;
 }) {
   const colors = useT3Theme();
   return (
+    <View style={[styles.panelHeader, { borderBottomColor: colors.border }]}>
+      <View style={styles.panelHeaderCopy}>
+        <AppText style={styles.panelTitle}>{title}</AppText>
+        <AppText style={[styles.panelDetail, { color: colors.muted }]}>{detail}</AppText>
+      </View>
+      <Pressable
+        accessibilityLabel="Return to chat"
+        accessibilityRole="button"
+        onPress={onClose}
+        style={({ pressed }) => [
+          styles.chatButton,
+          { backgroundColor: colors.subtleStrong, opacity: pressed ? 0.6 : 1 },
+        ]}>
+        <AppText style={styles.chatButtonLabel}>Chat</AppText>
+      </Pressable>
+    </View>
+  );
+}
+
+function MenuRow({ detail, label, onPress }: { detail: string; label: string; onPress: () => void }) {
+  const colors = useT3Theme();
+  return (
     <Pressable
-      accessibilityLabel={accessibilityLabel}
+      accessibilityLabel={label}
       accessibilityRole="button"
       onPress={onPress}
       style={({ pressed }) => [
-        styles.headerButton,
-        { backgroundColor: colors.subtleStrong, opacity: pressed ? 0.55 : 1 },
+        styles.menuRow,
+        { borderTopColor: colors.separator, opacity: pressed ? 0.55 : 1 },
       ]}>
-      <SymbolView name={icon} size={18} tintColor={colors.foreground} />
+      <View style={styles.menuCopy}>
+        <AppText style={styles.menuLabel}>{label}</AppText>
+        <AppText style={[styles.menuDetail, { color: colors.muted }]}>{detail}</AppText>
+      </View>
+      <AppText style={{ color: colors.tertiary }}>›</AppText>
     </Pressable>
   );
 }
@@ -315,9 +581,6 @@ function SessionRow({ session, onPress }: { session: HermesSession; onPress: () 
         styles.sessionRow,
         { borderBottomColor: colors.separator, opacity: pressed ? 0.55 : 1 },
       ]}>
-      <View style={[styles.sessionIcon, { backgroundColor: colors.subtle }]}>
-        <SymbolView name="text.bubble" size={18} tintColor={colors.secondary} />
-      </View>
       <View style={styles.sessionCopy}>
         <View style={styles.sessionTitleRow}>
           <AppText numberOfLines={1} style={styles.sessionTitle}>
@@ -348,56 +611,93 @@ function formatRelativeTime(timestamp: number) {
 
 const styles = StyleSheet.create({
   safe: { flex: 1 },
-  header: {
+  threadHeader: {
+    alignItems: 'center',
     borderBottomWidth: StyleSheet.hairlineWidth,
-    gap: T3Spacing.lg,
-    paddingBottom: T3Spacing.lg,
-    paddingHorizontal: T3Spacing.xl,
-    paddingTop: T3Spacing.md,
+    flexDirection: 'row',
+    minHeight: 62,
+    paddingHorizontal: T3Spacing.lg,
   },
-  brandRow: { alignItems: 'center', flexDirection: 'row', justifyContent: 'space-between' },
-  environmentButton: { flexShrink: 1 },
-  brand: { fontFamily: T3Typography.bold, fontSize: 26, lineHeight: 32 },
-  environmentRow: { alignItems: 'center', flexDirection: 'row', gap: 7 },
-  environment: { fontSize: 13, lineHeight: 17, maxWidth: 220 },
-  headerActions: { flexDirection: 'row', gap: T3Spacing.sm },
-  profileChips: { gap: T3Spacing.sm },
-  profileChip: {
+  backButton: {
+    alignItems: 'center',
+    height: 44,
+    justifyContent: 'center',
+    marginLeft: -8,
+    width: 44,
+  },
+  backChevron: { fontSize: 42, fontFamily: T3Typography.regular, lineHeight: 42 },
+  threadTitle: {
+    fontFamily: T3Typography.bold,
+    fontSize: 22,
+    letterSpacing: -0.25,
+    lineHeight: 28,
+  },
+  conversationCanvas: { flex: 1 },
+  composerDock: { paddingBottom: T3Spacing.sm, paddingHorizontal: T3Spacing.lg, paddingTop: T3Spacing.sm },
+  composerDockWide: { alignSelf: 'center', maxWidth: 760, width: '100%' },
+  promptComposer: {
+    borderWidth: StyleSheet.hairlineWidth,
+    overflow: 'hidden',
+  },
+  promptComposerCollapsed: {
+    borderRadius: T3Radius.pill,
+    minHeight: 54,
+    paddingBottom: 5,
+    paddingLeft: 0,
+    paddingRight: 5,
+    paddingTop: 5,
+  },
+  promptComposerExpanded: {
+    borderRadius: 26,
+    minHeight: 140,
+    paddingBottom: 6,
+    paddingHorizontal: 14,
+    paddingTop: 14,
+  },
+  collapsedInputRow: { alignItems: 'center', flexDirection: 'row' },
+  expandedInputRow: { minHeight: 78 },
+  promptInput: {
+    flex: 1,
+    fontSize: 17,
+    lineHeight: 24,
+  },
+  promptInputCollapsed: { borderWidth: 0, height: 36, minHeight: 36, paddingHorizontal: 18, paddingVertical: 4 },
+  promptInputExpanded: { borderWidth: 0, maxHeight: 150, minHeight: 78, paddingHorizontal: T3Spacing.xs, paddingTop: T3Spacing.xs },
+  promptFooter: { alignItems: 'center', flexDirection: 'row', gap: T3Spacing.md },
+  footerSpacer: { flex: 1 },
+  sendButton: {
     alignItems: 'center',
     borderRadius: T3Radius.pill,
-    borderWidth: StyleSheet.hairlineWidth,
-    flexDirection: 'row',
-    gap: T3Spacing.sm,
-    maxWidth: 180,
-    paddingHorizontal: T3Spacing.md,
-    paddingVertical: 7,
-  },
-  profileLabel: { fontFamily: T3Typography.medium, fontSize: 13, lineHeight: 17 },
-  headerButton: {
-    alignItems: 'center',
-    borderRadius: T3Radius.medium,
-    height: 42,
+    height: 44,
     justifyContent: 'center',
-    width: 42,
+    width: 44,
   },
-  search: { minHeight: 42, paddingVertical: 8 },
-  listContent: { paddingBottom: 112, paddingHorizontal: T3Spacing.xl },
-  listContentWide: { alignSelf: 'center', maxWidth: 760, width: '100%' },
-  emptyList: { flexGrow: 1 },
+  sendLabel: { fontFamily: T3Typography.bold, fontSize: 21, lineHeight: 24 },
+  startError: { fontSize: 13, lineHeight: 17, paddingBottom: T3Spacing.sm, paddingHorizontal: T3Spacing.xs },
+  panel: { flex: 1 },
+  panelHeader: {
+    alignItems: 'center',
+    borderBottomWidth: StyleSheet.hairlineWidth,
+    flexDirection: 'row',
+    paddingHorizontal: T3Spacing.xl,
+    paddingVertical: T3Spacing.md,
+  },
+  panelHeaderCopy: { flex: 1 },
+  panelTitle: { fontFamily: T3Typography.bold, fontSize: 21, lineHeight: 27 },
+  panelDetail: { fontSize: 12, lineHeight: 16 },
+  chatButton: { borderRadius: T3Radius.pill, paddingHorizontal: 14, paddingVertical: 9 },
+  chatButtonLabel: { fontFamily: T3Typography.bold, fontSize: 13, lineHeight: 17 },
+  panelSearch: { paddingHorizontal: T3Spacing.xl, paddingTop: T3Spacing.lg },
+  panelWide: { alignSelf: 'center', maxWidth: 760, width: '100%' },
+  search: { minHeight: 44, paddingVertical: 8 },
+  historyContent: { flexGrow: 1, paddingBottom: T3Spacing.huge, paddingHorizontal: T3Spacing.xl },
+  emptyHistory: { flexGrow: 1 },
   sessionRow: {
     alignItems: 'center',
     borderBottomWidth: StyleSheet.hairlineWidth,
     flexDirection: 'row',
-    gap: T3Spacing.md,
     minHeight: 76,
     paddingVertical: T3Spacing.md,
-  },
-  sessionIcon: {
-    alignItems: 'center',
-    borderRadius: T3Radius.medium,
-    height: 42,
-    justifyContent: 'center',
-    width: 42,
   },
   sessionCopy: { flex: 1, gap: 2 },
   sessionTitleRow: { alignItems: 'baseline', flexDirection: 'row', gap: T3Spacing.sm },
@@ -405,20 +705,37 @@ const styles = StyleSheet.create({
   sessionDate: { fontSize: 12, lineHeight: 16 },
   sessionMeta: { fontSize: 13, lineHeight: 17 },
   retry: { padding: T3Spacing.md },
-  fab: {
-    alignItems: 'center',
-    borderRadius: T3Radius.pill,
-    bottom: T3Spacing.xxl,
-    flexDirection: 'row',
-    gap: T3Spacing.sm,
-    minHeight: 56,
-    paddingHorizontal: 18,
-    position: 'absolute',
-    right: T3Spacing.xxl,
-    shadowColor: '#000000',
-    shadowOffset: { height: 8, width: 0 },
-    shadowOpacity: 0.2,
-    shadowRadius: 18,
+  settingsContent: {
+    gap: T3Spacing.lg,
+    padding: T3Spacing.xl,
+    paddingBottom: T3Spacing.huge,
   },
-  fabLabel: { fontFamily: T3Typography.bold, fontSize: 14 },
+  environmentCard: {
+    alignItems: 'center',
+    borderRadius: T3Radius.large,
+    borderWidth: StyleSheet.hairlineWidth,
+    flexDirection: 'row',
+    gap: T3Spacing.md,
+    minHeight: 76,
+    padding: T3Spacing.lg,
+  },
+  environmentCopy: { flex: 1 },
+  environmentName: { fontFamily: T3Typography.bold, fontSize: 16, lineHeight: 21 },
+  environmentMeta: { fontSize: 12, lineHeight: 16 },
+  menu: {
+    borderRadius: T3Radius.large,
+    borderWidth: StyleSheet.hairlineWidth,
+    overflow: 'hidden',
+    paddingHorizontal: T3Spacing.lg,
+  },
+  menuRow: {
+    alignItems: 'center',
+    borderTopWidth: StyleSheet.hairlineWidth,
+    flexDirection: 'row',
+    minHeight: 70,
+    paddingVertical: T3Spacing.sm,
+  },
+  menuCopy: { flex: 1 },
+  menuLabel: { fontFamily: T3Typography.medium, fontSize: 15, lineHeight: 20 },
+  menuDetail: { fontSize: 12, lineHeight: 16 },
 });

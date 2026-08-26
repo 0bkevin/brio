@@ -44,10 +44,20 @@ import {
   type HermesGatewayState,
 } from '@/lib/hermes-gateway';
 import { isNamedProfile } from '@/lib/profiles';
-import { buildRuntimeModelOptions, normalizeLiveUsage } from '@/lib/session-runtime';
+import {
+  buildRuntimeModelOptions,
+  modelIncompatibilities,
+  normalizeLiveUsage,
+  selectedCapabilities,
+} from '@/lib/session-runtime';
 import { useRunStore } from '@/state/run-store';
 import { useComposerStore } from '@/state/composer-store';
-import { EMPTY_PROMPT_QUEUE, type QueuedPrompt } from '@/state/composer-store-model';
+import {
+  EMPTY_COMPOSER_ATTACHMENTS,
+  EMPTY_PROMPT_HISTORY,
+  EMPTY_PROMPT_QUEUE,
+  type QueuedPrompt,
+} from '@/state/composer-store-model';
 import type { ChatModelOverride, ChatThread } from '@/state/chat-thread-model';
 
 type FeedItem = HermesMessage & { id: string };
@@ -90,10 +100,12 @@ type GatewayInputRequest = {
 
 export function HermesThreadScreen({
   connection,
+  initialModelOverride,
   profile,
   routeSessionId,
 }: {
   connection: AgentConnection;
+  initialModelOverride?: ChatModelOverride;
   profile: string;
   routeSessionId: string;
 }) {
@@ -105,7 +117,10 @@ export function HermesThreadScreen({
   const sessionId = routeSessionId === 'new' ? generatedSessionId : routeSessionId;
   const runKey = `${connection.id}:${profile}:${sessionId}`;
   const composerKey = `${connection.id}:${profile}:${routeSessionId}`;
-  const [modelOverride, setModelOverride] = useState<ChatModelOverride | undefined>();
+  const [modelOverride, setModelOverride] = useState<ChatModelOverride | undefined>(
+    initialModelOverride,
+  );
+  const [modelPickerOpen, setModelPickerOpen] = useState(false);
   const [immediateMessages, setImmediateMessages] = useState<FeedItem[]>([]);
   const [composerError, setComposerError] = useState('');
   const gatewayRef = useRef<HermesGatewayClient | null>(null);
@@ -120,10 +135,14 @@ export function HermesThreadScreen({
   const clearActiveRun = useRunStore((state) => state.clearActiveRun);
   const composerHydrated = useComposerStore((state) => state.hydrated);
   const draft = useComposerStore((state) => state.drafts[composerKey] ?? '');
-  const attachments = useComposerStore((state) => state.attachments[composerKey] ?? []);
+  const attachments = useComposerStore(
+    (state) => state.attachments[composerKey] ?? EMPTY_COMPOSER_ATTACHMENTS,
+  );
   const queue = useComposerStore((state) => state.queues[composerKey] ?? EMPTY_PROMPT_QUEUE);
   const queuePaused = useComposerStore((state) => Boolean(state.paused[composerKey]));
-  const history = useComposerStore((state) => state.promptHistory[composerKey] ?? []);
+  const history = useComposerStore(
+    (state) => state.promptHistory[composerKey] ?? EMPTY_PROMPT_HISTORY,
+  );
   const revisions = useComposerStore((state) => state.draftRevisions[composerKey]);
   const composerStorageError = useComposerStore((state) => state.storageError);
   const setDraft = useComposerStore((state) => state.setDraft);
@@ -474,6 +493,7 @@ export function HermesThreadScreen({
   const submit = useMutation({
     mutationFn: async (queuedPrompt: QueuedPrompt) => {
       const input = queuedPrompt.text.trim();
+      const promptModelOverride = queuedPrompt.modelOverride ?? modelOverride;
       if (input.startsWith('/') && queuedPrompt.attachments.length === 0) {
         const response = await dispatchComposerCommand(
           connection,
@@ -502,12 +522,14 @@ export function HermesThreadScreen({
                 source: 'brio',
                 title: 'Hermes conversation',
                 ...(isNamedProfile(profile) ? { profile } : {}),
-                ...(modelOverride?.model ? { model: modelOverride.model } : {}),
-                ...(modelOverride?.provider ? { provider: modelOverride.provider } : {}),
-                ...(modelOverride?.reasoningEffort
-                  ? { reasoning_effort: modelOverride.reasoningEffort }
+                ...(promptModelOverride?.model ? { model: promptModelOverride.model } : {}),
+                ...(promptModelOverride?.provider ? { provider: promptModelOverride.provider } : {}),
+                ...(promptModelOverride?.reasoningEffort
+                  ? { reasoning_effort: promptModelOverride.reasoningEffort }
                   : {}),
-                ...(typeof modelOverride?.fast === 'boolean' ? { fast: modelOverride.fast } : {}),
+                ...(typeof promptModelOverride?.fast === 'boolean'
+                  ? { fast: promptModelOverride.fast }
+                  : {}),
               });
               target = { runtime: created.session_id, stored: created.stored_session_id };
             } else {
@@ -586,9 +608,9 @@ export function HermesThreadScreen({
               content: message.content,
             })),
           ],
-          model: modelOverride?.model,
-          provider: modelOverride?.provider,
-          modelOptions: buildRuntimeModelOptions(modelOverride),
+          model: promptModelOverride?.model,
+          provider: promptModelOverride?.provider,
+          modelOptions: buildRuntimeModelOptions(promptModelOverride),
           sessionId,
           profile,
           composerSessionId: relayExpandsComposer ? sessionId : undefined,
@@ -604,9 +626,9 @@ export function HermesThreadScreen({
 
       const result = await startRun(connection, input, {
         sessionId,
-        model: modelOverride?.model,
-        provider: modelOverride?.provider,
-        modelOptions: buildRuntimeModelOptions(modelOverride),
+        model: promptModelOverride?.model,
+        provider: promptModelOverride?.provider,
+        modelOptions: buildRuntimeModelOptions(promptModelOverride),
         profile,
         conversationHistory: (messages.data?.messages ?? [])
           .filter((message) =>
@@ -652,9 +674,22 @@ export function HermesThreadScreen({
         ),
       );
       if (routeSessionId === 'new') {
+        const params: string[] = [];
+        if (isNamedProfile(profile)) params.push(`profile=${encodeURIComponent(profile)}`);
+        const acceptedModelOverride = queuedPrompt.modelOverride ?? modelOverride;
+        if (acceptedModelOverride) {
+          params.push(`provider=${encodeURIComponent(acceptedModelOverride.provider)}`);
+          params.push(`model=${encodeURIComponent(acceptedModelOverride.model)}`);
+          if (acceptedModelOverride.reasoningEffort) {
+            params.push(`effort=${encodeURIComponent(acceptedModelOverride.reasoningEffort)}`);
+          }
+          if (typeof acceptedModelOverride.fast === 'boolean') {
+            params.push(`fast=${String(acceptedModelOverride.fast)}`);
+          }
+        }
         router.replace(
           `/thread/${encodeURIComponent(result.sessionId ?? sessionId)}${
-            isNamedProfile(profile) ? `?profile=${encodeURIComponent(profile)}` : ''
+            params.length ? `?${params.join('&')}` : ''
           }`,
         );
       }
@@ -786,6 +821,13 @@ export function HermesThreadScreen({
     ...(contextBreakdown.data ? { contextBreakdown: contextBreakdown.data } : {}),
     runtimeSessionId: sessionId,
   };
+  const selectedModelBlocked = Boolean(
+    modelOverride &&
+      modelIncompatibilities(
+        selectedCapabilities(modelOptions.data ?? { model: null, provider: null, providers: [] }, modelOverride.provider, modelOverride.model),
+        { vision: attachments.some((attachment) => attachment.kind === 'image'), tools: true },
+      ).length,
+  );
   const changeModelOverride = (override: ChatModelOverride | undefined) => {
     setModelOverride(override);
     if (routeSessionId === 'new') return;
@@ -822,7 +864,7 @@ export function HermesThreadScreen({
 
   const send = async (deliveryMode: 'queue' | 'redirect') => {
     if ((!draft.trim() && attachments.length === 0) || !composerHydrated) return;
-    const queuedPrompt = await enqueueDraft(composerKey, deliveryMode);
+    const queuedPrompt = await enqueueDraft(composerKey, deliveryMode, modelOverride);
     if (!queuedPrompt || deliveryMode !== 'redirect' || !active) return;
     try {
       const target = gatewaySessionRef.current;
@@ -851,7 +893,7 @@ export function HermesThreadScreen({
   return (
     <SafeAreaView edges={['bottom', 'left', 'right']} style={[styles.safe, { backgroundColor: colors.screen }]}>
       <KeyboardAvoidingView
-        behavior={Platform.OS === 'ios' ? 'padding' : undefined}
+        behavior={Platform.OS === 'ios' ? 'padding' : 'height'}
         keyboardVerticalOffset={Platform.OS === 'ios' ? 88 : 0}
         style={styles.safe}>
         {messages.isLoading && feed.length === 0 ? (
@@ -919,18 +961,7 @@ export function HermesThreadScreen({
           </View>
         ) : null}
 
-        <View style={[styles.modelControls, { backgroundColor: colors.sheet, borderTopColor: colors.border }]}>
-          <SessionModelControls
-            onOverrideChange={changeModelOverride}
-            options={modelOptions.data}
-            optionsError={modelOptions.isError}
-            optionsLoading={modelOptions.isLoading}
-            sessions={analyticsSessions.data?.sessions}
-            thread={controlsThread}
-          />
-        </View>
-
-        <View style={[styles.composerShell, { backgroundColor: colors.sheet, borderTopColor: colors.border }]}> 
+        <View style={[styles.composerShell, { backgroundColor: colors.sheet }]}>
           {queue.length > 0 ? (
             <PromptQueue
               activePromptId={submit.isPending ? submit.variables?.id : undefined}
@@ -959,8 +990,21 @@ export function HermesThreadScreen({
               canUndo={Boolean(revisions?.past.length)}
               connection={connection}
               draft={draft}
+              forceExpanded={modelPickerOpen}
               history={history}
               hydrated={composerHydrated}
+              modelControl={
+                <SessionModelControls
+                  onOpenChange={setModelPickerOpen}
+                  onOverrideChange={changeModelOverride}
+                  options={modelOptions.data}
+                  optionsError={modelOptions.isError}
+                  optionsLoading={modelOptions.isLoading}
+                  sessions={analyticsSessions.data?.sessions}
+                  thread={controlsThread}
+                  variant="inline"
+                />
+              }
               onAddAttachment={(attachment) => addAttachment(composerKey, attachment)}
               onDraftChange={(value) => setDraft(composerKey, value)}
               onRedo={() => redoDraft(composerKey)}
@@ -968,6 +1012,7 @@ export function HermesThreadScreen({
               onSend={(mode) => void send(mode)}
               onUndo={() => undoDraft(composerKey)}
               profile={profile}
+              sendDisabled={selectedModelBlocked}
               sessionId={sessionId}
             />
           </View>
@@ -1335,15 +1380,7 @@ const styles = StyleSheet.create({
   userBubble: { borderBottomRightRadius: 5, paddingHorizontal: 14, paddingVertical: 10 },
   messageText: { fontSize: 15, lineHeight: 23 },
   toolName: { fontFamily: T3Typography.bold, fontSize: 11, lineHeight: 15, textTransform: 'uppercase' },
-  composerShell: { borderTopWidth: StyleSheet.hairlineWidth, padding: T3Spacing.md },
-  modelControls: {
-    alignSelf: 'center',
-    borderTopWidth: StyleSheet.hairlineWidth,
-    maxWidth: CHAT_CONTENT_MAX_WIDTH,
-    paddingHorizontal: T3Spacing.md,
-    paddingTop: T3Spacing.sm,
-    width: '100%',
-  },
+  composerShell: { paddingHorizontal: T3Spacing.lg, paddingVertical: 6 },
   composer: {
     alignSelf: 'center',
     gap: T3Spacing.sm,

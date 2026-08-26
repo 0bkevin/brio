@@ -1,5 +1,4 @@
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
-import { SymbolView } from 'expo-symbols';
 import { useState } from 'react';
 import { Pressable, ScrollView, StyleSheet, View } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
@@ -47,7 +46,7 @@ export function HermesFilesScreen({ connection }: { connection: AgentConnection 
           disabled={!currentPath}
           onPress={() => setPath(parentPath(currentPath))}
           style={({ pressed }) => [styles.upButton, { opacity: pressed ? 0.5 : currentPath ? 1 : 0.35 }]}>
-          <SymbolView name="arrow.up" size={17} tintColor={colors.foreground} />
+          <AppText style={styles.upLabel}>Up</AppText>
         </Pressable>
         <AppText numberOfLines={1} style={[styles.path, { color: colors.muted }]}>
           {currentPath ?? 'Workspace'}
@@ -101,11 +100,9 @@ function FileRow({ entry, onPress }: { entry: HermesFileEntry; onPress: () => vo
     <Pressable
       onPress={onPress}
       style={({ pressed }) => [styles.fileRow, { opacity: pressed ? 0.55 : 1 }]}>
-      <SymbolView
-        name={entry.dir ? 'folder' : 'doc.text'}
-        size={19}
-        tintColor={entry.dir ? colors.warning : colors.secondary}
-      />
+      <AppText style={[styles.fileKind, { color: entry.dir ? colors.warning : colors.secondary }]}>
+        {entry.dir ? 'DIR' : 'FILE'}
+      </AppText>
       <View style={styles.fileCopy}>
         <AppText numberOfLines={1} style={styles.fileName}>
           {entry.name}
@@ -235,7 +232,8 @@ const styles = StyleSheet.create({
     paddingHorizontal: T3Spacing.lg,
     paddingVertical: T3Spacing.sm,
   },
-  upButton: { alignItems: 'center', height: 38, justifyContent: 'center', width: 38 },
+  upButton: { alignItems: 'center', height: 38, justifyContent: 'center', paddingHorizontal: T3Spacing.sm },
+  upLabel: { fontFamily: T3Typography.bold, fontSize: 13, lineHeight: 17 },
   path: { flex: 1, fontFamily: T3Typography.mono, fontSize: 12, lineHeight: 17 },
   fileList: {
     alignSelf: 'center',
@@ -251,6 +249,12 @@ const styles = StyleSheet.create({
     gap: T3Spacing.md,
     minHeight: 58,
     paddingVertical: T3Spacing.sm,
+  },
+  fileKind: {
+    fontFamily: T3Typography.bold,
+    fontSize: 10,
+    lineHeight: 14,
+    minWidth: 28,
   },
   fileCopy: { flex: 1 },
   fileName: { fontFamily: T3Typography.medium, fontSize: 15, lineHeight: 20 },

@@ -91,6 +91,36 @@ test('enqueueComposerDraft consumes the current draft exactly once', () => {
   assert.deepEqual(first?.state.promptHistory.thread, ['preserve\nmultiline']);
 });
 
+test('queued prompts snapshot and restore the selected runtime model', () => {
+  const modelOverride = {
+    provider: 'openrouter',
+    model: 'anthropic/claude-sonnet-4',
+    reasoningEffort: 'high',
+    fast: false,
+  };
+  const initial = {
+    ...EMPTY_COMPOSER_STATE,
+    drafts: { thread: 'Use the selected model' },
+  };
+  const enqueued = enqueueComposerDraft(initial, 'thread', 'model', 123, 'queue', modelOverride);
+  const restored = validStoredComposerState(enqueued?.state);
+
+  assert.deepEqual(enqueued?.prompt.modelOverride, modelOverride);
+  assert.deepEqual(restored?.queues.thread?.[0]?.modelOverride, modelOverride);
+});
+
+test('stored queues reject malformed model overrides', () => {
+  const restored = validStoredComposerState({
+    drafts: {},
+    queues: {
+      thread: [{ ...prompt('bad-model'), modelOverride: { provider: '', model: 'valid' } }],
+    },
+    paused: {},
+  });
+
+  assert.equal(restored?.queues.thread, undefined);
+});
+
 test('attachment-only drafts queue safely and retain the requested delivery mode', () => {
   const attachment = {
     id: 'a'.repeat(32),

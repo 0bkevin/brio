@@ -277,7 +277,7 @@ Common values:
 - `BRIO_RELAY_TRUSTED_PROXY_CIDRS` - comma-separated reverse-proxy networks allowed to supply `X-Forwarded-For` for rate limiting. Forwarded addresses are ignored unless the direct TCP peer matches this list.
 - Production requests outside loopback require HTTPS/WSS. TLS-terminating proxies must be listed in `BRIO_RELAY_TRUSTED_PROXY_CIDRS` and send `X-Forwarded-Proto: https`; plaintext `/health` remains available for load-balancer probes.
 - Current Mobile and connector clients also reject remote plaintext relay URLs and relay HTTP redirects before sending enrollment codes or long-lived credentials. Plain HTTP remains available only for explicit loopback development URLs.
-- `BRIO_RELAY_ALLOWED_ORIGINS` - comma-separated browser origins allowed for relay CORS and WebSocket upgrades. Browser origins are denied when this is unset unless insecure development mode is explicitly enabled; origin-less native clients continue to work.
+- `BRIO_RELAY_ALLOWED_ORIGINS` - comma-separated origins allowed for relay CORS and WebSocket upgrades. Include the relay's own public HTTPS origin for React Native Android, which sends that origin by default, plus any separate browser app origins. Origins are denied when this is unset unless insecure development mode is explicitly enabled.
 - `BRIO_CLERK_SECRET_KEY` or `BRIO_CLERK_JWT_KEY` - enables verified Clerk identity on `POST /auth/devices`. Also set the exact `BRIO_CLERK_ISSUER` and `BRIO_CLERK_JWT_AUDIENCE`; `BRIO_CLERK_AUTHORIZED_PARTIES` optionally restricts the Clerk `azp` claim. The matching Mobile build uses `EXPO_PUBLIC_CLERK_PUBLISHABLE_KEY`, `EXPO_PUBLIC_CLERK_JWT_TEMPLATE`, and `EXPO_PUBLIC_BRIO_RELAY_URL`.
 - `BRIO_DEVICE_REGISTRATION_KEY` - operations-only fallback for `POST /auth/devices` through `Authorization: Bearer ...` or `X-Brio-Registration-Key`. With neither verified identity, this key, nor insecure development mode configured, device registration fails closed. Never embed this key in a public app build.
 - `EXPO_PUBLIC_BRIO_DEV_AUTH` - exposes Mobile's unverified email form for local development. Production builds leave this unset and use the configured Clerk account flow.
@@ -338,8 +338,9 @@ above). The mobile app includes the same recovery flow.
 
 ## Deployment
 
-The relay ships as a Docker image (`apps/relay/Dockerfile`), and an AWS Copilot
-manifest lives under `copilot/`. No production relay URL is embedded in Mobile
-or the installer: deploy the service, configure Postgres and verified identity,
-then provide that HTTPS URL through `EXPO_PUBLIC_BRIO_RELAY_URL` and generated
+The relay ships as a Docker image (`apps/relay/Dockerfile`). The current Oracle
+deployment stack lives under `deploy/oracle`, while the AWS Copilot manifest
+remains under `copilot/`. No production relay URL is embedded in Mobile or the
+installer: deploy the service, configure Postgres and verified identity, then
+provide its HTTPS URL through `EXPO_PUBLIC_BRIO_RELAY_URL` and generated
 enrollment commands.

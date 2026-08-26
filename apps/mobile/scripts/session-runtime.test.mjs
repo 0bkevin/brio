@@ -394,6 +394,7 @@ test('modelPricingFor resolves per-model maps and single pricing objects', () =>
 
 test('modelCostLabel uses exact backend strings and never synthesizes zero', () => {
   assert.equal(modelCostLabel({ input: '3', output: '15', cache: null, free: false }), '$3 in · $15 out per Mtok');
+  assert.equal(modelCostLabel({ input: '$3', output: '$15', free: false }), '$3 in · $15 out per Mtok');
   assert.equal(modelCostLabel({ input: '0', output: '0', free: false }), '$0 in · $0 out per Mtok');
   assert.equal(modelCostLabel({ free: true }), 'Free');
   // Missing price means unknown, never zero.
