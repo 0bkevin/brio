@@ -51,6 +51,7 @@
       ],
       "expo-secure-store",
       "./plugins/with-android-cleartext",
+      "./plugins/with-android-keyboard",
       "expo-document-picker",
       [
         "expo-image-picker",

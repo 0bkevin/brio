@@ -2,7 +2,16 @@ import { useQuery } from '@tanstack/react-query';
 import * as DocumentPicker from 'expo-document-picker';
 import * as ImagePicker from 'expo-image-picker';
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
-import { Modal, Platform, Pressable, ScrollView, StyleSheet, TextInput, View } from 'react-native';
+import {
+  LayoutAnimation,
+  Modal,
+  Platform,
+  Pressable,
+  ScrollView,
+  StyleSheet,
+  TextInput,
+  View,
+} from 'react-native';
 
 import { ThemedText } from '@/components/themed-text';
 import { Spacing } from '@/constants/theme';
@@ -38,6 +47,7 @@ export function ComposerControls({
   draft,
   history,
   hydrated,
+  keyboardVisible,
   forceExpanded = false,
   modelControl,
   onAddAttachment,
@@ -58,6 +68,7 @@ export function ComposerControls({
   draft: string;
   history: string[];
   hydrated: boolean;
+  keyboardVisible?: boolean;
   forceExpanded?: boolean;
   modelControl?: ReactNode;
   onAddAttachment: (attachment: ComposerAttachment) => Promise<void>;
@@ -73,10 +84,13 @@ export function ComposerControls({
   const colors = useTheme();
   const incomingShare = useIncomingShareContext();
   const processedShare = useRef<string | null>(null);
+  const inputRef = useRef<TextInput>(null);
+  const previousKeyboardVisible = useRef(keyboardVisible);
   const [pickerOpen, setPickerOpen] = useState(false);
   const [historyOpen, setHistoryOpen] = useState(false);
   const [commandsOpen, setCommandsOpen] = useState(false);
   const [inputFocused, setInputFocused] = useState(false);
+  const [inputHeight, setInputHeight] = useState(48);
   const [uploads, setUploads] = useState<UploadState[]>([]);
   const [error, setError] = useState('');
   const token = completionToken(draft);
@@ -116,6 +130,17 @@ export function ComposerControls({
     uploads.length > 0 ||
     Boolean(error) ||
     Boolean(incomingShare.error);
+
+  useEffect(() => {
+    const previous = previousKeyboardVisible.current;
+    previousKeyboardVisible.current = keyboardVisible;
+    if (previous !== true || keyboardVisible !== false || !inputFocused) return;
+    const timer = setTimeout(() => {
+      inputRef.current?.blur();
+      setInputFocused(false);
+    }, 0);
+    return () => clearTimeout(timer);
+  }, [inputFocused, keyboardVisible]);
 
   const uploadSources = useCallback(async (sources: AttachmentSource[]) => {
     setPickerOpen(false);
@@ -249,6 +274,15 @@ export function ComposerControls({
       setError(reason instanceof Error ? reason.message : 'Could not remove attachment');
     }
   };
+  const setFocused = (focused: boolean) => {
+    LayoutAnimation.configureNext({
+      duration: 180,
+      create: { property: LayoutAnimation.Properties.opacity, type: LayoutAnimation.Types.easeInEaseOut },
+      update: { type: LayoutAnimation.Types.easeInEaseOut },
+      delete: { property: LayoutAnimation.Properties.opacity, type: LayoutAnimation.Types.easeInEaseOut },
+    });
+    setInputFocused(focused);
+  };
 
   return (
     <>
@@ -322,15 +356,24 @@ export function ComposerControls({
             accessibilityLabel="Ask Hermes anything"
             maxLength={20000}
             multiline
-            onBlur={() => setInputFocused(false)}
+            onBlur={() => setFocused(false)}
             onChangeText={onDraftChange}
-            onFocus={() => setInputFocused(true)}
+            onContentSizeChange={(event) => {
+              const nativeHeight = event.nativeEvent.contentSize.height;
+              const measuredHeight = Platform.OS === 'android' ? nativeHeight - 32 : nativeHeight;
+              const nextHeight = Math.min(112, Math.max(48, Math.ceil(measuredHeight)));
+              setInputHeight(nextHeight);
+            }}
+            onFocus={() => setFocused(true)}
             placeholder={active ? 'Ask a follow-up…' : 'Ask Hermes anything…'}
             placeholderTextColor={colors.textTertiary}
-            scrollEnabled={expanded}
+            ref={inputRef}
+            scrollEnabled={expanded && inputHeight >= 112}
+            selectionColor={colors.accent}
             style={[
               styles.input,
               expanded ? styles.inputExpanded : styles.inputCollapsed,
+              expanded ? { height: inputHeight } : null,
               { color: colors.text },
             ]}
             textAlignVertical={expanded ? 'top' : 'center'}
@@ -494,30 +537,42 @@ function formatBytes(value: number) {
 }
 
 const styles = StyleSheet.create({
-  toolbar: { alignItems: 'center', flexDirection: 'row', gap: Spacing.two, paddingRight: Spacing.two },
-  toolbarAction: { borderRadius: 999, minHeight: 34, justifyContent: 'center', paddingHorizontal: 11 },
+  toolbar: {
+    alignItems: 'center',
+    flexDirection: 'row',
+    gap: Spacing.two,
+    paddingRight: Spacing.two,
+  },
+  toolbarAction: {
+    borderRadius: 999,
+    justifyContent: 'center',
+    minHeight: 36,
+    paddingHorizontal: 12,
+  },
   composer: { borderWidth: StyleSheet.hairlineWidth, overflow: 'hidden' },
   composerCollapsed: {
     borderRadius: 999,
-    minHeight: 54,
-    paddingBottom: 5,
-    paddingLeft: 5,
-    paddingRight: 5,
-    paddingTop: 5,
+    minHeight: 58,
+    padding: 6,
   },
   composerExpanded: {
     borderRadius: 26,
-    minHeight: 140,
-    paddingBottom: 6,
+    minHeight: 112,
+    paddingBottom: 7,
     paddingHorizontal: 14,
-    paddingTop: 14,
+    paddingTop: 12,
   },
   collapsedInputRow: { alignItems: 'center', flexDirection: 'row', gap: 5 },
-  expandedInputRow: { minHeight: 72 },
-  input: { flex: 1, fontSize: 16, lineHeight: 23, outlineStyle: 'none' } as never,
-  inputCollapsed: { height: 44, paddingBottom: 4, paddingHorizontal: 4, paddingTop: 4 },
-  inputExpanded: { maxHeight: 150, minHeight: 72, paddingHorizontal: 4, paddingVertical: 4 },
-  composerFooter: { alignItems: 'center', flexDirection: 'row', gap: Spacing.two },
+  expandedInputRow: { minHeight: 48 },
+  input: { fontSize: 16, lineHeight: 23, outlineStyle: 'none' } as never,
+  inputCollapsed: { flex: 1, height: 44, paddingBottom: 4, paddingHorizontal: 4, paddingTop: 4 },
+  inputExpanded: { maxHeight: 112, minHeight: 48, paddingHorizontal: 4, paddingVertical: 4 },
+  composerFooter: {
+    alignItems: 'center',
+    flexDirection: 'row',
+    gap: Spacing.two,
+    minHeight: 44,
+  },
   send: { alignItems: 'center', borderRadius: 22, height: 44, justifyContent: 'center', width: 44 },
   compactAttach: { alignItems: 'center', borderRadius: 22, height: 44, justifyContent: 'center', width: 44 },
   compactAttachLabel: { fontSize: 27, fontWeight: '300', lineHeight: 30 },
