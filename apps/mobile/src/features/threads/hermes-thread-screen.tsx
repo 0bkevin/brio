@@ -108,12 +108,16 @@ function createDraftSessionId() {
 
 export function HermesThreadScreen({
   connection,
+  embedded = false,
   initialModelOverride,
+  onSessionCreated,
   profile,
   routeSessionId,
 }: {
   connection: AgentConnection;
+  embedded?: boolean;
   initialModelOverride?: ChatModelOverride;
+  onSessionCreated?: (sessionId: string) => void;
   profile: string;
   routeSessionId: string;
 }) {
@@ -734,6 +738,11 @@ export function HermesThreadScreen({
         ),
       );
       if (routeSessionId === 'new') {
+        const acceptedSessionId = result.sessionId ?? sessionId;
+        if (onSessionCreated) {
+          onSessionCreated(acceptedSessionId);
+          return;
+        }
         const params: string[] = [];
         if (isNamedProfile(profile)) params.push(`profile=${encodeURIComponent(profile)}`);
         const acceptedModelOverride = queuedPrompt.modelOverride ?? modelOverride;
@@ -748,7 +757,7 @@ export function HermesThreadScreen({
           }
         }
         router.replace(
-          `/thread/${encodeURIComponent(result.sessionId ?? sessionId)}${
+          `/thread/${encodeURIComponent(acceptedSessionId)}${
             params.length ? `?${params.join('&')}` : ''
           }`,
         );
@@ -954,7 +963,7 @@ export function HermesThreadScreen({
     <SafeAreaView edges={['bottom', 'left', 'right']} style={[styles.safe, { backgroundColor: colors.screen }]}>
       <KeyboardAvoidingView
         behavior={Platform.OS === 'ios' ? 'padding' : 'height'}
-        keyboardVerticalOffset={Platform.OS === 'ios' ? 88 : 0}
+        keyboardVerticalOffset={Platform.OS === 'ios' && !embedded ? 88 : 0}
         style={styles.safe}>
         {messages.isLoading && feed.length === 0 ? (
           <EmptyState detail="Loading the conversation history." loading title="Opening conversation" />

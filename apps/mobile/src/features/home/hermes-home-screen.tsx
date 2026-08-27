@@ -3,10 +3,8 @@ import { useRouter, type Href } from 'expo-router';
 import { useEffect, useMemo, useState } from 'react';
 import {
   FlatList,
-  KeyboardAvoidingView,
   Modal,
   PanResponder,
-  Platform,
   Pressable,
   RefreshControl,
   ScrollView,
@@ -16,13 +14,12 @@ import {
 } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 
-import { SessionModelControls } from '@/components/session-model-controls';
 import { AppText, AppTextInput, EmptyState, StatusDot } from '@/components/t3-ui';
 import { SPLIT_LAYOUT_MIN_WIDTH, T3Radius, T3Spacing, T3Typography } from '@/constants/t3-theme';
+import { HermesThreadScreen } from '@/features/threads/hermes-thread-screen';
 import { useT3Theme } from '@/hooks/use-t3-theme';
 import {
   getHealth,
-  getModelOptions,
   listSessions,
   searchSessions,
   type AgentConnection,
@@ -37,9 +34,6 @@ import {
   type HermesProfile,
 } from '@/lib/profiles';
 import { resolveBrioDeepLink } from '@/lib/profiles-model';
-import { modelIncompatibilities, selectedCapabilities } from '@/lib/session-runtime';
-import { useComposerStore } from '@/state/composer-store';
-import type { ChatModelOverride, ChatThread } from '@/state/chat-thread-model';
 import { useDeepLinkStore } from '@/state/deep-link-store';
 import { useProfileStore } from '@/state/profile-store';
 
@@ -52,13 +46,8 @@ export function HermesHomeScreen({ connection }: { connection: AgentConnection }
   const [historyOpen, setHistoryOpen] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [search, setSearch] = useState('');
-  const [startError, setStartError] = useState('');
-  const [starting, setStarting] = useState(false);
-  const [composerFocused, setComposerFocused] = useState(false);
-  const [modelPickerOpen, setModelPickerOpen] = useState(false);
-  const [newThreadModels, setNewThreadModels] = useState<
-    Record<string, ChatModelOverride | undefined>
-  >({});
+  const [activeSessionId, setActiveSessionId] = useState('new');
+  const [conversationEpoch, setConversationEpoch] = useState(0);
   const agentId = environmentId(connection);
   const storedProfiles = useProfileStore((state) => state.activeProfiles);
   const setActiveProfile = useProfileStore((state) => state.setActiveProfile);
@@ -81,12 +70,6 @@ export function HermesHomeScreen({ connection }: { connection: AgentConnection }
       ? profileName(profilesQuery.data.active)
       : DEFAULT_PROFILE_NAME;
   const activeProfileData = profiles.find((profile) => profile.name === activeProfile);
-  const composerKey = `${connection.id}:${activeProfile}:new`;
-  const newThreadModel = newThreadModels[composerKey];
-  const composerHydrated = useComposerStore((state) => state.hydrated);
-  const draft = useComposerStore((state) => state.drafts[composerKey] ?? '');
-  const setDraft = useComposerStore((state) => state.setDraft);
-  const enqueueDraft = useComposerStore((state) => state.enqueueDraft);
 
   useEffect(() => {
     if (!pendingDeepLink || !profilesQuery.data) return;
@@ -98,20 +81,17 @@ export function HermesHomeScreen({ connection }: { connection: AgentConnection }
       isNamedProfile(resolved.profile) ? resolved.profile : undefined,
     );
     if (!resolved.sessionId) return;
-    router.push(
-      `/thread/${encodeURIComponent(resolved.sessionId)}${
-        isNamedProfile(resolved.profile)
-          ? `?profile=${encodeURIComponent(resolved.profile)}`
-          : ''
-      }`,
-    );
+    const timer = setTimeout(() => {
+      setActiveSessionId(resolved.sessionId!);
+      setConversationEpoch((current) => current + 1);
+    }, 0);
+    return () => clearTimeout(timer);
   }, [
     agentId,
     consumeDeepLink,
     pendingDeepLink,
     profiles,
     profilesQuery.data,
-    router,
     setActiveProfile,
   ]);
 
@@ -119,12 +99,6 @@ export function HermesHomeScreen({ connection }: { connection: AgentConnection }
     queryKey: ['home-health', connection.id, connection.url],
     queryFn: () => getHealth(connection),
     refetchInterval: 15_000,
-  });
-  const modelOptions = useQuery({
-    queryKey: ['model-options', connection.id, connection.url, activeProfile],
-    queryFn: () => getModelOptions(connection, false, activeProfile),
-    staleTime: 5 * 60_000,
-    retry: 1,
   });
   const sessions = useQuery({
     queryKey: ['sessions', connection.id, connection.url, activeProfile],
@@ -152,21 +126,6 @@ export function HermesHomeScreen({ connection }: { connection: AgentConnection }
     );
   }, [resultIds, search, sessions.data?.sessions]);
   const split = width >= SPLIT_LAYOUT_MIN_WIDTH;
-  const threadPath = (sessionId: string, override?: ChatModelOverride) => {
-    const params: string[] = [];
-    if (isNamedProfile(activeProfile)) {
-      params.push(`profile=${encodeURIComponent(activeProfile)}`);
-    }
-    if (override) {
-      params.push(`provider=${encodeURIComponent(override.provider)}`);
-      params.push(`model=${encodeURIComponent(override.model)}`);
-      if (override.reasoningEffort) {
-        params.push(`effort=${encodeURIComponent(override.reasoningEffort)}`);
-      }
-      if (typeof override.fast === 'boolean') params.push(`fast=${String(override.fast)}`);
-    }
-    return `/thread/${encodeURIComponent(sessionId)}${params.length ? `?${params.join('&')}` : ''}` as const;
-  };
 
   const homeSwipe = useMemo(
     () =>
@@ -185,26 +144,14 @@ export function HermesHomeScreen({ connection }: { connection: AgentConnection }
     [],
   );
 
-  const startNewTask = async () => {
-    if (!composerHydrated || !draft.trim() || starting) return;
-    setStartError('');
-    setStarting(true);
-    try {
-      const queued = await enqueueDraft(composerKey, 'queue', newThreadModel);
-      if (!queued) {
-        setStartError('Write a message for Hermes before starting.');
-        return;
-      }
-      router.push(threadPath('new', newThreadModel));
-    } catch (reason) {
-      setStartError(reason instanceof Error ? reason.message : 'Could not start this conversation.');
-    } finally {
-      setStarting(false);
-    }
-  };
   const openThread = (sessionId: string) => {
     setHistoryOpen(false);
-    router.push(threadPath(sessionId));
+    setActiveSessionId(sessionId);
+    setConversationEpoch((current) => current + 1);
+  };
+  const startNewChat = () => {
+    setActiveSessionId('new');
+    setConversationEpoch((current) => current + 1);
   };
   const openTool = (href: Href) => {
     setSettingsOpen(false);
@@ -217,126 +164,49 @@ export function HermesHomeScreen({ connection }: { connection: AgentConnection }
       : health.data?.hermes_ok
         ? 'online'
         : 'busy';
-  const newThread: ChatThread = {
-    id: 'new',
-    profile: activeProfile,
-    title: 'New Thread',
-    createdAt: 0,
-    updatedAt: 0,
-    messages: [],
-    ...(newThreadModel ? { modelOverride: newThreadModel } : {}),
-  };
-  const composerDestination =
-    activeProfileData?.alias_name?.trim() || connection.name?.trim() || 'Hermes';
-  const selectedModelBlocked = Boolean(
-    newThreadModel &&
-      modelIncompatibilities(
-        selectedCapabilities(
-          modelOptions.data ?? { model: null, provider: null, providers: [] },
-          newThreadModel.provider,
-          newThreadModel.model,
-        ),
-        { vision: false, tools: true },
-      ).length,
-  );
-  const canStart =
-    composerHydrated && Boolean(draft.trim()) && !starting && !selectedModelBlocked;
-  const composerExpanded = composerFocused || modelPickerOpen;
+  const activeSession = sessions.data?.sessions.find((session) => session.id === activeSessionId);
+  const activeTitle = activeSessionId === 'new'
+    ? 'New chat'
+    : activeSession?.title?.trim() || 'Hermes';
 
   return (
     <SafeAreaView
       {...(historyOpen || settingsOpen ? {} : homeSwipe.panHandlers)}
-      edges={['top', 'bottom', 'left', 'right']}
+      edges={['top', 'left', 'right']}
       style={[styles.safe, { backgroundColor: colors.screen }]}>
-      <KeyboardAvoidingView
-        behavior={Platform.OS === 'ios' ? 'padding' : 'height'}
-        style={styles.safe}>
-        <View style={[styles.threadHeader, { borderBottomColor: colors.border }]}>
+      <View style={[styles.threadHeader, { borderBottomColor: colors.border }]}>
+        <Pressable
+          accessibilityHint="Opens conversation history"
+          accessibilityLabel="Conversation history"
+          accessibilityRole="button"
+          hitSlop={8}
+          onPress={() => setHistoryOpen(true)}
+          style={({ pressed }) => [styles.backButton, { opacity: pressed ? 0.5 : 1 }]}>
+          <AppText style={styles.menuIcon}>☰</AppText>
+        </Pressable>
+        <AppText numberOfLines={1} style={styles.threadTitle}>{activeTitle}</AppText>
+        {activeSessionId !== 'new' ? (
           <Pressable
-            accessibilityHint="Opens conversation history"
-            accessibilityLabel="Conversation history"
+            accessibilityLabel="Start a new chat"
             accessibilityRole="button"
             hitSlop={8}
-            onPress={() => setHistoryOpen(true)}
-            style={({ pressed }) => [styles.backButton, { opacity: pressed ? 0.5 : 1 }]}>
-            <AppText style={styles.backChevron}>‹</AppText>
+            onPress={startNewChat}
+            style={({ pressed }) => [styles.newChatButton, { opacity: pressed ? 0.5 : 1 }]}>
+            <AppText style={styles.newChatIcon}>＋</AppText>
           </Pressable>
-          <AppText style={styles.threadTitle}>New Thread</AppText>
-        </View>
+        ) : (
+          <View style={styles.newChatButton} />
+        )}
+      </View>
 
-        <View style={styles.conversationCanvas}>
-          <EmptyState
-            detail="Describe the outcome you want. Brio will keep the session running even when you leave this screen."
-            title={`What should ${composerDestination} work on?`}
-          />
-        </View>
-
-        <View style={[styles.composerDock, split && styles.composerDockWide]}>
-          {startError ? (
-            <AppText style={[styles.startError, { color: colors.danger }]}>{startError}</AppText>
-          ) : null}
-          <View
-            style={[
-              styles.promptComposer,
-              composerExpanded ? styles.promptComposerExpanded : styles.promptComposerCollapsed,
-              { backgroundColor: colors.cardAlt, borderColor: colors.border },
-            ]}>
-            <View style={composerExpanded ? styles.expandedInputRow : styles.collapsedInputRow}>
-              <AppTextInput
-                accessibilityLabel="Describe a coding task"
-                maxLength={20000}
-                multiline
-                onChangeText={(value) => setDraft(composerKey, value)}
-                onBlur={() => setComposerFocused(false)}
-                onFocus={() => setComposerFocused(true)}
-                placeholder={`Describe a coding task in ${composerDestination}`}
-                style={[
-                  styles.promptInput,
-                  composerExpanded ? styles.promptInputExpanded : styles.promptInputCollapsed,
-                  { backgroundColor: 'transparent', borderColor: 'transparent' },
-                ]}
-                textAlignVertical="top"
-                value={draft}
-              />
-            </View>
-            <View style={styles.promptFooter}>
-              <SessionModelControls
-                onOverrideChange={(override) =>
-                  setNewThreadModels((current) => ({ ...current, [composerKey]: override }))
-                }
-                onOpenChange={setModelPickerOpen}
-                options={modelOptions.data}
-                optionsError={modelOptions.isError}
-                optionsLoading={modelOptions.isLoading}
-                showUsage={false}
-                thread={newThread}
-                variant="inline"
-              />
-              <View style={styles.footerSpacer} />
-              <Pressable
-                accessibilityLabel="Send to Hermes"
-                accessibilityRole="button"
-                disabled={!canStart}
-                onPress={() => void startNewTask()}
-                style={({ pressed }) => [
-                  styles.sendButton,
-                  {
-                    backgroundColor: canStart ? colors.primary : colors.subtleStrong,
-                    opacity: pressed ? 0.65 : 1,
-                  },
-                ]}>
-                <AppText
-                  style={[
-                    styles.sendLabel,
-                    { color: canStart ? colors.primaryForeground : colors.tertiary },
-                  ]}>
-                  {starting ? '…' : '↑'}
-                </AppText>
-              </Pressable>
-            </View>
-          </View>
-        </View>
-      </KeyboardAvoidingView>
+      <HermesThreadScreen
+        key={`${activeProfile}:${conversationEpoch}`}
+        connection={connection}
+        embedded
+        onSessionCreated={(sessionId) => setActiveSessionId(sessionId)}
+        profile={activeProfile}
+        routeSessionId={activeSessionId}
+      />
 
       <Modal animationType="fade" onRequestClose={() => setHistoryOpen(false)} visible={historyOpen}>
         <SafeAreaView
@@ -604,54 +474,22 @@ const styles = StyleSheet.create({
     marginLeft: -8,
     width: 44,
   },
-  backChevron: { fontSize: 42, fontFamily: T3Typography.regular, lineHeight: 42 },
+  menuIcon: { fontFamily: T3Typography.regular, fontSize: 23, lineHeight: 27 },
   threadTitle: {
-    fontFamily: T3Typography.bold,
-    fontSize: 22,
-    letterSpacing: -0.25,
-    lineHeight: 28,
-  },
-  conversationCanvas: { flex: 1 },
-  composerDock: { paddingBottom: T3Spacing.sm, paddingHorizontal: T3Spacing.lg, paddingTop: T3Spacing.sm },
-  composerDockWide: { alignSelf: 'center', maxWidth: 760, width: '100%' },
-  promptComposer: {
-    borderWidth: StyleSheet.hairlineWidth,
-    overflow: 'hidden',
-  },
-  promptComposerCollapsed: {
-    borderRadius: 26,
-    minHeight: 104,
-    paddingBottom: 7,
-    paddingHorizontal: 10,
-    paddingTop: 8,
-  },
-  promptComposerExpanded: {
-    borderRadius: 26,
-    minHeight: 140,
-    paddingBottom: 6,
-    paddingHorizontal: 14,
-    paddingTop: 14,
-  },
-  collapsedInputRow: { alignItems: 'center', flexDirection: 'row' },
-  expandedInputRow: { minHeight: 78 },
-  promptInput: {
     flex: 1,
-    fontSize: 17,
+    fontFamily: T3Typography.bold,
+    fontSize: 18,
+    letterSpacing: -0.25,
     lineHeight: 24,
+    textAlign: 'center',
   },
-  promptInputCollapsed: { borderWidth: 0, height: 44, minHeight: 44, paddingHorizontal: T3Spacing.xs, paddingVertical: 4 },
-  promptInputExpanded: { borderWidth: 0, maxHeight: 150, minHeight: 78, paddingHorizontal: T3Spacing.xs, paddingTop: T3Spacing.xs },
-  promptFooter: { alignItems: 'center', flexDirection: 'row', gap: T3Spacing.md },
-  footerSpacer: { flex: 1 },
-  sendButton: {
+  newChatButton: {
     alignItems: 'center',
-    borderRadius: T3Radius.pill,
     height: 44,
     justifyContent: 'center',
     width: 44,
   },
-  sendLabel: { fontFamily: T3Typography.bold, fontSize: 21, lineHeight: 24 },
-  startError: { fontSize: 13, lineHeight: 17, paddingBottom: T3Spacing.sm, paddingHorizontal: T3Spacing.xs },
+  newChatIcon: { fontFamily: T3Typography.regular, fontSize: 28, lineHeight: 30 },
   panel: { flex: 1 },
   panelHeader: {
     alignItems: 'center',
