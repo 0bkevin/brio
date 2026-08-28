@@ -1133,6 +1133,9 @@ export async function listJobRuns(connection: AgentConnection, jobId: string, li
       );
     } catch (legacyError) {
       if (!isUnsupportedAutomationRoute(legacyError)) throw legacyError;
+      // The legacy gateway may ignore source filters. Scan a full recent page
+      // so an older job is not mistaken for a job with no runs; the caller's
+      // boundedLimit still caps the message-history fan-out.
       const sessions = await listSessions(connection, 100, profile, { source: 'cron', order: 'recent' });
       const prefix = `cron_${jobId}_`;
       return {

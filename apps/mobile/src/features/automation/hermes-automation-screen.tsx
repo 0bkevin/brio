@@ -1,4 +1,4 @@
-import { useQueries, useQuery } from '@tanstack/react-query';
+import { useQuery } from '@tanstack/react-query';
 import { useState } from 'react';
 import { Pressable, RefreshControl, ScrollView, StyleSheet, View } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
@@ -30,10 +30,20 @@ type AutomationResponse = {
   timestamp: number;
 };
 
+const INITIAL_AUTOMATION_RESPONSE_LIMIT = 5;
+const MAX_AUTOMATION_RESPONSE_LIMIT = 20;
+
+type AutomationMessageBatch = {
+  sessions: HermesSession[];
+  messageSets: { role: string; content: string; timestamp: number }[][];
+  error?: Error;
+};
+
 export function HermesAutomationScreen({ connection }: { connection: AgentConnection }) {
   const colors = useT3Theme();
   const [view, setView] = useState<AutomationView>('jobs');
   const [selectedJob, setSelectedJob] = useState<HermesJob | null>(null);
+  const [heartbeatLimit, setHeartbeatLimit] = useState(INITIAL_AUTOMATION_RESPONSE_LIMIT);
   const agentId = environmentId(connection);
   const storedProfiles = useProfileStore((state) => state.activeProfiles);
   const profilesQuery = useQuery({
@@ -58,8 +68,8 @@ export function HermesAutomationScreen({ connection }: { connection: AgentConnec
     refetchInterval: 15_000,
   });
   const heartbeatSessions = useQuery({
-    queryKey: ['automation-heartbeats', connection.id, connection.url, activeProfile],
-    queryFn: () => listSessions(connection, 20, activeProfile, { source: 'heartbeat', order: 'recent' }),
+    queryKey: ['automation-heartbeats', connection.id, connection.url, activeProfile, heartbeatLimit],
+    queryFn: () => listSessions(connection, heartbeatLimit, activeProfile, { source: 'heartbeat', order: 'recent' }),
     refetchInterval: 15_000,
   });
 
@@ -112,6 +122,8 @@ export function HermesAutomationScreen({ connection }: { connection: AgentConnec
           title="Heartbeat responses"
           onRefresh={() => void heartbeatSessions.refetch()}
           refreshing={heartbeatSessions.isRefetching}
+          canLoadMore={heartbeatSessions.data?.sessions.length === heartbeatLimit && heartbeatLimit < MAX_AUTOMATION_RESPONSE_LIMIT}
+          onLoadMore={() => setHeartbeatLimit((limit) => Math.min(limit * 2, MAX_AUTOMATION_RESPONSE_LIMIT))}
           oneResponsePerSession
           requestPrefix="[Heartbeat — recurring instruction"
         />
@@ -133,9 +145,10 @@ function JobResponses({
 }) {
   const colors = useT3Theme();
   const id = jobID(job);
+  const [runLimit, setRunLimit] = useState(INITIAL_AUTOMATION_RESPONSE_LIMIT);
   const runs = useQuery({
-    queryKey: ['automation-job-runs', connection.id, connection.url, profile, id],
-    queryFn: () => listJobRuns(connection, id, 20, profile),
+    queryKey: ['automation-job-runs', connection.id, connection.url, profile, id, runLimit],
+    queryFn: () => listJobRuns(connection, id, runLimit, profile),
     enabled: Boolean(id),
     refetchInterval: 15_000,
   });
@@ -160,6 +173,8 @@ function JobResponses({
         title="Run responses"
         onRefresh={() => void runs.refetch()}
         refreshing={runs.isRefetching}
+        canLoadMore={runs.data?.runs.length === runLimit && runLimit < MAX_AUTOMATION_RESPONSE_LIMIT}
+        onLoadMore={() => setRunLimit((limit) => Math.min(limit * 2, MAX_AUTOMATION_RESPONSE_LIMIT))}
         oneResponsePerSession
       />
     </SafeAreaView>
@@ -175,6 +190,8 @@ function ResponseFeed({
   oneResponsePerSession = false,
   profile,
   refreshing,
+  canLoadMore = false,
+  onLoadMore,
   requestPrefix,
   sessions,
   sessionsError,
@@ -186,6 +203,8 @@ function ResponseFeed({
   emptyDetail: string;
   emptyTitle: string;
   onRefresh: () => void;
+  canLoadMore?: boolean;
+  onLoadMore?: () => void;
   oneResponsePerSession?: boolean;
   profile: string;
   refreshing: boolean;
@@ -196,28 +215,50 @@ function ResponseFeed({
   title: string;
 }) {
   const colors = useT3Theme();
-  const responseQueries = useQueries({
-    queries: sessions.map((session) => ({
-      queryKey: ['automation-response', connection.id, connection.url, profile, session.id, session.message_count],
-      queryFn: () => getSessionMessages(connection, session.id, profile),
-      retry: 2,
-      refetchInterval: (query: { state: { status: string } }) => query.state.status === 'error' ? 30_000 : false,
-    })),
+  const responseQuery = useQuery<AutomationMessageBatch>({
+    queryKey: [
+      'automation-responses',
+      connection.id,
+      connection.url,
+      profile,
+      sessions.map((session) => `${session.id}:${session.message_count}`).join('|'),
+    ],
+    enabled: !sessionsLoading && sessions.length > 0,
+    queryFn: async () => {
+      const results = await Promise.allSettled(
+        sessions.map(async (session) => ({
+          session,
+          messages: (await getSessionMessages(connection, session.id, profile)).messages,
+        })),
+      );
+      const successfulSessions: HermesSession[] = [];
+      const successfulMessages: { role: string; content: string; timestamp: number }[][] = [];
+      let error: Error | undefined;
+      results.forEach((result) => {
+        if (result.status === 'fulfilled') {
+          successfulSessions.push(result.value.session);
+          successfulMessages.push(result.value.messages);
+        } else if (!error) {
+          error = result.reason instanceof Error ? result.reason : new Error(String(result.reason));
+        }
+      });
+      return { sessions: successfulSessions, messageSets: successfulMessages, error };
+    },
+    retry: false,
+    staleTime: 30_000,
   });
-  const successfulSessions: HermesSession[] = [];
-  const successfulMessages: { role: string; content: string; timestamp: number }[][] = [];
-  responseQueries.forEach((query, index) => {
-    if (!query.data) return;
-    successfulSessions.push(sessions[index]);
-    successfulMessages.push(query.data.messages);
-  });
-  const responses = collectResponses(successfulSessions, successfulMessages, oneResponsePerSession, requestPrefix);
-  const responsesLoading = responseQueries.some((query) => query.isLoading);
-  const responsesRefetching = responseQueries.some((query) => query.isRefetching);
-  const responseError = responseQueries.find((query) => query.error)?.error;
+  const responses = collectResponses(
+    responseQuery.data?.sessions ?? [],
+    responseQuery.data?.messageSets ?? [],
+    oneResponsePerSession,
+    requestPrefix,
+  );
+  const responsesLoading = responseQuery.isLoading;
+  const responsesRefetching = responseQuery.isRefetching;
+  const responseError = responseQuery.error ?? responseQuery.data?.error;
   const refreshAll = () => {
     onRefresh();
-    responseQueries.forEach((query) => void query.refetch());
+    void responseQuery.refetch();
   };
 
   return (
@@ -233,6 +274,11 @@ function ResponseFeed({
       ) : null}
       {sessionsError || responseError ? <Failure error={sessionsError ?? responseError} onRetry={refreshAll} /> : null}
       {responses.map((response) => <ResponseCard key={response.id} response={response} />)}
+      {canLoadMore && onLoadMore ? (
+        <View style={styles.loadMore}>
+          <Button disabled={responsesLoading} onPress={onLoadMore} tone="secondary">Load older responses</Button>
+        </View>
+      ) : null}
       {!sessionsLoading && !sessionsError && !responsesLoading && !responseError && responses.length === 0 ? (
         <EmptyState detail={emptyDetail} title={emptyTitle} />
       ) : null}
@@ -371,4 +417,5 @@ const styles = StyleSheet.create({
   responseHeader: { alignItems: 'baseline', flexDirection: 'row', justifyContent: 'space-between' },
   responseLabel: { fontFamily: T3Typography.bold, fontSize: 13, lineHeight: 17 },
   responseText: { fontSize: 15, lineHeight: 22 },
+  loadMore: { alignItems: 'center', paddingVertical: T3Spacing.sm },
 });
