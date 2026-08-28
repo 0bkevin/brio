@@ -2,7 +2,24 @@ import { useQuery } from '@tanstack/react-query';
 import * as DocumentPicker from 'expo-document-picker';
 import * as ImagePicker from 'expo-image-picker';
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
-import { Modal, Platform, Pressable, ScrollView, StyleSheet, TextInput, View } from 'react-native';
+import {
+  Modal,
+  Platform,
+  Pressable,
+  ScrollView,
+  StyleSheet,
+  TextInput,
+  View,
+} from 'react-native';
+import Animated, {
+  Easing,
+  FadeIn,
+  FadeOut,
+  interpolate,
+  useAnimatedStyle,
+  useDerivedValue,
+  withTiming,
+} from 'react-native-reanimated';
 
 import { ThemedText } from '@/components/themed-text';
 import { Spacing } from '@/constants/theme';
@@ -29,6 +46,13 @@ type UploadState = {
   error?: string;
 };
 
+const COMPOSER_MOTION = {
+  duration: 230,
+  easing: Easing.bezier(0.2, 0, 0, 1),
+};
+const FOOTER_ENTER = FadeIn.duration(140).delay(80).easing(Easing.out(Easing.cubic));
+const FOOTER_EXIT = FadeOut.duration(70).easing(Easing.in(Easing.quad));
+
 export function ComposerControls({
   active,
   attachments,
@@ -38,6 +62,7 @@ export function ComposerControls({
   draft,
   history,
   hydrated,
+  keyboardVisible,
   forceExpanded = false,
   modelControl,
   onAddAttachment,
@@ -58,6 +83,7 @@ export function ComposerControls({
   draft: string;
   history: string[];
   hydrated: boolean;
+  keyboardVisible?: boolean;
   forceExpanded?: boolean;
   modelControl?: ReactNode;
   onAddAttachment: (attachment: ComposerAttachment) => Promise<void>;
@@ -73,10 +99,13 @@ export function ComposerControls({
   const colors = useTheme();
   const incomingShare = useIncomingShareContext();
   const processedShare = useRef<string | null>(null);
+  const inputRef = useRef<TextInput>(null);
+  const previousKeyboardVisible = useRef(keyboardVisible);
   const [pickerOpen, setPickerOpen] = useState(false);
   const [historyOpen, setHistoryOpen] = useState(false);
   const [commandsOpen, setCommandsOpen] = useState(false);
   const [inputFocused, setInputFocused] = useState(false);
+  const [inputHeight, setInputHeight] = useState(42);
   const [uploads, setUploads] = useState<UploadState[]>([]);
   const [error, setError] = useState('');
   const token = completionToken(draft);
@@ -116,6 +145,41 @@ export function ComposerControls({
     uploads.length > 0 ||
     Boolean(error) ||
     Boolean(incomingShare.error);
+  const expansionProgress = useDerivedValue(
+    () => withTiming(expanded ? 1 : 0, COMPOSER_MOTION),
+    [expanded],
+  );
+  const expandedComposerHeight = Math.max(98, inputHeight + 54);
+  const composerHeight = useDerivedValue(
+    () => withTiming(expanded ? expandedComposerHeight : 52, COMPOSER_MOTION),
+    [expanded, expandedComposerHeight],
+  );
+  const composerAnimatedStyle = useAnimatedStyle(() => ({
+    borderRadius: interpolate(expansionProgress.value, [0, 1], [26, 24]),
+    height: composerHeight.value,
+    paddingBottom: interpolate(expansionProgress.value, [0, 1], [4, 5]),
+    paddingHorizontal: interpolate(expansionProgress.value, [0, 1], [4, 12]),
+    paddingTop: interpolate(expansionProgress.value, [0, 1], [4, 9]),
+  }));
+  const compactLeftStyle = useAnimatedStyle(() => ({
+    opacity: interpolate(expansionProgress.value, [0, 0.35, 1], [1, 0, 0]),
+    width: interpolate(expansionProgress.value, [0, 1], [41, 0]),
+  }));
+  const compactRightStyle = useAnimatedStyle(() => ({
+    opacity: interpolate(expansionProgress.value, [0, 0.35, 1], [1, 0, 0]),
+    width: interpolate(expansionProgress.value, [0, 1], [45, 0]),
+  }));
+
+  useEffect(() => {
+    const previous = previousKeyboardVisible.current;
+    previousKeyboardVisible.current = keyboardVisible;
+    if (previous !== true || keyboardVisible !== false || !inputFocused) return;
+    const timer = setTimeout(() => {
+      inputRef.current?.blur();
+      setInputFocused(false);
+    }, Platform.OS === 'android' ? 180 : 0);
+    return () => clearTimeout(timer);
+  }, [inputFocused, keyboardVisible]);
 
   const uploadSources = useCallback(async (sources: AttachmentSource[]) => {
     setPickerOpen(false);
@@ -249,6 +313,10 @@ export function ComposerControls({
       setError(reason instanceof Error ? reason.message : 'Could not remove attachment');
     }
   };
+  const setFocused = (focused: boolean) => {
+    if (focused === inputFocused) return;
+    setInputFocused(focused);
+  };
 
   return (
     <>
@@ -299,38 +367,67 @@ export function ComposerControls({
         </View>
       ) : null}
 
-      <View
+      <Animated.View
         style={[
           styles.composer,
-          expanded ? styles.composerExpanded : styles.composerCollapsed,
+          composerAnimatedStyle,
           { backgroundColor: colors.panelStrong, borderColor: colors.border },
         ]}>
-        <View style={expanded ? styles.expandedInputRow : styles.collapsedInputRow}>
+        <View style={styles.composerInputRow}>
+          <Animated.View
+            pointerEvents={expanded ? 'none' : 'auto'}
+            style={[styles.compactLeftSlot, compactLeftStyle]}>
+            <Pressable
+              accessibilityElementsHidden={expanded}
+              accessibilityLabel="Attach context"
+              accessible={!expanded}
+              hitSlop={4}
+              onPress={() => setPickerOpen(true)}
+              style={({ pressed }) => [styles.compactControlPressable, { opacity: pressed ? 0.65 : 1 }]}>
+              <ThemedText style={styles.compactAttachLabel} themeColor="textSecondary">+</ThemedText>
+            </Pressable>
+          </Animated.View>
           <TextInput
             accessibilityLabel="Ask Hermes anything"
             maxLength={20000}
             multiline
-            onBlur={() => setInputFocused(false)}
+            onBlur={() => {
+              if (Platform.OS === 'android' && keyboardVisible) return;
+              setFocused(false);
+            }}
             onChangeText={onDraftChange}
-            onFocus={() => setInputFocused(true)}
+            onContentSizeChange={(event) => {
+              const nativeHeight = event.nativeEvent.contentSize.height;
+              const measuredHeight = Platform.OS === 'android' ? nativeHeight - 32 : nativeHeight;
+              const nextHeight = Math.min(96, Math.max(42, Math.ceil(measuredHeight)));
+              setInputHeight(nextHeight);
+            }}
+            onFocus={() => setFocused(true)}
             placeholder={active ? 'Ask a follow-up…' : 'Ask Hermes anything…'}
             placeholderTextColor={colors.textTertiary}
-            scrollEnabled={expanded}
+            ref={inputRef}
+            scrollEnabled={expanded && inputHeight >= 96}
+            selectionColor={colors.accent}
             style={[
               styles.input,
               expanded ? styles.inputExpanded : styles.inputCollapsed,
+              expanded ? { height: inputHeight } : null,
               { color: colors.text },
             ]}
             textAlignVertical={expanded ? 'top' : 'center'}
             value={draft}
           />
-          {!expanded ? (
+          <Animated.View
+            pointerEvents={expanded ? 'none' : 'auto'}
+            style={[styles.compactRightSlot, compactRightStyle]}>
             <Pressable
+              accessibilityElementsHidden={expanded}
               accessibilityLabel={active ? 'Queue message' : 'Send message'}
+              accessible={!expanded}
               disabled={!canSend}
               onPress={() => onSend('queue')}
               style={({ pressed }) => [
-                styles.send,
+                styles.sendPressable,
                 {
                   backgroundColor: canSend ? colors.accent : colors.backgroundSelected,
                   opacity: pressed ? 0.72 : 1,
@@ -341,19 +438,20 @@ export function ComposerControls({
                 ↑
               </ThemedText>
             </Pressable>
-          ) : null}
+          </Animated.View>
         </View>
         {expanded ? (
-          <View style={styles.composerFooter}>
+          <Animated.View entering={FOOTER_ENTER} exiting={FOOTER_EXIT} style={styles.composerFooter}>
             <ScrollView
               contentContainerStyle={styles.toolbar}
               horizontal
               keyboardShouldPersistTaps="handled"
+              style={styles.toolbarScroller}
               showsHorizontalScrollIndicator={false}>
-              <ToolbarAction label="+" accessibilityLabel="Attach context" onPress={() => setPickerOpen(true)} />
+              <ToolbarAction bare label="+" accessibilityLabel="Attach context" onPress={() => setPickerOpen(true)} />
               {modelControl}
-              <ToolbarAction label="Commands" onPress={() => setCommandsOpen(true)} />
-              {history.length > 0 ? <ToolbarAction label="History" onPress={() => setHistoryOpen(true)} /> : null}
+              <ToolbarAction accessibilityLabel="Commands" label="/" onPress={() => setCommandsOpen(true)} />
+              {history.length > 0 ? <ToolbarAction accessibilityLabel="Prompt history" label="↶" onPress={() => setHistoryOpen(true)} /> : null}
               {canUndo ? <ToolbarAction label="Undo" onPress={onUndo} /> : null}
               {canRedo ? <ToolbarAction label="Redo" onPress={onRedo} /> : null}
               {active ? <ToolbarAction disabled={!canSend} label="Redirect" onPress={() => onSend('redirect')} tone="warning" /> : null}
@@ -365,9 +463,9 @@ export function ComposerControls({
               style={({ pressed }) => [styles.send, { backgroundColor: canSend ? colors.accent : colors.backgroundSelected, opacity: pressed ? 0.72 : 1 }]}>
               <ThemedText style={{ color: canSend ? colors.accentText : colors.textDisabled, fontSize: 20 }}>↑</ThemedText>
             </Pressable>
-          </View>
+          </Animated.View>
         ) : null}
-      </View>
+      </Animated.View>
 
       <PickerModal onClose={() => setPickerOpen(false)} onDocuments={() => void chooseDocuments()} onImages={() => void chooseImages()} onPhoto={() => void takePhoto()} visible={pickerOpen} />
       <HistoryModal history={history} onChoose={(text) => { onDraftChange(text); setHistoryOpen(false); }} onClose={() => setHistoryOpen(false)} visible={historyOpen} />
@@ -389,18 +487,30 @@ function AttachmentChip({ detail, name, onRemove, tone = 'normal' }: { detail: s
   );
 }
 
-function ToolbarAction({ accessibilityLabel, disabled, label, onPress, tone = 'normal' }: { accessibilityLabel?: string; disabled?: boolean; label: string; onPress: () => void; tone?: 'normal' | 'warning' }) {
+function ToolbarAction({ accessibilityLabel, bare = false, disabled, label, onPress, tone = 'normal' }: { accessibilityLabel?: string; bare?: boolean; disabled?: boolean; label: string; onPress: () => void; tone?: 'normal' | 'warning' }) {
   const colors = useTheme();
   return (
     <Pressable
       accessibilityLabel={accessibilityLabel ?? label}
       disabled={disabled}
+      hitSlop={bare ? 4 : undefined}
       onPress={onPress}
       style={({ pressed }) => [
         styles.toolbarAction,
-        { backgroundColor: colors.backgroundSelected, opacity: disabled ? 0.35 : pressed ? 0.6 : 1 },
+        bare ? styles.toolbarActionBare : null,
+        {
+          backgroundColor: bare ? 'transparent' : colors.backgroundSelected,
+          opacity: disabled ? 0.35 : pressed ? 0.6 : 1,
+        },
       ]}>
-      <ThemedText style={{ color: tone === 'warning' ? colors.warning : colors.textSecondary }} type="smallBold">{label}</ThemedText>
+      <ThemedText
+        style={[
+          { color: tone === 'warning' ? colors.warning : colors.textSecondary },
+          bare ? styles.toolbarActionBareLabel : null,
+        ]}
+        type="smallBold">
+        {label}
+      </ThemedText>
     </Pressable>
   );
 }
@@ -482,31 +592,40 @@ function formatBytes(value: number) {
 }
 
 const styles = StyleSheet.create({
-  toolbar: { alignItems: 'center', flexDirection: 'row', gap: Spacing.two, paddingRight: Spacing.two },
-  toolbarAction: { borderRadius: 999, minHeight: 34, justifyContent: 'center', paddingHorizontal: 11 },
-  composer: { borderWidth: StyleSheet.hairlineWidth, overflow: 'hidden' },
-  composerCollapsed: {
+  toolbar: {
+    alignItems: 'center',
+    flexDirection: 'row',
+    flexGrow: 1,
+    gap: Spacing.two,
+    justifyContent: 'space-between',
+    paddingRight: Spacing.two,
+  },
+  toolbarScroller: { flex: 1 },
+  toolbarAction: {
     borderRadius: 999,
-    minHeight: 54,
-    paddingBottom: 5,
-    paddingLeft: 18,
-    paddingRight: 5,
-    paddingTop: 5,
+    justifyContent: 'center',
+    minHeight: 34,
+    paddingHorizontal: 11,
   },
-  composerExpanded: {
-    borderRadius: 26,
-    minHeight: 140,
-    paddingBottom: 6,
-    paddingHorizontal: 14,
-    paddingTop: 14,
+  toolbarActionBare: { alignItems: 'center', minWidth: 36, paddingHorizontal: 0 },
+  toolbarActionBareLabel: { fontSize: 27, fontWeight: '300', lineHeight: 29 },
+  composer: { borderWidth: StyleSheet.hairlineWidth, overflow: 'hidden' },
+  composerInputRow: { alignItems: 'center', flexDirection: 'row', minHeight: 42 },
+  input: { fontSize: 16, lineHeight: 23, outlineStyle: 'none' } as never,
+  inputCollapsed: { flex: 1, height: 42, paddingBottom: 3, paddingHorizontal: 4, paddingTop: 3 },
+  inputExpanded: { flex: 1, maxHeight: 96, minHeight: 42, paddingHorizontal: 4, paddingVertical: 3 },
+  composerFooter: {
+    alignItems: 'center',
+    flexDirection: 'row',
+    gap: Spacing.two,
+    minHeight: 40,
   },
-  collapsedInputRow: { alignItems: 'center', flexDirection: 'row' },
-  expandedInputRow: { minHeight: 72 },
-  input: { flex: 1, fontSize: 16, lineHeight: 23, outlineStyle: 'none' } as never,
-  inputCollapsed: { height: 36, paddingBottom: 4, paddingTop: 4 },
-  inputExpanded: { maxHeight: 150, minHeight: 72, paddingHorizontal: 4, paddingVertical: 4 },
-  composerFooter: { alignItems: 'center', flexDirection: 'row', gap: Spacing.two },
-  send: { alignItems: 'center', borderRadius: 22, height: 44, justifyContent: 'center', width: 44 },
+  send: { alignItems: 'center', borderRadius: 20, height: 40, justifyContent: 'center', width: 40 },
+  sendPressable: { alignItems: 'center', borderRadius: 20, height: 40, justifyContent: 'center', width: 40 },
+  compactLeftSlot: { height: 40, justifyContent: 'center', overflow: 'hidden' },
+  compactRightSlot: { alignItems: 'flex-end', height: 40, justifyContent: 'center', overflow: 'hidden' },
+  compactControlPressable: { alignItems: 'center', height: 40, justifyContent: 'center', width: 36 },
+  compactAttachLabel: { fontSize: 27, fontWeight: '300', lineHeight: 30 },
   attachmentList: { gap: Spacing.two, paddingBottom: Spacing.two },
   attachmentChip: { alignItems: 'center', borderRadius: 10, borderWidth: StyleSheet.hairlineWidth, flexDirection: 'row', gap: Spacing.two, paddingHorizontal: Spacing.two, paddingVertical: Spacing.one },
   completions: { borderRadius: 12, borderWidth: StyleSheet.hairlineWidth, marginBottom: Spacing.two, maxHeight: 220 },

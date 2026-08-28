@@ -3,13 +3,15 @@ import { useRouter } from 'expo-router';
 import { useEffect, useRef, useState } from 'react';
 import {
   FlatList,
+  Keyboard,
   KeyboardAvoidingView,
+  LayoutAnimation,
   Platform,
   Pressable,
   StyleSheet,
   View,
 } from 'react-native';
-import { SafeAreaView } from 'react-native-safe-area-context';
+import { SafeAreaView, useSafeAreaInsets } from 'react-native-safe-area-context';
 
 import { ComposerControls } from '@/components/composer-controls';
 import { AppText, AppTextInput, Button, Card, EmptyState } from '@/components/t3-ui';
@@ -108,16 +110,21 @@ function createDraftSessionId() {
 
 export function HermesThreadScreen({
   connection,
+  embedded = false,
   initialModelOverride,
+  onSessionCreated,
   profile,
   routeSessionId,
 }: {
   connection: AgentConnection;
+  embedded?: boolean;
   initialModelOverride?: ChatModelOverride;
+  onSessionCreated?: (sessionId: string) => void;
   profile: string;
   routeSessionId: string;
 }) {
   const colors = useT3Theme();
+  const safeArea = useSafeAreaInsets();
   const router = useRouter();
   const queryClient = useQueryClient();
   const listRef = useRef<FlatList<FeedItem>>(null);
@@ -141,6 +148,7 @@ export function HermesThreadScreen({
   const [gatewayActivity, setGatewayActivity] = useState<FeedItem[]>([]);
   const [gatewayApproval, setGatewayApproval] = useState<GatewayApproval | null>(null);
   const [gatewayInput, setGatewayInput] = useState<GatewayInputRequest | null>(null);
+  const [keyboardInset, setKeyboardInset] = useState(0);
   const runId = useRunStore((state) => state.activeRuns[runKey] ?? null);
   const setActiveRun = useRunStore((state) => state.setActiveRun);
   const clearActiveRun = useRunStore((state) => state.clearActiveRun);
@@ -175,6 +183,25 @@ export function HermesThreadScreen({
     content: string;
     timestamp: number;
   } | null>(null);
+
+  useEffect(() => {
+    if (Platform.OS !== 'android') return;
+    const animateInset = (nextInset: number) => {
+      LayoutAnimation.configureNext({
+        duration: 190,
+        update: { type: LayoutAnimation.Types.easeInEaseOut },
+      });
+      setKeyboardInset(nextInset);
+    };
+    const shown = Keyboard.addListener('keyboardDidShow', (event) => {
+      animateInset(Math.max(0, event.endCoordinates.height - safeArea.bottom + T3Spacing.sm));
+    });
+    const hidden = Keyboard.addListener('keyboardDidHide', () => animateInset(0));
+    return () => {
+      shown.remove();
+      hidden.remove();
+    };
+  }, [safeArea.bottom]);
 
   useEffect(() => {
     if (routeSessionId !== 'new' || !composerHydrated) return;
@@ -734,6 +761,11 @@ export function HermesThreadScreen({
         ),
       );
       if (routeSessionId === 'new') {
+        const acceptedSessionId = result.sessionId ?? sessionId;
+        if (onSessionCreated) {
+          onSessionCreated(acceptedSessionId);
+          return;
+        }
         const params: string[] = [];
         if (isNamedProfile(profile)) params.push(`profile=${encodeURIComponent(profile)}`);
         const acceptedModelOverride = queuedPrompt.modelOverride ?? modelOverride;
@@ -748,7 +780,7 @@ export function HermesThreadScreen({
           }
         }
         router.replace(
-          `/thread/${encodeURIComponent(result.sessionId ?? sessionId)}${
+          `/thread/${encodeURIComponent(acceptedSessionId)}${
             params.length ? `?${params.join('&')}` : ''
           }`,
         );
@@ -953,9 +985,9 @@ export function HermesThreadScreen({
   return (
     <SafeAreaView edges={['bottom', 'left', 'right']} style={[styles.safe, { backgroundColor: colors.screen }]}>
       <KeyboardAvoidingView
-        behavior={Platform.OS === 'ios' ? 'padding' : 'height'}
-        keyboardVerticalOffset={Platform.OS === 'ios' ? 88 : 0}
-        style={styles.safe}>
+        behavior={Platform.OS === 'ios' ? 'padding' : undefined}
+        keyboardVerticalOffset={Platform.OS === 'ios' && !embedded ? 88 : 0}
+        style={[styles.safe, keyboardInset > 0 && { paddingBottom: keyboardInset }]}>
         {messages.isLoading && feed.length === 0 ? (
           <EmptyState detail="Loading the conversation history." loading title="Opening conversation" />
         ) : messages.isError && feed.length === 0 ? (
@@ -1021,7 +1053,14 @@ export function HermesThreadScreen({
           </View>
         ) : null}
 
-        <View style={[styles.composerShell, { backgroundColor: colors.sheet }]}>
+        <View
+          style={[
+            styles.composerShell,
+            {
+              backgroundColor: colors.sheet,
+              marginBottom: keyboardInset > 0 ? T3Spacing.md : 0,
+            },
+          ]}>
           {queue.length > 0 ? (
             <PromptQueue
               activePromptId={submit.isPending ? submit.variables?.id : undefined}
@@ -1053,6 +1092,7 @@ export function HermesThreadScreen({
               forceExpanded={modelPickerOpen}
               history={history}
               hydrated={composerHydrated}
+              keyboardVisible={Platform.OS === 'android' ? keyboardInset > 0 : undefined}
               modelControl={
                 <SessionModelControls
                   onOpenChange={setModelPickerOpen}
