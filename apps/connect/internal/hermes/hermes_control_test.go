@@ -406,7 +406,32 @@ func TestHeartbeatRunnerQueuesDuePromptAndReanchorsHermes(t *testing.T) {
 			var result any
 			switch request.Method {
 			case "session.resume":
-				result = map[string]any{"session_id": "runtime-session"}
+				if request.Params["eager_build"] != true || request.Params["omit_messages"] != nil {
+					t.Fatalf("source heartbeat resume params = %+v", request.Params)
+				}
+				result = map[string]any{
+					"session_id": "runtime-session",
+					"messages": []map[string]any{
+						{"role": "user", "text": "Work in this repository"},
+						{"role": "assistant", "text": "Understood"},
+					},
+					"info": map[string]any{
+						"cwd": "/tmp/source-workspace", "model": "test-model", "provider": "test-provider",
+						"reasoning_effort": "high", "fast": false,
+					},
+				}
+			case "session.create":
+				title, _ := request.Params["title"].(string)
+				if request.Params["source"] != "heartbeat" || !strings.HasPrefix(title, "Heartbeat response ") {
+					t.Fatalf("heartbeat session params = %+v", request.Params)
+				}
+				messages, _ := request.Params["messages"].([]any)
+				if len(messages) != 2 || request.Params["cwd"] != "/tmp/source-workspace" ||
+					request.Params["model"] != "test-model" || request.Params["provider"] != "test-provider" ||
+					request.Params["reasoning_effort"] != "high" || request.Params["fast"] != false {
+					t.Fatalf("heartbeat did not inherit source context: %+v", request.Params)
+				}
+				result = map[string]any{"session_id": "heartbeat-runtime", "stored_session_id": "heartbeat-stored"}
 			case "session.status":
 				result = map[string]any{"output": "Agent Running: No"}
 			case "prompt.submit":
@@ -447,7 +472,7 @@ func TestHeartbeatRunnerQueuesDuePromptAndReanchorsHermes(t *testing.T) {
 	)
 	select {
 	case params := <-promptSubmitted:
-		if params["queued"] != true || !strings.Contains(params["text"].(string), "[Heartbeat — recurring instruction, fires every 10m]") {
+		if params["session_id"] != "heartbeat-runtime" || params["queued"] != true || !strings.Contains(params["text"].(string), "[Heartbeat — recurring instruction, fires every 10m]") {
 			t.Fatalf("prompt params = %+v", params)
 		}
 	case <-time.After(3 * time.Second):
@@ -456,13 +481,191 @@ func TestHeartbeatRunnerQueuesDuePromptAndReanchorsHermes(t *testing.T) {
 	deadline := time.Now().Add(time.Second)
 	for {
 		state := client.Heartbeat("stored-session")
-		if state != nil && state.FireCount == 1 && state.NextInSeconds > 500 {
+		if state != nil && state.FireCount == 1 && state.NextInSeconds > 500 && state.OutputSessionID == "heartbeat-stored" {
 			break
 		}
 		if time.Now().After(deadline) {
 			t.Fatalf("heartbeat was not reanchored: %+v", state)
 		}
 		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+func TestHeartbeatRunnerDoesNotQueueWhileResponseSessionIsBusy(t *testing.T) {
+	promptSubmitted := make(chan struct{}, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := websocket.Accept(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.Close(websocket.StatusNormalClosure, "done")
+		for {
+			_, payload, readErr := conn.Read(context.Background())
+			if readErr != nil {
+				return
+			}
+			var request struct {
+				ID     string         `json:"id"`
+				Method string         `json:"method"`
+				Params map[string]any `json:"params"`
+			}
+			if json.Unmarshal(payload, &request) != nil {
+				return
+			}
+			var result any
+			switch request.Method {
+			case "session.resume":
+				if request.Params["session_id"] == "heartbeat-stored" {
+					result = map[string]any{"session_id": "heartbeat-runtime", "stored_session_id": "heartbeat-stored"}
+				} else {
+					result = map[string]any{"session_id": "runtime-session"}
+				}
+			case "session.status":
+				if request.Params["session_id"] == "heartbeat-runtime" {
+					result = map[string]any{"output": "Agent Running: Yes"}
+				} else {
+					result = map[string]any{"output": "Agent Running: No"}
+				}
+			case "prompt.submit":
+				promptSubmitted <- struct{}{}
+				result = map[string]any{"status": "streaming"}
+			default:
+				t.Fatalf("unexpected method while heartbeat output is busy: %s %+v", request.Method, request.Params)
+			}
+			response, _ := json.Marshal(map[string]any{"jsonrpc": "2.0", "id": request.ID, "result": result})
+			if conn.Write(context.Background(), websocket.MessageText, response) != nil {
+				return
+			}
+		}
+	}))
+	defer server.Close()
+
+	client := newControlClient(Config{
+		HermesControlURL:   server.URL,
+		HermesControlToken: "control-token",
+	}, server.Client())
+	defer client.Close()
+	client.heartbeats["stored-session"] = controlHeartbeatState{
+		Status:          "active",
+		Prompt:          "Check CI",
+		Interval:        "10m",
+		OutputSessionID: "heartbeat-stored",
+		InFlight:        true,
+	}
+	client.fireHeartbeat("stored-session")
+	select {
+	case <-promptSubmitted:
+		t.Fatal("busy heartbeat response session received another prompt")
+	default:
+	}
+	state := client.Heartbeat("stored-session")
+	if state == nil || state.InFlight || state.FireCount != 0 || state.NextAt <= float64(time.Now().UnixMilli())/1000 {
+		t.Fatalf("heartbeat retry state = %+v", state)
+	}
+}
+
+func TestPrepareHeartbeatOutputAllowsPrunedSession(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := websocket.Accept(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.Close(websocket.StatusNormalClosure, "done")
+		_, payload, err := conn.Read(context.Background())
+		if err != nil {
+			return
+		}
+		var request struct {
+			ID string `json:"id"`
+		}
+		if json.Unmarshal(payload, &request) != nil {
+			return
+		}
+		response, _ := json.Marshal(map[string]any{
+			"jsonrpc": "2.0", "id": request.ID,
+			"error": map[string]any{"code": 4007, "message": "session not found"},
+		})
+		_ = conn.Write(context.Background(), websocket.MessageText, response)
+	}))
+	defer server.Close()
+
+	client := newControlClient(Config{HermesControlURL: server.URL, HermesControlToken: "control-token"}, server.Client())
+	defer client.Close()
+	busy, err := client.prepareHeartbeatOutput(context.Background(), controlHeartbeatState{OutputSessionID: "pruned-response"})
+	if err != nil || busy {
+		t.Fatalf("pruned heartbeat output blocked the next run: busy=%v err=%v", busy, err)
+	}
+}
+
+func TestPrepareHeartbeatOutputClosesIdleRuntime(t *testing.T) {
+	closed := make(chan string, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := websocket.Accept(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.Close(websocket.StatusNormalClosure, "done")
+		for {
+			_, payload, readErr := conn.Read(context.Background())
+			if readErr != nil {
+				return
+			}
+			var request struct {
+				ID     string         `json:"id"`
+				Method string         `json:"method"`
+				Params map[string]any `json:"params"`
+			}
+			if json.Unmarshal(payload, &request) != nil {
+				return
+			}
+			var result any
+			switch request.Method {
+			case "session.resume":
+				result = map[string]any{"session_id": "idle-runtime"}
+			case "session.status":
+				result = map[string]any{"output": "Agent Running: No"}
+			case "session.close":
+				closed <- request.Params["session_id"].(string)
+				result = map[string]any{"closed": true}
+			default:
+				t.Fatalf("unexpected method: %s", request.Method)
+			}
+			response, _ := json.Marshal(map[string]any{"jsonrpc": "2.0", "id": request.ID, "result": result})
+			if conn.Write(context.Background(), websocket.MessageText, response) != nil {
+				return
+			}
+		}
+	}))
+	defer server.Close()
+
+	client := newControlClient(Config{HermesControlURL: server.URL, HermesControlToken: "control-token"}, server.Client())
+	defer client.Close()
+	busy, err := client.prepareHeartbeatOutput(context.Background(), controlHeartbeatState{OutputSessionID: "stored-response"})
+	if err != nil || busy {
+		t.Fatalf("idle heartbeat output was not released: busy=%v err=%v", busy, err)
+	}
+	select {
+	case sessionID := <-closed:
+		if sessionID != "idle-runtime" {
+			t.Fatalf("closed runtime = %q", sessionID)
+		}
+	default:
+		t.Fatal("idle heartbeat runtime was not closed")
+	}
+}
+
+func TestSanitizeHeartbeatSeedDropsInterruptedToolTail(t *testing.T) {
+	seed := sanitizeHeartbeatSeed([]map[string]any{
+		{"role": "system", "text": "Use the repository instructions"},
+		{"role": "user", "text": "Check the build"},
+		{"role": "assistant", "text": "The build is green"},
+		{"role": "user", "text": "Now inspect the logs"},
+		{"role": "assistant", "text": "", "tool_calls": []any{map[string]any{"name": "terminal"}}},
+		{"role": "tool", "text": "unfinished"},
+	})
+	if len(seed) != 3 || seed[0]["role"] != "system" || seed[1]["role"] != "user" ||
+		seed[2]["role"] != "assistant" || seed[2]["content"] != "The build is green" {
+		t.Fatalf("sanitized heartbeat seed = %+v", seed)
 	}
 }
 

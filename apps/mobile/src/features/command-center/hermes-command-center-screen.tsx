@@ -69,7 +69,13 @@ export function HermesCommandCenterScreen({ connection }: { connection: AgentCon
 
   const sessions = useQuery({
     queryKey: ['control-sessions', activeConnection.id, activeConnection.url, activeProfile],
-    queryFn: () => listControlSessions(activeConnection, 100, activeProfile),
+    queryFn: async () => {
+      const result = await listControlSessions(activeConnection, 100, activeProfile);
+      return {
+        ...result,
+        sessions: result.sessions.filter((session) => session.source !== 'heartbeat' && session.source !== 'cron'),
+      };
+    },
     refetchInterval: 15_000,
   });
   const sessionId = sessions.data?.sessions.some((session) => session.id === selectedSessionId)
@@ -356,6 +362,9 @@ export function HermesCommandCenterScreen({ connection }: { connection: AgentCon
                     ) : null}
                   </View>
                   <AppText>{snapshot.data.heartbeat.prompt}</AppText>
+                  {snapshot.data.heartbeat.outputSessionId ? (
+                    <Button onPress={() => router.push('/automation')} tone="secondary">View responses</Button>
+                  ) : null}
                   {snapshot.data.heartbeat.lastError ? (
                     <AppText style={[styles.caption, { color: colors.danger }]}>
                       Last delivery attempt: {snapshot.data.heartbeat.lastError}

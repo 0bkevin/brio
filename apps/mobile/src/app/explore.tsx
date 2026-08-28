@@ -26,7 +26,7 @@ export default function ManageScreen() {
   });
   const sessions = useQuery({
     queryKey: ['sessions', connection?.url],
-    queryFn: () => listSessions(connection!, 5),
+    queryFn: () => listSessions(connection!, 5, undefined, { excludeSources: ['cron', 'heartbeat'], order: 'recent' }),
     enabled: Boolean(connection),
   });
   const memory = useQuery({

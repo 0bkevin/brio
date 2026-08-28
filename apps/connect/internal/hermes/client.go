@@ -203,7 +203,7 @@ func legacyCronJobPath(path string) (string, bool) {
 		return "/api/cron/jobs/" + id, true
 	}
 	switch action {
-	case "pause", "resume", "trigger":
+	case "pause", "resume", "trigger", "runs":
 		return "/api/cron/jobs/" + id + "/" + action, true
 	default:
 		return "", false

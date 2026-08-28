@@ -102,7 +102,7 @@ export function HermesHomeScreen({ connection }: { connection: AgentConnection }
   });
   const sessions = useQuery({
     queryKey: ['sessions', connection.id, connection.url, activeProfile],
-    queryFn: () => listSessions(connection, 100, activeProfile),
+    queryFn: () => listSessions(connection, 100, activeProfile, { excludeSources: ['cron', 'heartbeat'], order: 'recent' }),
     refetchInterval: 15_000,
   });
   const searchResults = useQuery({
@@ -329,6 +329,11 @@ export function HermesHomeScreen({ connection }: { connection: AgentConnection }
                 detail="Runs, sessions, and controls"
                 label="Command Center"
                 onPress={() => openTool('/command-center')}
+              />
+              <MenuRow
+                detail="Cron and heartbeat responses"
+                label="Automation"
+                onPress={() => openTool('/automation')}
               />
               <MenuRow
                 detail="Browse the connected workspace"

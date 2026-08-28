@@ -25,6 +25,9 @@ import {
   filterAgentsForControlSession,
   finalizeConnection,
   getHealth,
+  listSessions,
+  listJobRuns,
+  listJobs,
   normalizeMessageList,
   normalizeCapabilities,
   normalizeFileList,
@@ -44,6 +47,110 @@ test('normalizes current Hermes list envelopes without breaking legacy responses
   assert.deepEqual(normalizeSessionList({ sessions }).sessions, sessions);
   assert.deepEqual(normalizeMessageList({ data: messages }).messages, messages);
   assert.deepEqual(normalizeMessageList({ messages }).messages, messages);
+});
+
+test('keeps automation sessions out of chat history even when Hermes ignores source filters', async () => {
+  const originalFetch = globalThis.fetch;
+  let requestURL = '';
+  globalThis.fetch = async (input) => {
+    requestURL = String(input);
+    return new Response(JSON.stringify({
+      data: [
+        { id: 'chat-1', source: 'brio', started_at: 1, message_count: 2 },
+        { id: 'cron-1', source: 'cron', started_at: 2, message_count: 2 },
+        { id: 'heartbeat-1', source: 'heartbeat', started_at: 3, message_count: 2 },
+      ],
+    }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+  };
+  try {
+    const result = await listSessions({
+      id: 'direct-1',
+      name: 'Hermes',
+      mode: 'self_hosted',
+      transport: 'direct',
+      status: 'online',
+      capabilities: {},
+      url: 'http://127.0.0.1:8787',
+      token: 'secret',
+    }, 100, 'coder', { excludeSources: ['cron', 'heartbeat'], order: 'recent' });
+    assert.deepEqual(result.sessions.map((session) => session.id), ['chat-1']);
+    assert.match(requestURL, /exclude_sources=cron%2Cheartbeat/);
+    assert.match(requestURL, /order=recent/);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test('continues through legacy unfiltered pages until it finds visible sessions', async () => {
+  const originalFetch = globalThis.fetch;
+  const requestURLs = [];
+  globalThis.fetch = async (input) => {
+    const url = new URL(String(input));
+    requestURLs.push(url);
+    const offset = Number(url.searchParams.get('offset') ?? 0);
+    const data = offset === 0
+      ? Array.from({ length: 100 }, (_, index) => ({
+          id: `cron-${index}`,
+          source: index % 2 ? 'cron' : 'heartbeat',
+          started_at: 200 - index,
+          message_count: 2,
+        }))
+      : [
+          { id: 'chat-1', source: 'brio', started_at: 2, message_count: 2 },
+          { id: 'chat-2', source: 'cli', started_at: 1, message_count: 2 },
+        ];
+    return new Response(JSON.stringify({ data }), {
+      status: 200,
+      headers: { 'Content-Type': 'application/json' },
+    });
+  };
+  try {
+    const result = await listSessions({
+      id: 'direct-1',
+      name: 'Hermes',
+      mode: 'self_hosted',
+      transport: 'direct',
+      status: 'online',
+      capabilities: {},
+      url: 'http://127.0.0.1:8787',
+      token: 'secret',
+    }, 2, undefined, { excludeSources: ['cron', 'heartbeat'], order: 'recent' });
+    assert.deepEqual(result.sessions.map((session) => session.id), ['chat-1', 'chat-2']);
+    assert.equal(requestURLs.length, 2);
+    assert.equal(requestURLs[1].searchParams.get('offset'), '100');
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test('scopes default-profile cron lists and run history instead of using Hermes profile=all', async () => {
+  const originalFetch = globalThis.fetch;
+  const requests = [];
+  globalThis.fetch = async (input) => {
+    requests.push(String(input));
+    return new Response(
+      JSON.stringify(String(input).includes('/runs') ? { runs: [] } : []),
+      { status: 200, headers: { 'Content-Type': 'application/json' } },
+    );
+  };
+  const connection = {
+    id: 'direct-1',
+    name: 'Hermes',
+    mode: 'self_hosted',
+    transport: 'direct',
+    status: 'online',
+    capabilities: {},
+    url: 'http://127.0.0.1:8787',
+    token: 'secret',
+  };
+  try {
+    await listJobs(connection, 'default');
+    await listJobRuns(connection, 'job-1', 20, 'default');
+    assert.equal(requests[0], 'http://127.0.0.1:8787/jobs/?profile=default');
+    assert.equal(requests[1], 'http://127.0.0.1:8787/jobs/job-1/runs?limit=20&profile=default');
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
 });
 
 test('creates a persisted Hermes session before a REST-backed new thread starts', async () => {
