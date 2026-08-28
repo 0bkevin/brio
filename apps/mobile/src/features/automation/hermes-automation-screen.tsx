@@ -1,4 +1,4 @@
-import { useQuery } from '@tanstack/react-query';
+import { useQueries, useQuery } from '@tanstack/react-query';
 import { useState } from 'react';
 import { Pressable, RefreshControl, ScrollView, StyleSheet, View } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
@@ -59,7 +59,7 @@ export function HermesAutomationScreen({ connection }: { connection: AgentConnec
   });
   const heartbeatSessions = useQuery({
     queryKey: ['automation-heartbeats', connection.id, connection.url, activeProfile],
-    queryFn: () => listSessions(connection, 50, activeProfile, { source: 'heartbeat', order: 'recent' }),
+    queryFn: () => listSessions(connection, 20, activeProfile, { source: 'heartbeat', order: 'recent' }),
     refetchInterval: 15_000,
   });
 
@@ -74,16 +74,11 @@ export function HermesAutomationScreen({ connection }: { connection: AgentConnec
     );
   }
 
-  const heartbeatCount = heartbeatSessions.data?.sessions.reduce(
-    (total, session) => total + Math.max(0, Math.floor(session.message_count / 2)),
-    0,
-  ) ?? 0;
-
   return (
     <SafeAreaView edges={['bottom', 'left', 'right']} style={[styles.safe, { backgroundColor: colors.screen }]}>
       <View style={[styles.segmented, { backgroundColor: colors.subtleStrong }]}>
         <Segment label={`Scheduled jobs (${jobs.data?.length ?? 0})`} active={view === 'jobs'} onPress={() => setView('jobs')} />
-        <Segment label={`Heartbeats (${heartbeatCount})`} active={view === 'heartbeats'} onPress={() => setView('heartbeats')} />
+        <Segment label="Heartbeats" active={view === 'heartbeats'} onPress={() => setView('heartbeats')} />
       </View>
       {view === 'jobs' ? (
         <ScrollView
@@ -106,7 +101,7 @@ export function HermesAutomationScreen({ connection }: { connection: AgentConnec
         </ScrollView>
       ) : (
         <ResponseFeed
-          detail="Recurring heartbeat prompts run in a separate automation session. Only Hermes’ responses appear here."
+          detail="Recurring heartbeat prompts run in isolated automation sessions seeded from the source chat. Only Hermes’ responses appear here."
           emptyDetail="Heartbeat responses will appear here after a configured heartbeat fires."
           emptyTitle="No heartbeat responses"
           profile={activeProfile}
@@ -117,6 +112,8 @@ export function HermesAutomationScreen({ connection }: { connection: AgentConnec
           title="Heartbeat responses"
           onRefresh={() => void heartbeatSessions.refetch()}
           refreshing={heartbeatSessions.isRefetching}
+          oneResponsePerSession
+          requestPrefix="[Heartbeat — recurring instruction"
         />
       )}
     </SafeAreaView>
@@ -178,6 +175,7 @@ function ResponseFeed({
   oneResponsePerSession = false,
   profile,
   refreshing,
+  requestPrefix,
   sessions,
   sessionsError,
   sessionsLoading,
@@ -191,43 +189,51 @@ function ResponseFeed({
   oneResponsePerSession?: boolean;
   profile: string;
   refreshing: boolean;
+  requestPrefix?: string;
   sessions: HermesSession[];
   sessionsError: unknown;
   sessionsLoading: boolean;
   title: string;
 }) {
   const colors = useT3Theme();
-  const sessionKey = sessions.map((session) => session.id).join(',');
-  const responses = useQuery({
-    queryKey: ['automation-responses', connection.id, connection.url, profile, sessionKey, oneResponsePerSession],
-    enabled: sessions.length > 0,
-    queryFn: async () => {
-      const messageSets = await Promise.all(
-        sessions.map((session) => getSessionMessages(connection, session.id, profile)),
-      );
-      return collectResponses(sessions, messageSets.map((set) => set.messages), oneResponsePerSession);
-    },
-    refetchInterval: 15_000,
+  const responseQueries = useQueries({
+    queries: sessions.map((session) => ({
+      queryKey: ['automation-response', connection.id, connection.url, profile, session.id, session.message_count],
+      queryFn: () => getSessionMessages(connection, session.id, profile),
+      retry: 2,
+      refetchInterval: (query: { state: { status: string } }) => query.state.status === 'error' ? 30_000 : false,
+    })),
   });
+  const successfulSessions: HermesSession[] = [];
+  const successfulMessages: { role: string; content: string; timestamp: number }[][] = [];
+  responseQueries.forEach((query, index) => {
+    if (!query.data) return;
+    successfulSessions.push(sessions[index]);
+    successfulMessages.push(query.data.messages);
+  });
+  const responses = collectResponses(successfulSessions, successfulMessages, oneResponsePerSession, requestPrefix);
+  const responsesLoading = responseQueries.some((query) => query.isLoading);
+  const responsesRefetching = responseQueries.some((query) => query.isRefetching);
+  const responseError = responseQueries.find((query) => query.error)?.error;
   const refreshAll = () => {
     onRefresh();
-    void responses.refetch();
+    responseQueries.forEach((query) => void query.refetch());
   };
 
   return (
     <ScrollView
       contentContainerStyle={styles.content}
-      refreshControl={<RefreshControl refreshing={refreshing || responses.isRefetching} onRefresh={refreshAll} />}>
+      refreshControl={<RefreshControl refreshing={refreshing || responsesRefetching} onRefresh={refreshAll} />}>
       <View style={styles.intro}>
         <AppText style={styles.title}>{title}</AppText>
         <AppText style={[styles.detail, { color: colors.muted }]}>{detail}</AppText>
       </View>
-      {sessionsLoading || (sessions.length > 0 && responses.isLoading) ? (
+      {sessionsLoading || (sessions.length > 0 && responsesLoading) ? (
         <EmptyState detail="Loading automation responses from Hermes." loading title="Collecting responses" />
       ) : null}
-      {sessionsError || responses.isError ? <Failure error={sessionsError ?? responses.error} onRetry={refreshAll} /> : null}
-      {(responses.data ?? []).map((response) => <ResponseCard key={response.id} response={response} />)}
-      {!sessionsLoading && !sessionsError && !responses.isLoading && !responses.isError && (responses.data?.length ?? 0) === 0 ? (
+      {sessionsError || responseError ? <Failure error={sessionsError ?? responseError} onRetry={refreshAll} /> : null}
+      {responses.map((response) => <ResponseCard key={response.id} response={response} />)}
+      {!sessionsLoading && !sessionsError && !responsesLoading && !responseError && responses.length === 0 ? (
         <EmptyState detail={emptyDetail} title={emptyTitle} />
       ) : null}
     </ScrollView>
@@ -294,10 +300,22 @@ function collectResponses(
   sessions: HermesSession[],
   messageSets: { role: string; content: string; timestamp: number }[][],
   oneResponsePerSession: boolean,
+  requestPrefix?: string,
 ) {
   const responses: AutomationResponse[] = [];
   messageSets.forEach((messages, sessionIndex) => {
-    const assistant = messages.filter((message) => message.role === 'assistant' && message.content.trim());
+    let requestIndex = -1;
+    if (requestPrefix) {
+      messages.forEach((message, index) => {
+        if (message.role === 'user' && message.content.trimStart().startsWith(requestPrefix)) {
+          requestIndex = index;
+        }
+      });
+    }
+    if (requestPrefix && requestIndex < 0) return;
+    const assistant = messages
+      .slice(requestIndex + 1)
+      .filter((message) => message.role === 'assistant' && message.content.trim());
     const visible = oneResponsePerSession ? assistant.slice(-1) : assistant;
     visible.forEach((message, messageIndex) => {
       responses.push({

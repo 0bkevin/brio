@@ -158,6 +158,7 @@ export type HermesSearchResult = {
 type HermesSessionListEnvelope = {
   sessions?: HermesSession[];
   data?: HermesSession[];
+  total?: number;
   error?: string;
 };
 
@@ -712,29 +713,65 @@ export async function listSessions(
   profile?: string,
   options: SessionListOptions = {},
 ) {
-  const query = new URLSearchParams({ limit: String(limit) });
-  if (options.source) query.set('source', options.source);
-  if (options.sources?.length) query.set('sources', options.sources.join(','));
-  if (options.excludeSources?.length) query.set('exclude_sources', options.excludeSources.join(','));
-  if (options.order) query.set('order', options.order);
-  const response = await brioFetch<HermesSessionListEnvelope>(
-    connection,
-    `${scopedPath('/api/sessions', profile)}?${query.toString()}`,
-  );
-  const normalized = normalizeSessionList(response);
   // Older Hermes builds ignore source query parameters. Keep Brio's split
-  // correct locally while retaining wire compatibility with those builds.
+  // correct locally while retaining wire compatibility with those builds. If
+  // a full page is filtered out, continue through bounded offset pages so a
+  // busy automation history cannot hide later conversations (or vice versa).
   const included = options.source
     ? new Set([options.source])
     : options.sources?.length
       ? new Set(options.sources)
       : null;
   const excluded = new Set(options.excludeSources ?? []);
+  const hasSourceFilter = Boolean(included || excluded.size);
+  const requestedLimit = Math.max(0, limit);
+  const pageSize = hasSourceFilter ? 100 : Math.min(100, Math.max(1, requestedLimit));
+  // Legacy gateways require local filtering. Bound that compatibility scan to
+  // 1,000 rows; if it is exhausted, fail visibly instead of presenting an
+  // incorrect empty history or issuing an unbounded burst of requests.
+  const maxCompatibilityPages = 10;
+  const sessions: HermesSession[] = [];
+  const seen = new Set<string>();
+  let envelope: HermesSessionListEnvelope = {};
+  let offset = 0;
+  let exhausted = false;
+
+  for (let pageIndex = 0; pageIndex < (hasSourceFilter ? maxCompatibilityPages : 1); pageIndex += 1) {
+    const query = new URLSearchParams({ limit: String(requestedLimit === 0 ? 0 : pageSize) });
+    if (offset) query.set('offset', String(offset));
+    if (options.source) query.set('source', options.source);
+    if (options.sources?.length) query.set('sources', options.sources.join(','));
+    if (options.excludeSources?.length) query.set('exclude_sources', options.excludeSources.join(','));
+    if (options.order) query.set('order', options.order);
+    envelope = await brioFetch<HermesSessionListEnvelope>(
+      connection,
+      `${scopedPath('/api/sessions', profile)}?${query.toString()}`,
+    );
+    const page = normalizeSessionList(envelope).sessions;
+    let sawUnseen = false;
+    for (const session of page) {
+      if (seen.has(session.id)) continue;
+      seen.add(session.id);
+      sawUnseen = true;
+      if ((!included || included.has(session.source)) && !excluded.has(session.source)) {
+        sessions.push(session);
+      }
+    }
+    const reachedReportedTotal = typeof envelope.total === 'number' && offset + pageSize >= envelope.total;
+    if (sessions.length >= requestedLimit || page.length < pageSize || !sawUnseen || requestedLimit === 0 || reachedReportedTotal) {
+      exhausted = true;
+      break;
+    }
+    offset += pageSize;
+  }
+
+  if (hasSourceFilter && !exhausted && sessions.length < requestedLimit) {
+    throw new Error('Session history is too large to filter safely with this Hermes version. Update Hermes and try again.');
+  }
+
   return {
-    ...normalized,
-    sessions: normalized.sessions.filter((session) =>
-      (!included || included.has(session.source)) && !excluded.has(session.source),
-    ),
+    ...envelope,
+    sessions: sessions.slice(0, requestedLimit),
   };
 }
 
@@ -1064,13 +1101,18 @@ export function getLogs(
 }
 
 export function listJobs(connection: AgentConnection, profile?: string) {
-  return brioFetch<HermesJob[] | { jobs: HermesJob[] }>(connection, scopedPath('/jobs/', profile));
+  return brioFetch<HermesJob[] | { jobs: HermesJob[] }>(
+    connection,
+    `${scopedPath('/jobs/', profile)}${defaultAutomationProfileQuery(profile)}`,
+  );
 }
 
 export function listJobRuns(connection: AgentConnection, jobId: string, limit = 20, profile?: string) {
+  const query = new URLSearchParams({ limit: String(Math.max(1, Math.min(limit, 100))) });
+  if (!profile || profile === 'default') query.set('profile', 'default');
   return brioFetch<{ runs: HermesSession[]; limit?: number }>(
     connection,
-    `${scopedPath(`/jobs/${encodeURIComponent(jobId)}/runs`, profile)}?limit=${Math.max(1, Math.min(limit, 100))}`,
+    `${scopedPath(`/jobs/${encodeURIComponent(jobId)}/runs`, profile)}?${query.toString()}`,
   );
 }
 
@@ -1082,7 +1124,7 @@ export function runJobAction(
 ) {
   return brioFetch<Record<string, unknown>>(
     connection,
-    scopedPath(`/jobs/${encodeURIComponent(jobId)}/${action}`, profile),
+    `${scopedPath(`/jobs/${encodeURIComponent(jobId)}/${action}`, profile)}${defaultAutomationProfileQuery(profile)}`,
     { method: 'POST', body: '{}' },
   );
 }
@@ -1090,9 +1132,13 @@ export function runJobAction(
 export function deleteJob(connection: AgentConnection, jobId: string, profile?: string) {
   return brioFetch<Record<string, unknown>>(
     connection,
-    scopedPath(`/jobs/${encodeURIComponent(jobId)}`, profile),
+    `${scopedPath(`/jobs/${encodeURIComponent(jobId)}`, profile)}${defaultAutomationProfileQuery(profile)}`,
     { method: 'DELETE' },
   );
+}
+
+function defaultAutomationProfileQuery(profile?: string) {
+  return !profile || profile === 'default' ? '?profile=default' : '';
 }
 
 export function controlRPC<T>(
@@ -1114,8 +1160,12 @@ export function controlRPC<T>(
   });
 }
 
-export function listControlSessions(connection: AgentConnection, limit = 100, profile?: string) {
-  return controlRPC<{ sessions: HermesControlSession[] }>(connection, 'session.list', { limit }, false, undefined, profile);
+export async function listControlSessions(connection: AgentConnection, limit = 100, profile?: string) {
+  const result = await listSessions(connection, limit, profile, {
+    excludeSources: ['cron', 'heartbeat', 'kanban', 'tool'],
+    order: 'recent',
+  });
+  return { sessions: result.sessions as HermesControlSession[] };
 }
 
 export async function listModelSessions(

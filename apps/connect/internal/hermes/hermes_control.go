@@ -446,9 +446,8 @@ func (c *controlClient) SyncHeartbeat(storedSessionID string, runtimeSessionID s
 	existing, existed := c.heartbeats[storedSessionID]
 	state.RuntimeSessionID = runtimeSessionID
 	if existed {
-		// Heartbeat responses live in one automation-only conversation. Keep
-		// that destination when the schedule is refreshed or replaced so a
-		// recurring heartbeat never creates one visible thread per firing.
+		// Keep the latest automation run so the scheduler can avoid overlapping
+		// with it before creating the next isolated heartbeat response session.
 		state.OutputSessionID = existing.OutputSessionID
 		state.OutputRuntimeID = existing.OutputRuntimeID
 	}
@@ -557,16 +556,14 @@ func (c *controlClient) fireHeartbeat(storedSessionID string) {
 	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
 	defer cancel()
 	resumed, err := c.Call(ctx, "session.resume", map[string]any{
-		"session_id":    storedSessionID,
-		"omit_messages": true,
+		"session_id":  storedSessionID,
+		"eager_build": true,
 	})
 	if err != nil {
 		c.finishHeartbeatAttempt(storedSessionID, err, 30*time.Second)
 		return
 	}
-	var resumedSession struct {
-		SessionID string `json:"session_id"`
-	}
+	var resumedSession heartbeatSourceSession
 	if json.Unmarshal(resumed, &resumedSession) != nil || strings.TrimSpace(resumedSession.SessionID) == "" {
 		c.finishHeartbeatAttempt(storedSessionID, errors.New("Hermes returned an invalid session.resume result for heartbeat"), 30*time.Second)
 		return
@@ -584,6 +581,20 @@ func (c *controlClient) fireHeartbeat(storedSessionID string) {
 	}
 	if strings.Contains(statusOutput, "agent running: yes") {
 		c.finishHeartbeatAttempt(storedSessionID, nil, 5*time.Second)
+		return
+	}
+	outputBusy, err := c.prepareHeartbeatOutput(ctx, state)
+	if err != nil {
+		c.finishHeartbeatAttempt(storedSessionID, err, 30*time.Second)
+		return
+	}
+	if outputBusy {
+		c.finishHeartbeatAttempt(storedSessionID, nil, 5*time.Second)
+		return
+	}
+	outputRuntimeID, outputSessionID, err := c.createHeartbeatOutputSession(ctx, resumedSession)
+	if err != nil {
+		c.finishHeartbeatAttempt(storedSessionID, err, 30*time.Second)
 		return
 	}
 	pause, err := c.Call(ctx, "slash.exec", map[string]any{
@@ -619,11 +630,6 @@ func (c *controlClient) fireHeartbeat(storedSessionID string) {
 		state.Interval,
 		state.Prompt,
 	)
-	outputRuntimeID, outputSessionID, err := c.ensureHeartbeatOutputSession(ctx, state)
-	if err != nil {
-		c.finishHeartbeatAttempt(storedSessionID, err, 30*time.Second)
-		return
-	}
 	c.heartbeatMu.Lock()
 	if current, exists := c.heartbeats[storedSessionID]; exists {
 		current.OutputRuntimeID = outputRuntimeID
@@ -671,35 +677,81 @@ func (c *controlClient) fireHeartbeat(storedSessionID string) {
 	c.heartbeatMu.Unlock()
 }
 
-func (c *controlClient) ensureHeartbeatOutputSession(ctx context.Context, state controlHeartbeatState) (string, string, error) {
-	if storedSessionID := strings.TrimSpace(state.OutputSessionID); storedSessionID != "" {
-		resumed, err := c.Call(ctx, "session.resume", map[string]any{
-			"session_id": storedSessionID, "omit_messages": true,
-		})
-		if err == nil {
-			var session struct {
-				SessionID       string `json:"session_id"`
-				StoredSessionID string `json:"stored_session_id"`
-				SessionKey      string `json:"session_key"`
-			}
-			if json.Unmarshal(resumed, &session) == nil && strings.TrimSpace(session.SessionID) != "" {
-				stored := strings.TrimSpace(session.StoredSessionID)
-				if stored == "" {
-					stored = strings.TrimSpace(session.SessionKey)
-				}
-				if stored == "" {
-					stored = storedSessionID
-				}
-				return strings.TrimSpace(session.SessionID), stored, nil
-			}
-		}
-	}
+type heartbeatSourceSession struct {
+	SessionID string           `json:"session_id"`
+	Messages  []map[string]any `json:"messages"`
+	Info      struct {
+		CWD             string `json:"cwd"`
+		Model           string `json:"model"`
+		Provider        string `json:"provider"`
+		ReasoningEffort string `json:"reasoning_effort"`
+		Fast            *bool  `json:"fast"`
+	} `json:"info"`
+}
 
-	created, err := c.Call(ctx, "session.create", map[string]any{
-		"cols":   100,
-		"source": "heartbeat",
-		"title":  "Heartbeat responses",
+func (c *controlClient) prepareHeartbeatOutput(ctx context.Context, state controlHeartbeatState) (bool, error) {
+	storedSessionID := strings.TrimSpace(state.OutputSessionID)
+	if storedSessionID == "" {
+		return false, nil
+	}
+	resumed, err := c.Call(ctx, "session.resume", map[string]any{
+		"session_id": storedSessionID, "omit_messages": true,
 	})
+	if err != nil {
+		var rpcErr *controlRPCError
+		if errors.As(err, &rpcErr) && rpcErr.Code == 4007 && strings.Contains(strings.ToLower(rpcErr.Message), "not found") {
+			// The persisted response may have been deleted or pruned. It no
+			// longer owns a live runtime, so the next firing can replace it.
+			return false, nil
+		}
+		return false, fmt.Errorf("could not inspect the previous heartbeat response: %w", err)
+	}
+	var session struct {
+		SessionID string `json:"session_id"`
+	}
+	if json.Unmarshal(resumed, &session) != nil || strings.TrimSpace(session.SessionID) == "" {
+		return false, errors.New("Hermes returned an invalid heartbeat response session")
+	}
+	status, err := c.Call(ctx, "session.status", map[string]any{"session_id": strings.TrimSpace(session.SessionID)})
+	if err != nil {
+		return false, err
+	}
+	statusText := strings.ToLower(controlResultOutput(status))
+	if statusText == "" {
+		return false, errors.New("Hermes returned an invalid heartbeat response session status")
+	}
+	if strings.Contains(statusText, "agent running: yes") {
+		return true, nil
+	}
+	if _, err := c.Call(ctx, "session.close", map[string]any{"session_id": strings.TrimSpace(session.SessionID)}); err != nil {
+		return false, fmt.Errorf("could not release the previous heartbeat response runtime: %w", err)
+	}
+	return false, nil
+}
+
+func (c *controlClient) createHeartbeatOutputSession(ctx context.Context, source heartbeatSourceSession) (string, string, error) {
+	params := map[string]any{
+		"cols":     100,
+		"messages": sanitizeHeartbeatSeed(source.Messages),
+		"source":   "heartbeat",
+		"title":    fmt.Sprintf("Heartbeat response %d", time.Now().UnixNano()),
+	}
+	if value := strings.TrimSpace(source.Info.CWD); value != "" {
+		params["cwd"] = value
+	}
+	if value := strings.TrimSpace(source.Info.Model); value != "" {
+		params["model"] = value
+	}
+	if value := strings.TrimSpace(source.Info.Provider); value != "" {
+		params["provider"] = value
+	}
+	if value := strings.TrimSpace(source.Info.ReasoningEffort); value != "" {
+		params["reasoning_effort"] = value
+	}
+	if source.Info.Fast != nil {
+		params["fast"] = *source.Info.Fast
+	}
+	created, err := c.Call(ctx, "session.create", params)
 	if err != nil {
 		return "", "", fmt.Errorf("could not create the heartbeat response session: %w", err)
 	}
@@ -719,6 +771,47 @@ func (c *controlClient) ensureHeartbeatOutputSession(ctx context.Context, state 
 		return "", "", errors.New("Hermes did not return a persisted session id for heartbeat responses")
 	}
 	return strings.TrimSpace(session.SessionID), stored, nil
+}
+
+func sanitizeHeartbeatSeed(messages []map[string]any) []map[string]any {
+	systems := make([]map[string]any, 0)
+	turns := make([]map[string]any, 0, len(messages))
+	pendingUser := ""
+	for _, message := range messages {
+		role, _ := message["role"].(string)
+		role = strings.ToLower(strings.TrimSpace(role))
+		content, _ := message["text"].(string)
+		if strings.TrimSpace(content) == "" {
+			content, _ = message["content"].(string)
+		}
+		content = strings.TrimSpace(content)
+		if content == "" {
+			continue
+		}
+		switch role {
+		case "system":
+			systems = append(systems, map[string]any{"role": "system", "content": content})
+		case "user":
+			if pendingUser == "" {
+				pendingUser = content
+			} else {
+				pendingUser += "\n\n" + content
+			}
+		case "assistant":
+			if pendingUser == "" {
+				continue
+			}
+			turns = append(turns,
+				map[string]any{"role": "user", "content": pendingUser},
+				map[string]any{"role": "assistant", "content": content},
+			)
+			pendingUser = ""
+		}
+	}
+	// A trailing user turn represents an interrupted/incomplete source turn.
+	// The heartbeat prompt is itself the next user turn, so do not replay that
+	// dangling tail or any display-only tool events around it.
+	return append(systems, turns...)
 }
 
 func (c *controlClient) finishHeartbeatAttempt(storedSessionID string, err error, retryAfter time.Duration) {
