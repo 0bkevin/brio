@@ -90,7 +90,7 @@ export function ComposerControls({
   const [historyOpen, setHistoryOpen] = useState(false);
   const [commandsOpen, setCommandsOpen] = useState(false);
   const [inputFocused, setInputFocused] = useState(false);
-  const [inputHeight, setInputHeight] = useState(48);
+  const [inputHeight, setInputHeight] = useState(42);
   const [uploads, setUploads] = useState<UploadState[]>([]);
   const [error, setError] = useState('');
   const token = completionToken(draft);
@@ -347,7 +347,7 @@ export function ComposerControls({
               onPress={() => setPickerOpen(true)}
               style={({ pressed }) => [
                 styles.compactAttach,
-                { backgroundColor: colors.backgroundSelected, opacity: pressed ? 0.65 : 1 },
+                { opacity: pressed ? 0.65 : 1 },
               ]}>
               <ThemedText style={styles.compactAttachLabel} themeColor="textSecondary">+</ThemedText>
             </Pressable>
@@ -361,14 +361,14 @@ export function ComposerControls({
             onContentSizeChange={(event) => {
               const nativeHeight = event.nativeEvent.contentSize.height;
               const measuredHeight = Platform.OS === 'android' ? nativeHeight - 32 : nativeHeight;
-              const nextHeight = Math.min(112, Math.max(48, Math.ceil(measuredHeight)));
+              const nextHeight = Math.min(96, Math.max(42, Math.ceil(measuredHeight)));
               setInputHeight(nextHeight);
             }}
             onFocus={() => setFocused(true)}
             placeholder={active ? 'Ask a follow-up…' : 'Ask Hermes anything…'}
             placeholderTextColor={colors.textTertiary}
             ref={inputRef}
-            scrollEnabled={expanded && inputHeight >= 112}
+            scrollEnabled={expanded && inputHeight >= 96}
             selectionColor={colors.accent}
             style={[
               styles.input,
@@ -404,8 +404,9 @@ export function ComposerControls({
               contentContainerStyle={styles.toolbar}
               horizontal
               keyboardShouldPersistTaps="handled"
+              style={styles.toolbarScroller}
               showsHorizontalScrollIndicator={false}>
-              <ToolbarAction label="+" accessibilityLabel="Attach context" onPress={() => setPickerOpen(true)} />
+              <ToolbarAction bare label="+" accessibilityLabel="Attach context" onPress={() => setPickerOpen(true)} />
               {modelControl}
               <ToolbarAction accessibilityLabel="Commands" label="/" onPress={() => setCommandsOpen(true)} />
               {history.length > 0 ? <ToolbarAction accessibilityLabel="Prompt history" label="↶" onPress={() => setHistoryOpen(true)} /> : null}
@@ -444,18 +445,30 @@ function AttachmentChip({ detail, name, onRemove, tone = 'normal' }: { detail: s
   );
 }
 
-function ToolbarAction({ accessibilityLabel, disabled, label, onPress, tone = 'normal' }: { accessibilityLabel?: string; disabled?: boolean; label: string; onPress: () => void; tone?: 'normal' | 'warning' }) {
+function ToolbarAction({ accessibilityLabel, bare = false, disabled, label, onPress, tone = 'normal' }: { accessibilityLabel?: string; bare?: boolean; disabled?: boolean; label: string; onPress: () => void; tone?: 'normal' | 'warning' }) {
   const colors = useTheme();
   return (
     <Pressable
       accessibilityLabel={accessibilityLabel ?? label}
       disabled={disabled}
+      hitSlop={bare ? 4 : undefined}
       onPress={onPress}
       style={({ pressed }) => [
         styles.toolbarAction,
-        { backgroundColor: colors.backgroundSelected, opacity: disabled ? 0.35 : pressed ? 0.6 : 1 },
+        bare ? styles.toolbarActionBare : null,
+        {
+          backgroundColor: bare ? 'transparent' : colors.backgroundSelected,
+          opacity: disabled ? 0.35 : pressed ? 0.6 : 1,
+        },
       ]}>
-      <ThemedText style={{ color: tone === 'warning' ? colors.warning : colors.textSecondary }} type="smallBold">{label}</ThemedText>
+      <ThemedText
+        style={[
+          { color: tone === 'warning' ? colors.warning : colors.textSecondary },
+          bare ? styles.toolbarActionBareLabel : null,
+        ]}
+        type="smallBold">
+        {label}
+      </ThemedText>
     </Pressable>
   );
 }
@@ -540,41 +553,46 @@ const styles = StyleSheet.create({
   toolbar: {
     alignItems: 'center',
     flexDirection: 'row',
+    flexGrow: 1,
     gap: Spacing.two,
+    justifyContent: 'space-between',
     paddingRight: Spacing.two,
   },
+  toolbarScroller: { flex: 1 },
   toolbarAction: {
     borderRadius: 999,
     justifyContent: 'center',
-    minHeight: 36,
-    paddingHorizontal: 12,
+    minHeight: 34,
+    paddingHorizontal: 11,
   },
+  toolbarActionBare: { alignItems: 'center', minWidth: 36, paddingHorizontal: 0 },
+  toolbarActionBareLabel: { fontSize: 27, fontWeight: '300', lineHeight: 29 },
   composer: { borderWidth: StyleSheet.hairlineWidth, overflow: 'hidden' },
   composerCollapsed: {
     borderRadius: 999,
-    minHeight: 58,
-    padding: 6,
+    minHeight: 52,
+    padding: 4,
   },
   composerExpanded: {
-    borderRadius: 26,
-    minHeight: 112,
-    paddingBottom: 7,
-    paddingHorizontal: 14,
-    paddingTop: 12,
+    borderRadius: 24,
+    minHeight: 98,
+    paddingBottom: 5,
+    paddingHorizontal: 12,
+    paddingTop: 9,
   },
   collapsedInputRow: { alignItems: 'center', flexDirection: 'row', gap: 5 },
-  expandedInputRow: { minHeight: 48 },
+  expandedInputRow: { minHeight: 42 },
   input: { fontSize: 16, lineHeight: 23, outlineStyle: 'none' } as never,
-  inputCollapsed: { flex: 1, height: 44, paddingBottom: 4, paddingHorizontal: 4, paddingTop: 4 },
-  inputExpanded: { maxHeight: 112, minHeight: 48, paddingHorizontal: 4, paddingVertical: 4 },
+  inputCollapsed: { flex: 1, height: 42, paddingBottom: 3, paddingHorizontal: 4, paddingTop: 3 },
+  inputExpanded: { maxHeight: 96, minHeight: 42, paddingHorizontal: 4, paddingVertical: 3 },
   composerFooter: {
     alignItems: 'center',
     flexDirection: 'row',
     gap: Spacing.two,
-    minHeight: 44,
+    minHeight: 40,
   },
-  send: { alignItems: 'center', borderRadius: 22, height: 44, justifyContent: 'center', width: 44 },
-  compactAttach: { alignItems: 'center', borderRadius: 22, height: 44, justifyContent: 'center', width: 44 },
+  send: { alignItems: 'center', borderRadius: 20, height: 40, justifyContent: 'center', width: 40 },
+  compactAttach: { alignItems: 'center', height: 40, justifyContent: 'center', width: 36 },
   compactAttachLabel: { fontSize: 27, fontWeight: '300', lineHeight: 30 },
   attachmentList: { gap: Spacing.two, paddingBottom: Spacing.two },
   attachmentChip: { alignItems: 'center', borderRadius: 10, borderWidth: StyleSheet.hairlineWidth, flexDirection: 'row', gap: Spacing.two, paddingHorizontal: Spacing.two, paddingVertical: Spacing.one },
