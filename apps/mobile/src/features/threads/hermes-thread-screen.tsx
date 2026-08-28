@@ -194,7 +194,7 @@ export function HermesThreadScreen({
       setKeyboardInset(nextInset);
     };
     const shown = Keyboard.addListener('keyboardDidShow', (event) => {
-      animateInset(Math.max(0, event.endCoordinates.height - safeArea.bottom));
+      animateInset(Math.max(0, event.endCoordinates.height - safeArea.bottom + T3Spacing.sm));
     });
     const hidden = Keyboard.addListener('keyboardDidHide', () => animateInset(0));
     return () => {
@@ -1053,7 +1053,14 @@ export function HermesThreadScreen({
           </View>
         ) : null}
 
-        <View style={[styles.composerShell, { backgroundColor: colors.sheet }]}>
+        <View
+          style={[
+            styles.composerShell,
+            {
+              backgroundColor: colors.sheet,
+              marginBottom: keyboardInset > 0 ? T3Spacing.md : 0,
+            },
+          ]}>
           {queue.length > 0 ? (
             <PromptQueue
               activePromptId={submit.isPending ? submit.variables?.id : undefined}

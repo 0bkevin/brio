@@ -3,7 +3,6 @@ import * as DocumentPicker from 'expo-document-picker';
 import * as ImagePicker from 'expo-image-picker';
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 import {
-  LayoutAnimation,
   Modal,
   Platform,
   Pressable,
@@ -12,6 +11,15 @@ import {
   TextInput,
   View,
 } from 'react-native';
+import Animated, {
+  Easing,
+  FadeIn,
+  FadeOut,
+  interpolate,
+  useAnimatedStyle,
+  useDerivedValue,
+  withTiming,
+} from 'react-native-reanimated';
 
 import { ThemedText } from '@/components/themed-text';
 import { Spacing } from '@/constants/theme';
@@ -37,6 +45,13 @@ type UploadState = {
   controller: AbortController;
   error?: string;
 };
+
+const COMPOSER_MOTION = {
+  duration: 230,
+  easing: Easing.bezier(0.2, 0, 0, 1),
+};
+const FOOTER_ENTER = FadeIn.duration(140).delay(80).easing(Easing.out(Easing.cubic));
+const FOOTER_EXIT = FadeOut.duration(70).easing(Easing.in(Easing.quad));
 
 export function ComposerControls({
   active,
@@ -130,6 +145,30 @@ export function ComposerControls({
     uploads.length > 0 ||
     Boolean(error) ||
     Boolean(incomingShare.error);
+  const expansionProgress = useDerivedValue(
+    () => withTiming(expanded ? 1 : 0, COMPOSER_MOTION),
+    [expanded],
+  );
+  const expandedComposerHeight = Math.max(98, inputHeight + 54);
+  const composerHeight = useDerivedValue(
+    () => withTiming(expanded ? expandedComposerHeight : 52, COMPOSER_MOTION),
+    [expanded, expandedComposerHeight],
+  );
+  const composerAnimatedStyle = useAnimatedStyle(() => ({
+    borderRadius: interpolate(expansionProgress.value, [0, 1], [26, 24]),
+    height: composerHeight.value,
+    paddingBottom: interpolate(expansionProgress.value, [0, 1], [4, 5]),
+    paddingHorizontal: interpolate(expansionProgress.value, [0, 1], [4, 12]),
+    paddingTop: interpolate(expansionProgress.value, [0, 1], [4, 9]),
+  }));
+  const compactLeftStyle = useAnimatedStyle(() => ({
+    opacity: interpolate(expansionProgress.value, [0, 0.35, 1], [1, 0, 0]),
+    width: interpolate(expansionProgress.value, [0, 1], [41, 0]),
+  }));
+  const compactRightStyle = useAnimatedStyle(() => ({
+    opacity: interpolate(expansionProgress.value, [0, 0.35, 1], [1, 0, 0]),
+    width: interpolate(expansionProgress.value, [0, 1], [45, 0]),
+  }));
 
   useEffect(() => {
     const previous = previousKeyboardVisible.current;
@@ -138,7 +177,7 @@ export function ComposerControls({
     const timer = setTimeout(() => {
       inputRef.current?.blur();
       setInputFocused(false);
-    }, 0);
+    }, Platform.OS === 'android' ? 180 : 0);
     return () => clearTimeout(timer);
   }, [inputFocused, keyboardVisible]);
 
@@ -275,12 +314,7 @@ export function ComposerControls({
     }
   };
   const setFocused = (focused: boolean) => {
-    LayoutAnimation.configureNext({
-      duration: 180,
-      create: { property: LayoutAnimation.Properties.opacity, type: LayoutAnimation.Types.easeInEaseOut },
-      update: { type: LayoutAnimation.Types.easeInEaseOut },
-      delete: { property: LayoutAnimation.Properties.opacity, type: LayoutAnimation.Types.easeInEaseOut },
-    });
+    if (focused === inputFocused) return;
     setInputFocused(focused);
   };
 
@@ -333,30 +367,34 @@ export function ComposerControls({
         </View>
       ) : null}
 
-      <View
+      <Animated.View
         style={[
           styles.composer,
-          expanded ? styles.composerExpanded : styles.composerCollapsed,
+          composerAnimatedStyle,
           { backgroundColor: colors.panelStrong, borderColor: colors.border },
         ]}>
-        <View style={expanded ? styles.expandedInputRow : styles.collapsedInputRow}>
-          {!expanded ? (
+        <View style={styles.composerInputRow}>
+          <Animated.View
+            pointerEvents={expanded ? 'none' : 'auto'}
+            style={[styles.compactLeftSlot, compactLeftStyle]}>
             <Pressable
+              accessibilityElementsHidden={expanded}
               accessibilityLabel="Attach context"
+              accessible={!expanded}
               hitSlop={4}
               onPress={() => setPickerOpen(true)}
-              style={({ pressed }) => [
-                styles.compactAttach,
-                { opacity: pressed ? 0.65 : 1 },
-              ]}>
+              style={({ pressed }) => [styles.compactControlPressable, { opacity: pressed ? 0.65 : 1 }]}>
               <ThemedText style={styles.compactAttachLabel} themeColor="textSecondary">+</ThemedText>
             </Pressable>
-          ) : null}
+          </Animated.View>
           <TextInput
             accessibilityLabel="Ask Hermes anything"
             maxLength={20000}
             multiline
-            onBlur={() => setFocused(false)}
+            onBlur={() => {
+              if (Platform.OS === 'android' && keyboardVisible) return;
+              setFocused(false);
+            }}
             onChangeText={onDraftChange}
             onContentSizeChange={(event) => {
               const nativeHeight = event.nativeEvent.contentSize.height;
@@ -379,13 +417,17 @@ export function ComposerControls({
             textAlignVertical={expanded ? 'top' : 'center'}
             value={draft}
           />
-          {!expanded ? (
+          <Animated.View
+            pointerEvents={expanded ? 'none' : 'auto'}
+            style={[styles.compactRightSlot, compactRightStyle]}>
             <Pressable
+              accessibilityElementsHidden={expanded}
               accessibilityLabel={active ? 'Queue message' : 'Send message'}
+              accessible={!expanded}
               disabled={!canSend}
               onPress={() => onSend('queue')}
               style={({ pressed }) => [
-                styles.send,
+                styles.sendPressable,
                 {
                   backgroundColor: canSend ? colors.accent : colors.backgroundSelected,
                   opacity: pressed ? 0.72 : 1,
@@ -396,10 +438,10 @@ export function ComposerControls({
                 ↑
               </ThemedText>
             </Pressable>
-          ) : null}
+          </Animated.View>
         </View>
         {expanded ? (
-          <View style={styles.composerFooter}>
+          <Animated.View entering={FOOTER_ENTER} exiting={FOOTER_EXIT} style={styles.composerFooter}>
             <ScrollView
               contentContainerStyle={styles.toolbar}
               horizontal
@@ -421,9 +463,9 @@ export function ComposerControls({
               style={({ pressed }) => [styles.send, { backgroundColor: canSend ? colors.accent : colors.backgroundSelected, opacity: pressed ? 0.72 : 1 }]}>
               <ThemedText style={{ color: canSend ? colors.accentText : colors.textDisabled, fontSize: 20 }}>↑</ThemedText>
             </Pressable>
-          </View>
+          </Animated.View>
         ) : null}
-      </View>
+      </Animated.View>
 
       <PickerModal onClose={() => setPickerOpen(false)} onDocuments={() => void chooseDocuments()} onImages={() => void chooseImages()} onPhoto={() => void takePhoto()} visible={pickerOpen} />
       <HistoryModal history={history} onChoose={(text) => { onDraftChange(text); setHistoryOpen(false); }} onClose={() => setHistoryOpen(false)} visible={historyOpen} />
@@ -568,23 +610,10 @@ const styles = StyleSheet.create({
   toolbarActionBare: { alignItems: 'center', minWidth: 36, paddingHorizontal: 0 },
   toolbarActionBareLabel: { fontSize: 27, fontWeight: '300', lineHeight: 29 },
   composer: { borderWidth: StyleSheet.hairlineWidth, overflow: 'hidden' },
-  composerCollapsed: {
-    borderRadius: 999,
-    minHeight: 52,
-    padding: 4,
-  },
-  composerExpanded: {
-    borderRadius: 24,
-    minHeight: 98,
-    paddingBottom: 5,
-    paddingHorizontal: 12,
-    paddingTop: 9,
-  },
-  collapsedInputRow: { alignItems: 'center', flexDirection: 'row', gap: 5 },
-  expandedInputRow: { minHeight: 42 },
+  composerInputRow: { alignItems: 'center', flexDirection: 'row', minHeight: 42 },
   input: { fontSize: 16, lineHeight: 23, outlineStyle: 'none' } as never,
   inputCollapsed: { flex: 1, height: 42, paddingBottom: 3, paddingHorizontal: 4, paddingTop: 3 },
-  inputExpanded: { maxHeight: 96, minHeight: 42, paddingHorizontal: 4, paddingVertical: 3 },
+  inputExpanded: { flex: 1, maxHeight: 96, minHeight: 42, paddingHorizontal: 4, paddingVertical: 3 },
   composerFooter: {
     alignItems: 'center',
     flexDirection: 'row',
@@ -592,7 +621,10 @@ const styles = StyleSheet.create({
     minHeight: 40,
   },
   send: { alignItems: 'center', borderRadius: 20, height: 40, justifyContent: 'center', width: 40 },
-  compactAttach: { alignItems: 'center', height: 40, justifyContent: 'center', width: 36 },
+  sendPressable: { alignItems: 'center', borderRadius: 20, height: 40, justifyContent: 'center', width: 40 },
+  compactLeftSlot: { height: 40, justifyContent: 'center', overflow: 'hidden' },
+  compactRightSlot: { alignItems: 'flex-end', height: 40, justifyContent: 'center', overflow: 'hidden' },
+  compactControlPressable: { alignItems: 'center', height: 40, justifyContent: 'center', width: 36 },
   compactAttachLabel: { fontSize: 27, fontWeight: '300', lineHeight: 30 },
   attachmentList: { gap: Spacing.two, paddingBottom: Spacing.two },
   attachmentChip: { alignItems: 'center', borderRadius: 10, borderWidth: StyleSheet.hairlineWidth, flexDirection: 'row', gap: Spacing.two, paddingHorizontal: Spacing.two, paddingVertical: Spacing.one },
