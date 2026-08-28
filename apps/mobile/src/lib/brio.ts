@@ -1100,45 +1100,103 @@ export function getLogs(
   );
 }
 
-export function listJobs(connection: AgentConnection, profile?: string) {
-  return brioFetch<HermesJob[] | { jobs: HermesJob[] }>(
-    connection,
-    `${scopedPath('/jobs/', profile)}${defaultAutomationProfileQuery(profile)}`,
-  );
+export async function listJobs(connection: AgentConnection, profile?: string) {
+  try {
+    return await brioFetch<HermesJob[] | { jobs: HermesJob[] }>(
+      connection,
+      `${scopedPath('/api/cron/jobs', profile)}${automationProfileQuery(profile)}`,
+    );
+  } catch (error) {
+    if (!isUnsupportedAutomationRoute(error)) throw error;
+    return brioFetch<HermesJob[] | { jobs: HermesJob[] }>(
+      connection,
+      `${scopedPath('/jobs/', profile)}${automationProfileQuery(profile)}`,
+    );
+  }
 }
 
-export function listJobRuns(connection: AgentConnection, jobId: string, limit = 20, profile?: string) {
-  const query = new URLSearchParams({ limit: String(Math.max(1, Math.min(limit, 100))) });
-  if (!profile || profile === 'default') query.set('profile', 'default');
-  return brioFetch<{ runs: HermesSession[]; limit?: number }>(
-    connection,
-    `${scopedPath(`/jobs/${encodeURIComponent(jobId)}/runs`, profile)}?${query.toString()}`,
-  );
+export async function listJobRuns(connection: AgentConnection, jobId: string, limit = 20, profile?: string) {
+  const boundedLimit = Math.max(1, Math.min(limit, 100));
+  const query = new URLSearchParams({ limit: String(boundedLimit) });
+  query.set('profile', profileNameForAutomation(profile));
+  try {
+    return await brioFetch<{ runs: HermesSession[]; limit?: number }>(
+      connection,
+      `${scopedPath(`/api/cron/jobs/${encodeURIComponent(jobId)}/runs`, profile)}?${query.toString()}`,
+    );
+  } catch (error) {
+    if (!isUnsupportedAutomationRoute(error)) throw error;
+    try {
+      return await brioFetch<{ runs: HermesSession[]; limit?: number }>(
+        connection,
+        `${scopedPath(`/jobs/${encodeURIComponent(jobId)}/runs`, profile)}?${query.toString()}`,
+      );
+    } catch (legacyError) {
+      if (!isUnsupportedAutomationRoute(legacyError)) throw legacyError;
+      const sessions = await listSessions(connection, 100, profile, { source: 'cron', order: 'recent' });
+      const prefix = `cron_${jobId}_`;
+      return {
+        runs: sessions.sessions.filter((session) => session.id.startsWith(prefix)).slice(0, boundedLimit),
+        limit: boundedLimit,
+      };
+    }
+  }
 }
 
-export function runJobAction(
+export async function runJobAction(
   connection: AgentConnection,
   jobId: string,
   action: 'pause' | 'resume' | 'trigger',
   profile?: string,
 ) {
-  return brioFetch<Record<string, unknown>>(
-    connection,
-    `${scopedPath(`/jobs/${encodeURIComponent(jobId)}/${action}`, profile)}${defaultAutomationProfileQuery(profile)}`,
-    { method: 'POST', body: '{}' },
-  );
+  try {
+    return await brioFetch<Record<string, unknown>>(
+      connection,
+      `${scopedPath(`/api/cron/jobs/${encodeURIComponent(jobId)}/${action}`, profile)}${automationProfileQuery(profile)}`,
+      { method: 'POST', body: '{}' },
+    );
+  } catch (error) {
+    if (!isUnsupportedAutomationRoute(error)) throw error;
+    return brioFetch<Record<string, unknown>>(
+      connection,
+      `${scopedPath(`/jobs/${encodeURIComponent(jobId)}/${action}`, profile)}${automationProfileQuery(profile)}`,
+      { method: 'POST', body: '{}' },
+    );
+  }
 }
 
-export function deleteJob(connection: AgentConnection, jobId: string, profile?: string) {
-  return brioFetch<Record<string, unknown>>(
-    connection,
-    `${scopedPath(`/jobs/${encodeURIComponent(jobId)}`, profile)}${defaultAutomationProfileQuery(profile)}`,
-    { method: 'DELETE' },
-  );
+export async function deleteJob(connection: AgentConnection, jobId: string, profile?: string) {
+  try {
+    return await brioFetch<Record<string, unknown>>(
+      connection,
+      `${scopedPath(`/api/cron/jobs/${encodeURIComponent(jobId)}`, profile)}${automationProfileQuery(profile)}`,
+      { method: 'DELETE' },
+    );
+  } catch (error) {
+    if (!isUnsupportedAutomationRoute(error)) throw error;
+    return brioFetch<Record<string, unknown>>(
+      connection,
+      `${scopedPath(`/jobs/${encodeURIComponent(jobId)}`, profile)}${automationProfileQuery(profile)}`,
+      { method: 'DELETE' },
+    );
+  }
 }
 
-function defaultAutomationProfileQuery(profile?: string) {
-  return !profile || profile === 'default' ? '?profile=default' : '';
+function profileNameForAutomation(profile?: string) {
+  return profile?.trim() || 'default';
+}
+
+function automationProfileQuery(profile?: string) {
+  return `?profile=${encodeURIComponent(profileNameForAutomation(profile))}`;
+}
+
+function isUnsupportedAutomationRoute(error: unknown) {
+  if (error instanceof BrioRequestError) {
+    return error.status === 404 || /no route|not found/i.test(error.message);
+  }
+  // Relay gateways can surface the upstream route error as a plain Error,
+  // without preserving the HTTP status frame.
+  return error instanceof Error && /no route|not found/i.test(error.message);
 }
 
 export function controlRPC<T>(

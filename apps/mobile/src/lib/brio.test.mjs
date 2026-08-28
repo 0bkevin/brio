@@ -146,8 +146,40 @@ test('scopes default-profile cron lists and run history instead of using Hermes 
   try {
     await listJobs(connection, 'default');
     await listJobRuns(connection, 'job-1', 20, 'default');
-    assert.equal(requests[0], 'http://127.0.0.1:8787/jobs/?profile=default');
-    assert.equal(requests[1], 'http://127.0.0.1:8787/jobs/job-1/runs?limit=20&profile=default');
+    assert.equal(requests[0], 'http://127.0.0.1:8787/api/cron/jobs?profile=default');
+    assert.equal(requests[1], 'http://127.0.0.1:8787/api/cron/jobs/job-1/runs?limit=20&profile=default');
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test('falls back to legacy cron sessions when an older connector lacks the run endpoint', async () => {
+  const originalFetch = globalThis.fetch;
+  const requests = [];
+  globalThis.fetch = async (input) => {
+    const url = String(input);
+    requests.push(url);
+    if (url.includes('/api/cron/jobs/') || url.includes('/jobs/job-1/runs')) {
+      return new Response(JSON.stringify({ error: 'no route for GET ' + new URL(url).pathname }), {
+        status: 404,
+        headers: { 'Content-Type': 'application/json' },
+      });
+    }
+    if (url.includes('/api/sessions')) {
+      return new Response(JSON.stringify({ data: [
+        { id: 'cron_job-1_20260828_120000', source: 'cron', started_at: 1, message_count: 2 },
+        { id: 'cron-other_20260828_120000', source: 'cron', started_at: 2, message_count: 2 },
+      ] }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+    }
+    throw new Error(`unexpected request: ${url}`);
+  };
+  try {
+    const runs = await listJobRuns({
+      id: 'direct-1', name: 'Hermes', mode: 'self_hosted', transport: 'direct', status: 'online',
+      capabilities: {}, url: 'http://127.0.0.1:8787', token: 'secret',
+    }, 'job-1', 20, 'default');
+    assert.deepEqual(runs.runs.map((run) => run.id), ['cron_job-1_20260828_120000']);
+    assert.match(requests.at(-1), /\/api\/sessions\?limit=100&source=cron&order=recent/);
   } finally {
     globalThis.fetch = originalFetch;
   }

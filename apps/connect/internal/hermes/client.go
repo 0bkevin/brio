@@ -167,6 +167,8 @@ func RoutePath(path string) Route {
 		return Route{Kind: RouteControlForward, Path: "/api/gateway/restart"}
 	case "/logs":
 		return Route{Kind: RouteControlForward, Path: "/api/logs"}
+	case "/api/cron/jobs":
+		return Route{Kind: RouteControlForward, Path: path}
 	case "/jobs", "/jobs/":
 		return Route{Kind: RouteControlForward, Path: "/api/cron/jobs"}
 	}
@@ -182,6 +184,10 @@ func RoutePath(path string) Route {
 		if name != "" && !strings.Contains(name, "/") {
 			return Route{Kind: RouteControlForward, Path: "/api/tools/toolsets/" + name}
 		}
+	case strings.HasPrefix(path, "/api/cron/jobs/"):
+		if canonicalCronJobPath(path) {
+			return Route{Kind: RouteControlForward, Path: path}
+		}
 	case strings.HasPrefix(path, "/jobs/"):
 		if mapped, ok := legacyCronJobPath(path); ok {
 			return Route{Kind: RouteControlForward, Path: mapped}
@@ -191,6 +197,23 @@ func RoutePath(path string) Route {
 		return Route{Kind: RouteForward, Path: path}
 	}
 	return Route{Kind: RouteUnknown}
+}
+
+func canonicalCronJobPath(path string) bool {
+	rest := strings.TrimPrefix(path, "/api/cron/jobs/")
+	id, action, hasAction := strings.Cut(rest, "/")
+	if id == "" || strings.Contains(action, "/") {
+		return false
+	}
+	if !hasAction {
+		return true
+	}
+	switch action {
+	case "pause", "resume", "trigger", "runs":
+		return true
+	default:
+		return false
+	}
 }
 
 func legacyCronJobPath(path string) (string, bool) {

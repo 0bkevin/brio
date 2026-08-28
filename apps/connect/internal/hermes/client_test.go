@@ -70,6 +70,8 @@ func TestRoutePath(t *testing.T) {
 		{path: "/gateway/status", kind: RouteControlForward, forwardTo: "/api/status"},
 		{path: "/gateway/restart", kind: RouteControlForward, forwardTo: "/api/gateway/restart"},
 		{path: "/logs", kind: RouteControlForward, forwardTo: "/api/logs"},
+		{path: "/api/cron/jobs", kind: RouteControlForward, forwardTo: "/api/cron/jobs"},
+		{path: "/api/cron/jobs/job_1/runs", kind: RouteControlForward, forwardTo: "/api/cron/jobs/job_1/runs"},
 		{path: "/jobs/", kind: RouteControlForward, forwardTo: "/api/cron/jobs"},
 		{path: "/jobs/job_1/pause", kind: RouteControlForward, forwardTo: "/api/cron/jobs/job_1/pause"},
 		{path: "/jobs/job_1/runs", kind: RouteControlForward, forwardTo: "/api/cron/jobs/job_1/runs"},
