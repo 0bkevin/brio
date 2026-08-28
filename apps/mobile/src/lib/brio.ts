@@ -162,6 +162,14 @@ type HermesSessionListEnvelope = {
   error?: string;
 };
 
+export type HermesSessionPage = {
+  sessions: HermesSession[];
+  hasMore: boolean;
+  nextCursor?: string;
+  continueWhenEmpty?: boolean;
+  warning?: string;
+};
+
 type HermesMessageListEnvelope = {
   messages?: HermesMessage[];
   data?: HermesMessage[];
@@ -707,6 +715,140 @@ export function interruptComposerSession(connection: AgentConnection, sessionId:
   });
 }
 
+function parseSessionCursor(cursor?: string) {
+  if (!cursor) return { offset: 0, lastId: undefined as string | undefined };
+  try {
+    const parsed = JSON.parse(decodeURIComponent(cursor)) as {
+      offset?: number;
+      strategy?: 'raw' | 'window';
+      firstId?: string;
+      lastId?: string;
+    };
+    if (Number.isSafeInteger(parsed.offset) && parsed.offset >= 0) {
+      return { offset: parsed.offset, strategy: parsed.strategy ?? 'raw', firstId: parsed.firstId, lastId: parsed.lastId };
+    }
+  } catch {
+    // Accept the numeric cursor used by early development builds.
+  }
+  const offset = Number(cursor);
+  return { offset: Number.isSafeInteger(offset) && offset >= 0 ? offset : 0, strategy: 'raw' as const, firstId: undefined, lastId: undefined };
+}
+
+function makeSessionCursor(offset: number, lastId?: string, firstId?: string, strategy: 'raw' | 'window' = 'raw') {
+  return encodeURIComponent(JSON.stringify({ offset, strategy, firstId, lastId }));
+}
+
+/**
+ * Loads one stable page for automation feeds. The cursor is an opaque raw
+ * session offset so it also works when an older Hermes relay ignores source
+ * filters and Brio has to filter the compatibility page locally.
+ */
+export async function listAutomationSessionsPage(
+  connection: AgentConnection,
+  limit = 5,
+  profile?: string,
+  options: SessionListOptions = {},
+  cursor?: string,
+): Promise<HermesSessionPage> {
+  const included = options.source
+    ? new Set([options.source])
+    : options.sources?.length
+      ? new Set(options.sources)
+      : null;
+  const excluded = new Set(options.excludeSources ?? []);
+  const hasSourceFilter = Boolean(included || excluded.size);
+  const requestedLimit = Math.max(1, Math.min(limit, 100));
+  const pageSize = hasSourceFilter ? 100 : requestedLimit;
+  const maxCompatibilityPages = 10;
+  const sessions: HermesSession[] = [];
+  const seen = new Set<string>();
+  const cursorState = parseSessionCursor(cursor);
+  const windowMode = cursorState.strategy === 'window';
+  let rawOffset = cursorState.offset;
+
+  for (let pageIndex = 0; pageIndex < (hasSourceFilter && !windowMode ? maxCompatibilityPages : 1); pageIndex += 1) {
+    const pageStart = rawOffset;
+    const query = new URLSearchParams({
+      limit: String(windowMode ? Math.min(100, pageStart + requestedLimit) : pageSize),
+    });
+    if (pageStart && !windowMode) query.set('offset', String(pageStart));
+    if (options.source) query.set('source', options.source);
+    if (options.sources?.length) query.set('sources', options.sources.join(','));
+    if (options.excludeSources?.length) query.set('exclude_sources', options.excludeSources.join(','));
+    if (options.order) query.set('order', options.order);
+
+    const envelope = await brioFetch<HermesSessionListEnvelope>(
+      connection,
+      `${scopedPath('/api/sessions', profile)}?${query.toString()}`,
+    );
+    const rawPage = normalizeSessionList(envelope).sessions;
+    if (!windowMode && (
+      (cursorState.firstId && rawPage[0]?.id === cursorState.firstId)
+      || (cursorState.lastId && rawPage[0]?.id === cursorState.lastId)
+    )) {
+      return { sessions: [], hasMore: false };
+    }
+    if (windowMode) {
+      const page = rawPage.filter((session) =>
+        (!included || included.has(session.source)) && !excluded.has(session.source));
+      const window = page.slice(pageStart, pageStart + requestedLimit);
+      const reachedReportedTotal = typeof envelope.total === 'number' && pageStart + window.length >= envelope.total;
+      const hasMore = window.length > 0
+        && !reachedReportedTotal
+        && rawPage.length >= Math.min(100, pageStart + requestedLimit);
+      return {
+        sessions: window,
+        hasMore,
+        nextCursor: hasMore
+          ? makeSessionCursor(pageStart + Math.max(window.length, 1), window.at(-1)?.id, window[0]?.id, 'window')
+          : undefined,
+      };
+    }
+    const page = rawPage;
+    let consumed = 0;
+    let sawUnseen = false;
+    for (const session of page) {
+      consumed += 1;
+      if (seen.has(session.id)) continue;
+      seen.add(session.id);
+      sawUnseen = true;
+      if ((!included || included.has(session.source)) && !excluded.has(session.source)) {
+        sessions.push(session);
+      }
+      if (sessions.length >= requestedLimit) break;
+    }
+
+    const reachedReportedTotal = typeof envelope.total === 'number' && pageStart + page.length >= envelope.total;
+    const pageHasMore = page.length >= pageSize && !reachedReportedTotal;
+    if (sessions.length >= requestedLimit || !pageHasMore || !sawUnseen) {
+      return {
+        sessions,
+        hasMore: pageHasMore && sawUnseen,
+        continueWhenEmpty: hasSourceFilter && !windowMode,
+        nextCursor:
+          pageHasMore && sawUnseen
+            ? makeSessionCursor(
+                pageStart + Math.max(consumed, 1),
+                page[Math.max(consumed, 1) - 1]?.id,
+                page[0]?.id,
+                hasSourceFilter && page.every((session) =>
+                  (!included || included.has(session.source)) && !excluded.has(session.source))
+                  ? 'window'
+                  : 'raw',
+              )
+            : undefined,
+      };
+    }
+    rawOffset = pageStart + page.length;
+  }
+
+  return {
+    sessions,
+    hasMore: false,
+    warning: 'Older Hermes cannot safely paginate this filtered history beyond the scanned limit.',
+  };
+}
+
 export async function listSessions(
   connection: AgentConnection,
   limit = 100,
@@ -1100,45 +1242,205 @@ export function getLogs(
   );
 }
 
-export function listJobs(connection: AgentConnection, profile?: string) {
-  return brioFetch<HermesJob[] | { jobs: HermesJob[] }>(
-    connection,
-    `${scopedPath('/jobs/', profile)}${defaultAutomationProfileQuery(profile)}`,
-  );
+export async function listJobs(connection: AgentConnection, profile?: string) {
+  try {
+    return await brioFetch<HermesJob[] | { jobs: HermesJob[] }>(
+      connection,
+      `${scopedPath('/api/cron/jobs', profile)}${automationProfileQuery(profile)}`,
+    );
+  } catch (error) {
+    if (!isUnsupportedAutomationRoute(error)) throw error;
+    return brioFetch<HermesJob[] | { jobs: HermesJob[] }>(
+      connection,
+      `${scopedPath('/jobs/', profile)}${automationProfileQuery(profile)}`,
+    );
+  }
 }
 
-export function listJobRuns(connection: AgentConnection, jobId: string, limit = 20, profile?: string) {
-  const query = new URLSearchParams({ limit: String(Math.max(1, Math.min(limit, 100))) });
-  if (!profile || profile === 'default') query.set('profile', 'default');
-  return brioFetch<{ runs: HermesSession[]; limit?: number }>(
-    connection,
-    `${scopedPath(`/jobs/${encodeURIComponent(jobId)}/runs`, profile)}?${query.toString()}`,
-  );
+type HermesJobRunsEnvelope = {
+  runs?: HermesSession[];
+  sessions?: HermesSession[];
+  data?: HermesSession[];
+  limit?: number;
+  total?: number;
+  has_more?: boolean;
+  next_cursor?: string | null;
+};
+
+type HermesJobRunsResponse = HermesJobRunsEnvelope | HermesSession[];
+
+function normalizeJobRuns(response: HermesJobRunsResponse): HermesJobRunsEnvelope & { runs: HermesSession[] } {
+  if (Array.isArray(response)) return { runs: response };
+  return {
+    ...response,
+    runs: response.runs ?? response.sessions ?? response.data ?? [],
+  };
 }
 
-export function runJobAction(
+const JOB_RUN_FALLBACK_SCAN_LIMIT = 100;
+
+export async function listJobRunsPage(
+  connection: AgentConnection,
+  jobId: string,
+  limit = 5,
+  profile?: string,
+  cursor?: string,
+): Promise<HermesSessionPage> {
+  const boundedLimit = Math.max(1, Math.min(limit, 100));
+  const cursorState = parseSessionCursor(cursor);
+  const windowMode = Boolean(cursor && cursorState.strategy === 'window');
+  const requestLimit = windowMode ? Math.min(100, cursorState.offset + boundedLimit) : boundedLimit;
+  const query = new URLSearchParams({ limit: String(requestLimit) });
+  query.set('profile', profileNameForAutomation(profile));
+  if (cursorState.offset && !windowMode) query.set('offset', String(cursorState.offset));
+  try {
+    const result = normalizeJobRuns(await brioFetch<HermesJobRunsResponse>(
+      connection,
+      `${scopedPath(`/api/cron/jobs/${encodeURIComponent(jobId)}/runs`, profile)}?${query.toString()}`,
+    ));
+    const allRuns = result.runs ?? result.data ?? [];
+    if (!windowMode && (
+      (cursorState.firstId && allRuns[0]?.id === cursorState.firstId)
+      || (cursorState.lastId && allRuns[0]?.id === cursorState.lastId)
+    )) {
+      return { sessions: [], hasMore: false };
+    }
+    const runs = windowMode ? allRuns.slice(cursorState.offset, cursorState.offset + boundedLimit) : allRuns;
+    const hasMore = runs.length > 0 && (typeof result.has_more === 'boolean'
+      ? result.has_more
+      : typeof result.total === 'number'
+        ? cursorState.offset + runs.length < result.total
+        : allRuns.length >= requestLimit);
+    return {
+      sessions: runs,
+      hasMore,
+      nextCursor: hasMore
+        ? makeSessionCursor(
+          cursorState.offset + runs.length,
+          runs.at(-1)?.id,
+          runs[0]?.id,
+          'window',
+        )
+        : undefined,
+    };
+  } catch (error) {
+    if (!isUnsupportedAutomationRoute(error)) throw error;
+    try {
+      const result = normalizeJobRuns(await brioFetch<HermesJobRunsResponse>(
+        connection,
+        `${scopedPath(`/jobs/${encodeURIComponent(jobId)}/runs`, profile)}?${query.toString()}`,
+      ));
+      const allRuns = result.runs ?? result.data ?? [];
+      if (!windowMode && (
+        (cursorState.firstId && allRuns[0]?.id === cursorState.firstId)
+        || (cursorState.lastId && allRuns[0]?.id === cursorState.lastId)
+      )) {
+        return { sessions: [], hasMore: false };
+      }
+      const runs = windowMode ? allRuns.slice(cursorState.offset, cursorState.offset + boundedLimit) : allRuns;
+      const hasMore = runs.length > 0 && (typeof result.has_more === 'boolean'
+        ? result.has_more
+        : typeof result.total === 'number'
+          ? cursorState.offset + runs.length < result.total
+          : allRuns.length >= requestLimit);
+      return {
+        sessions: runs,
+        hasMore,
+        nextCursor: hasMore
+          ? makeSessionCursor(
+              cursorState.offset + Math.max(runs.length, 1),
+              runs.at(-1)?.id,
+              runs[0]?.id,
+              'window',
+            )
+          : undefined,
+      };
+    } catch (legacyError) {
+      if (!isUnsupportedAutomationRoute(legacyError)) throw legacyError;
+      // Older gateways expose cron runs only through the shared session list.
+      // Keep the raw-session cursor so a busy history cannot hide this job's
+      // recent runs. The source page is deliberately larger than the UI page:
+      // filtering after five rows could return an empty page even when the job
+      // has a run immediately behind other jobs. Return every matching run in
+      // this scan chunk so the cursor never skips matches that were fetched.
+      const page = await listAutomationSessionsPage(
+        connection,
+        Math.max(boundedLimit, JOB_RUN_FALLBACK_SCAN_LIMIT),
+        profile,
+        { source: 'cron', order: 'recent' },
+        cursor,
+      );
+      const prefix = `cron_${jobId}_`;
+      return {
+        sessions: page.sessions.filter((session) => session.id.startsWith(prefix)),
+        hasMore: page.hasMore,
+        nextCursor: page.nextCursor,
+        continueWhenEmpty: true,
+        warning: page.warning,
+      };
+    }
+  }
+}
+
+export async function listJobRuns(connection: AgentConnection, jobId: string, limit = 20, profile?: string) {
+  const page = await listJobRunsPage(connection, jobId, limit, profile);
+  return { runs: page.sessions, limit: Math.max(1, Math.min(limit, 100)) };
+}
+
+export async function runJobAction(
   connection: AgentConnection,
   jobId: string,
   action: 'pause' | 'resume' | 'trigger',
   profile?: string,
 ) {
-  return brioFetch<Record<string, unknown>>(
-    connection,
-    `${scopedPath(`/jobs/${encodeURIComponent(jobId)}/${action}`, profile)}${defaultAutomationProfileQuery(profile)}`,
-    { method: 'POST', body: '{}' },
-  );
+  try {
+    return await brioFetch<Record<string, unknown>>(
+      connection,
+      `${scopedPath(`/api/cron/jobs/${encodeURIComponent(jobId)}/${action}`, profile)}${automationProfileQuery(profile)}`,
+      { method: 'POST', body: '{}' },
+    );
+  } catch (error) {
+    if (!isUnsupportedAutomationRoute(error)) throw error;
+    return brioFetch<Record<string, unknown>>(
+      connection,
+      `${scopedPath(`/jobs/${encodeURIComponent(jobId)}/${action}`, profile)}${automationProfileQuery(profile)}`,
+      { method: 'POST', body: '{}' },
+    );
+  }
 }
 
-export function deleteJob(connection: AgentConnection, jobId: string, profile?: string) {
-  return brioFetch<Record<string, unknown>>(
-    connection,
-    `${scopedPath(`/jobs/${encodeURIComponent(jobId)}`, profile)}${defaultAutomationProfileQuery(profile)}`,
-    { method: 'DELETE' },
-  );
+export async function deleteJob(connection: AgentConnection, jobId: string, profile?: string) {
+  try {
+    return await brioFetch<Record<string, unknown>>(
+      connection,
+      `${scopedPath(`/api/cron/jobs/${encodeURIComponent(jobId)}`, profile)}${automationProfileQuery(profile)}`,
+      { method: 'DELETE' },
+    );
+  } catch (error) {
+    if (!isUnsupportedAutomationRoute(error)) throw error;
+    return brioFetch<Record<string, unknown>>(
+      connection,
+      `${scopedPath(`/jobs/${encodeURIComponent(jobId)}`, profile)}${automationProfileQuery(profile)}`,
+      { method: 'DELETE' },
+    );
+  }
 }
 
-function defaultAutomationProfileQuery(profile?: string) {
-  return !profile || profile === 'default' ? '?profile=default' : '';
+function profileNameForAutomation(profile?: string) {
+  return profile?.trim() || 'default';
+}
+
+function automationProfileQuery(profile?: string) {
+  return `?profile=${encodeURIComponent(profileNameForAutomation(profile))}`;
+}
+
+function isUnsupportedAutomationRoute(error: unknown) {
+  if (error instanceof BrioRequestError) {
+    return error.status === 404 || /no route|not found/i.test(error.message);
+  }
+  // Relay gateways can surface the upstream route error as a plain Error,
+  // without preserving the HTTP status frame.
+  return error instanceof Error && /no route|not found/i.test(error.message);
 }
 
 export function controlRPC<T>(

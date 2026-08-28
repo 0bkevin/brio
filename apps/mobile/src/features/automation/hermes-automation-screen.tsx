@@ -1,4 +1,5 @@
-import { useQueries, useQuery } from '@tanstack/react-query';
+import { useInfiniteQuery, useQueries, useQuery } from '@tanstack/react-query';
+import Markdown from 'react-native-markdown-display';
 import { useState } from 'react';
 import { Pressable, RefreshControl, ScrollView, StyleSheet, View } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
@@ -8,11 +9,12 @@ import { T3Radius, T3Spacing, T3Typography } from '@/constants/t3-theme';
 import { useT3Theme } from '@/hooks/use-t3-theme';
 import {
   getSessionMessages,
-  listJobRuns,
+  listAutomationSessionsPage,
+  listJobRunsPage,
   listJobs,
-  listSessions,
   type AgentConnection,
   type HermesJob,
+  type HermesSessionPage,
   type HermesSession,
 } from '@/lib/brio';
 import {
@@ -26,9 +28,19 @@ import { useProfileStore } from '@/state/profile-store';
 type AutomationView = 'jobs' | 'heartbeats';
 type AutomationResponse = {
   id: string;
+  sessionId: string;
   content: string;
   timestamp: number;
+  startedAt: number;
+  endedAt?: number | null;
+  messageCount: number;
+  model?: string;
 };
+
+const INITIAL_AUTOMATION_RESPONSE_LIMIT = 5;
+const MAX_AUTOMATION_PAGES = 20;
+
+type AutomationPageLoader = (cursor?: string) => Promise<HermesSessionPage>;
 
 export function HermesAutomationScreen({ connection }: { connection: AgentConnection }) {
   const colors = useT3Theme();
@@ -57,12 +69,6 @@ export function HermesAutomationScreen({ connection }: { connection: AgentConnec
     },
     refetchInterval: 15_000,
   });
-  const heartbeatSessions = useQuery({
-    queryKey: ['automation-heartbeats', connection.id, connection.url, activeProfile],
-    queryFn: () => listSessions(connection, 20, activeProfile, { source: 'heartbeat', order: 'recent' }),
-    refetchInterval: 15_000,
-  });
-
   if (selectedJob) {
     return (
       <JobResponses
@@ -101,20 +107,23 @@ export function HermesAutomationScreen({ connection }: { connection: AgentConnec
         </ScrollView>
       ) : (
         <ResponseFeed
-          detail="Recurring heartbeat prompts run in isolated automation sessions seeded from the source chat. Only Hermes’ responses appear here."
-          emptyDetail="Heartbeat responses will appear here after a configured heartbeat fires."
-          emptyTitle="No heartbeat responses"
-          profile={activeProfile}
-          connection={connection}
-          sessions={heartbeatSessions.data?.sessions ?? []}
-          sessionsError={heartbeatSessions.error}
-          sessionsLoading={heartbeatSessions.isLoading}
-          title="Heartbeat responses"
-          onRefresh={() => void heartbeatSessions.refetch()}
-          refreshing={heartbeatSessions.isRefetching}
-          oneResponsePerSession
-          requestPrefix="[Heartbeat — recurring instruction"
-        />
+        detail="Recurring heartbeat prompts run in isolated automation sessions seeded from the source chat. Only Hermes’ responses appear here."
+        emptyDetail="Heartbeat responses will appear here after a configured heartbeat fires."
+        emptyTitle="No heartbeat responses"
+        profile={activeProfile}
+        connection={connection}
+        title="Heartbeat responses"
+        queryKey={['automation-heartbeats', connection.id, connection.url, activeProfile]}
+        loadPage={(cursor) => listAutomationSessionsPage(
+          connection,
+          INITIAL_AUTOMATION_RESPONSE_LIMIT,
+          activeProfile,
+          { source: 'heartbeat', order: 'recent' },
+          cursor,
+        )}
+        oneResponsePerSession
+        requestPrefix="[Heartbeat — recurring instruction"
+      />
       )}
     </SafeAreaView>
   );
@@ -133,12 +142,6 @@ function JobResponses({
 }) {
   const colors = useT3Theme();
   const id = jobID(job);
-  const runs = useQuery({
-    queryKey: ['automation-job-runs', connection.id, connection.url, profile, id],
-    queryFn: () => listJobRuns(connection, id, 20, profile),
-    enabled: Boolean(id),
-    refetchInterval: 15_000,
-  });
   return (
     <SafeAreaView edges={['bottom', 'left', 'right']} style={[styles.safe, { backgroundColor: colors.screen }]}>
       <View style={[styles.detailHeader, { borderBottomColor: colors.border }]}>
@@ -154,12 +157,16 @@ function JobResponses({
         emptyDetail="Run this job once and its response will appear here."
         emptyTitle="No responses yet"
         profile={profile}
-        sessions={runs.data?.runs ?? []}
-        sessionsError={runs.error}
-        sessionsLoading={runs.isLoading}
         title="Run responses"
-        onRefresh={() => void runs.refetch()}
-        refreshing={runs.isRefetching}
+        queryKey={['automation-job-runs', connection.id, connection.url, profile, id]}
+        enabled={Boolean(id)}
+        loadPage={(cursor) => listJobRunsPage(
+          connection,
+          id,
+          INITIAL_AUTOMATION_RESPONSE_LIMIT,
+          profile,
+          cursor,
+        )}
         oneResponsePerSession
       />
     </SafeAreaView>
@@ -171,37 +178,54 @@ function ResponseFeed({
   detail,
   emptyDetail,
   emptyTitle,
-  onRefresh,
+  loadPage,
+  enabled = true,
   oneResponsePerSession = false,
   profile,
-  refreshing,
+  queryKey,
   requestPrefix,
-  sessions,
-  sessionsError,
-  sessionsLoading,
   title,
 }: {
   connection: AgentConnection;
   detail: string;
   emptyDetail: string;
   emptyTitle: string;
-  onRefresh: () => void;
+  loadPage: AutomationPageLoader;
+  enabled?: boolean;
   oneResponsePerSession?: boolean;
   profile: string;
-  refreshing: boolean;
+  queryKey: readonly unknown[];
   requestPrefix?: string;
-  sessions: HermesSession[];
-  sessionsError: unknown;
-  sessionsLoading: boolean;
   title: string;
 }) {
   const colors = useT3Theme();
+  const [selectedResponse, setSelectedResponse] = useState<AutomationResponse | null>(null);
+  const sessionQuery = useInfiniteQuery({
+    queryKey,
+    queryFn: ({ pageParam }) => loadPage(typeof pageParam === 'string' ? pageParam : undefined),
+    initialPageParam: null as string | null,
+    enabled,
+    getNextPageParam: (lastPage, allPages) => {
+      if (!lastPage.hasMore || !lastPage.nextCursor) return undefined;
+      if (allPages.length >= MAX_AUTOMATION_PAGES) return undefined;
+      const previousCursors = new Set(allPages.slice(0, -1).map((page) => page.nextCursor));
+      if (previousCursors.has(lastPage.nextCursor)) return undefined;
+      const previousIds = new Set(allPages.slice(0, -1).flatMap((page) => page.sessions.map((session) => session.id)));
+      const hasNewSession = lastPage.sessions.some((session) => !previousIds.has(session.id));
+      if (!hasNewSession && !lastPage.continueWhenEmpty) return undefined;
+      return lastPage.nextCursor;
+    },
+    refetchInterval: 15_000,
+    retry: false,
+  });
+  const sessions = dedupeSessions(sessionQuery.data?.pages.flatMap((page) => page.sessions) ?? []);
   const responseQueries = useQueries({
     queries: sessions.map((session) => ({
       queryKey: ['automation-response', connection.id, connection.url, profile, session.id, session.message_count],
+      enabled: enabled && sessions.length > 0,
       queryFn: () => getSessionMessages(connection, session.id, profile),
-      retry: 2,
-      refetchInterval: (query: { state: { status: string } }) => query.state.status === 'error' ? 30_000 : false,
+      retry: false,
+      staleTime: 30_000,
     })),
   });
   const successfulSessions: HermesSession[] = [];
@@ -212,13 +236,32 @@ function ResponseFeed({
     successfulMessages.push(query.data.messages);
   });
   const responses = collectResponses(successfulSessions, successfulMessages, oneResponsePerSession, requestPrefix);
-  const responsesLoading = responseQueries.some((query) => query.isLoading);
+  const sessionsLoading = sessionQuery.isLoading;
+  const responsesLoading = sessions.length > 0 && responseQueries.some((query) => query.isLoading);
   const responsesRefetching = responseQueries.some((query) => query.isRefetching);
+  const loadingMoreResponses = sessionQuery.data?.pages.length
+    ? sessionQuery.data.pages.length > 1 && responseQueries.some((query) => query.isLoading)
+    : false;
+  const loadMoreLoading = sessionQuery.isFetchingNextPage || loadingMoreResponses;
   const responseError = responseQueries.find((query) => query.error)?.error;
   const refreshAll = () => {
-    onRefresh();
+    void sessionQuery.refetch();
     responseQueries.forEach((query) => void query.refetch());
   };
+  const refreshing = sessionQuery.isRefetching && !sessionQuery.isFetchingNextPage;
+  const historyCapped = (sessionQuery.data?.pages.length ?? 0) >= MAX_AUTOMATION_PAGES;
+  const historyExhausted = (historyCapped || !sessionQuery.hasNextPage) && !sessionQuery.isFetching && !sessionQuery.error;
+  const historyWarning = sessionQuery.data?.pages.find((page) => page.warning)?.warning;
+  const initialResponsesLoading = (sessionQuery.data?.pages.length ?? 0) <= 1 && responsesLoading;
+
+  if (selectedResponse) {
+    return (
+      <RunDetail
+        response={selectedResponse}
+        onBack={() => setSelectedResponse(null)}
+      />
+    );
+  }
 
   return (
     <ScrollView
@@ -228,15 +271,104 @@ function ResponseFeed({
         <AppText style={styles.title}>{title}</AppText>
         <AppText style={[styles.detail, { color: colors.muted }]}>{detail}</AppText>
       </View>
-      {sessionsLoading || (sessions.length > 0 && responsesLoading) ? (
+      {sessionsLoading || initialResponsesLoading ? (
         <EmptyState detail="Loading automation responses from Hermes." loading title="Collecting responses" />
       ) : null}
-      {sessionsError || responseError ? <Failure error={sessionsError ?? responseError} onRetry={refreshAll} /> : null}
-      {responses.map((response) => <ResponseCard key={response.id} response={response} />)}
-      {!sessionsLoading && !sessionsError && !responsesLoading && !responseError && responses.length === 0 ? (
+      {sessionQuery.error || responseError ? <Failure error={sessionQuery.error ?? responseError} onRetry={refreshAll} /> : null}
+      {responses.map((response) => (
+        <ResponseCard
+          key={response.id}
+          onPress={() => setSelectedResponse(response)}
+          response={response}
+        />
+      ))}
+      {historyWarning ? (
+        <AppText style={[styles.historyStatus, { color: colors.tertiary }]}>{historyWarning}</AppText>
+      ) : null}
+      {(sessionQuery.hasNextPage || loadMoreLoading) ? (
+        <View style={styles.loadMore}>
+          <Button
+            disabled={responsesLoading || loadMoreLoading}
+            loading={loadMoreLoading}
+            onPress={() => void sessionQuery.fetchNextPage()}
+            tone="secondary">
+            {loadMoreLoading ? 'Loading older responses…' : 'Load older responses'}
+          </Button>
+        </View>
+      ) : null}
+      {historyExhausted && sessions.length > 0 ? (
+        <AppText style={[styles.historyStatus, { color: colors.muted }]}>
+          {historyCapped ? 'Response history limit reached.' : 'No older responses available.'}
+        </AppText>
+      ) : null}
+      {!sessionsLoading && !sessionQuery.error && !responsesLoading && !responseError && responses.length === 0 ? (
         <EmptyState detail={emptyDetail} title={emptyTitle} />
       ) : null}
     </ScrollView>
+  );
+}
+
+function RunDetail({ response, onBack }: { response: AutomationResponse; onBack: () => void }) {
+  const colors = useT3Theme();
+  const status = response.endedAt === null ? 'Running' : 'Completed';
+  return (
+    <View style={styles.runDetail}>
+      <View style={[styles.detailHeader, { borderBottomColor: colors.border }]}>
+        <Button onPress={onBack} tone="plain">Back</Button>
+        <View style={styles.detailHeaderCopy}>
+          <AppText style={styles.detailTitle}>Run details</AppText>
+          <AppText numberOfLines={1} style={[styles.meta, { color: colors.muted }]}>{formatTime(response.timestamp)}</AppText>
+        </View>
+      </View>
+      <ScrollView contentContainerStyle={styles.runDetailContent}>
+        <Card style={styles.runSummary}>
+          <View style={styles.runSummaryHeader}>
+            <View style={styles.runSummaryTitle}>
+              <StatusDot status={status === 'Running' ? 'busy' : 'online'} />
+              <AppText style={styles.responseLabel}>{status} run</AppText>
+            </View>
+            <AppText style={[styles.meta, { color: colors.tertiary }]}>Hermes</AppText>
+          </View>
+          <View style={styles.runMetaGrid}>
+            <RunMeta label="Started" value={formatTime(response.startedAt)} />
+            <RunMeta label="Finished" value={response.endedAt ? formatTime(response.endedAt) : 'In progress'} />
+            <RunMeta label="Messages" value={String(response.messageCount)} />
+            <RunMeta label="Model" value={response.model || 'Default'} />
+          </View>
+          <AppText selectable style={[styles.runID, { color: colors.muted }]}>Run ID: {response.sessionId}</AppText>
+        </Card>
+        <Card style={styles.markdownCard}>
+          <Markdown
+            style={{
+              body: { color: colors.foreground, fontFamily: T3Typography.regular, fontSize: 15, lineHeight: 23 },
+              blockquote: { backgroundColor: colors.subtle, borderLeftColor: colors.primary, borderLeftWidth: 3, color: colors.secondary, paddingHorizontal: 12 },
+              bullet_list: { marginBottom: 10 },
+              code_block: { backgroundColor: colors.code, borderColor: colors.border, borderRadius: T3Radius.small, borderWidth: StyleSheet.hairlineWidth, color: colors.foreground, fontFamily: T3Typography.mono, padding: 12 },
+              code_inline: { backgroundColor: colors.code, borderRadius: 4, color: colors.foreground, fontFamily: T3Typography.mono, paddingHorizontal: 3 },
+              fence: { backgroundColor: colors.code, borderColor: colors.border, borderRadius: T3Radius.small, borderWidth: StyleSheet.hairlineWidth, color: colors.foreground, fontFamily: T3Typography.mono, padding: 12 },
+              heading1: { color: colors.foreground, fontFamily: T3Typography.bold, fontSize: 24, lineHeight: 30, marginBottom: 10, marginTop: 8 },
+              heading2: { color: colors.foreground, fontFamily: T3Typography.bold, fontSize: 20, lineHeight: 26, marginBottom: 8, marginTop: 8 },
+              heading3: { color: colors.foreground, fontFamily: T3Typography.bold, fontSize: 17, lineHeight: 23, marginBottom: 6, marginTop: 8 },
+              link: { color: colors.primary },
+              list_item: { marginBottom: 4 },
+              ordered_list: { marginBottom: 10 },
+              paragraph: { marginBottom: 10 },
+            }}>
+            {response.content}
+          </Markdown>
+        </Card>
+      </ScrollView>
+    </View>
+  );
+}
+
+function RunMeta({ label, value }: { label: string; value: string }) {
+  const colors = useT3Theme();
+  return (
+    <View style={styles.runMetaItem}>
+      <AppText style={[styles.meta, { color: colors.muted }]}>{label}</AppText>
+      <AppText numberOfLines={1} style={styles.runMetaValue}>{value}</AppText>
+    </View>
   );
 }
 
@@ -260,16 +392,28 @@ function JobCard({ job, onPress }: { job: HermesJob; onPress: () => void }) {
   );
 }
 
-function ResponseCard({ response }: { response: AutomationResponse }) {
+function ResponseCard({ response, onPress }: { response: AutomationResponse; onPress: () => void }) {
   const colors = useT3Theme();
+  const status = response.endedAt === null ? 'Running' : 'Completed';
   return (
-    <Card style={styles.responseCard}>
-      <View style={styles.responseHeader}>
-        <AppText style={styles.responseLabel}>Hermes</AppText>
-        <AppText style={[styles.meta, { color: colors.tertiary }]}>{formatTime(response.timestamp)}</AppText>
-      </View>
-      <AppText selectable style={styles.responseText}>{response.content}</AppText>
-    </Card>
+    <Pressable accessibilityRole="button" onPress={onPress} style={({ pressed }) => ({ opacity: pressed ? 0.65 : 1 })}>
+      <Card style={styles.responseCard}>
+        <View style={styles.responseHeader}>
+          <View style={styles.responseTitle}>
+            <StatusDot status={status === 'Running' ? 'busy' : 'online'} />
+            <AppText style={styles.responseLabel}>{status} run</AppText>
+          </View>
+          <AppText style={[styles.meta, { color: colors.tertiary }]}>{formatTime(response.timestamp)}</AppText>
+        </View>
+        <AppText numberOfLines={3} style={styles.responsePreview}>{previewText(response.content)}</AppText>
+        <View style={styles.responseFooter}>
+          <AppText style={[styles.meta, { color: colors.muted }]}>
+            {response.model || 'Default model'} · {response.messageCount} messages
+          </AppText>
+          <AppText style={[styles.meta, { color: colors.primary }]}>View details ›</AppText>
+        </View>
+      </Card>
+    </Pressable>
   );
 }
 
@@ -296,6 +440,15 @@ function Failure({ error, onRetry }: { error: unknown; onRetry: () => void }) {
   );
 }
 
+function dedupeSessions(sessions: HermesSession[]) {
+  const seen = new Set<string>();
+  return sessions.filter((session) => {
+    if (seen.has(session.id)) return false;
+    seen.add(session.id);
+    return true;
+  });
+}
+
 function collectResponses(
   sessions: HermesSession[],
   messageSets: { role: string; content: string; timestamp: number }[][],
@@ -320,12 +473,29 @@ function collectResponses(
     visible.forEach((message, messageIndex) => {
       responses.push({
         id: `${sessions[sessionIndex]?.id ?? sessionIndex}:${message.timestamp}:${messageIndex}`,
+        sessionId: sessions[sessionIndex]?.id ?? String(sessionIndex),
         content: message.content.trim(),
         timestamp: message.timestamp || sessions[sessionIndex]?.started_at || 0,
+        startedAt: sessions[sessionIndex]?.started_at || 0,
+        endedAt: sessions[sessionIndex]?.ended_at,
+        messageCount: sessions[sessionIndex]?.message_count || messages.length,
+        model: sessions[sessionIndex]?.model,
       });
     });
   });
   return responses.sort((left, right) => right.timestamp - left.timestamp);
+}
+
+function previewText(content: string) {
+  return content
+    .replace(/```[\s\S]*?```/g, 'Code block')
+    .replace(/^#{1,6}\s+/gm, '')
+    .replace(/^\s*[-*+]\s+/gm, '• ')
+    .replace(/^\s*\d+\.\s+/gm, '')
+    .replace(/\[([^\]]+)\]\([^)]*\)/g, '$1')
+    .replace(/[*_`~]/g, '')
+    .replace(/\n{2,}/g, '\n')
+    .trim();
 }
 
 function jobID(job: HermesJob) {
@@ -368,7 +538,21 @@ const styles = StyleSheet.create({
   detailHeaderCopy: { flex: 1, paddingRight: 70 },
   detailTitle: { fontFamily: T3Typography.bold, fontSize: 17, lineHeight: 22, textAlign: 'center' },
   responseCard: { gap: T3Spacing.md, padding: T3Spacing.lg },
-  responseHeader: { alignItems: 'baseline', flexDirection: 'row', justifyContent: 'space-between' },
+  responseFooter: { alignItems: 'center', flexDirection: 'row', gap: T3Spacing.sm, justifyContent: 'space-between' },
+  responseHeader: { alignItems: 'center', flexDirection: 'row', justifyContent: 'space-between' },
   responseLabel: { fontFamily: T3Typography.bold, fontSize: 13, lineHeight: 17 },
-  responseText: { fontSize: 15, lineHeight: 22 },
+  responsePreview: { fontSize: 15, lineHeight: 21 },
+  responseTitle: { alignItems: 'center', flexDirection: 'row', gap: T3Spacing.sm },
+  runDetail: { flex: 1 },
+  runDetailContent: { alignSelf: 'center', gap: T3Spacing.md, maxWidth: 720, padding: T3Spacing.xl, paddingBottom: T3Spacing.huge, width: '100%' },
+  runID: { fontFamily: T3Typography.mono, fontSize: 11, lineHeight: 16 },
+  runMetaGrid: { flexDirection: 'row', flexWrap: 'wrap', gap: T3Spacing.lg, marginTop: T3Spacing.sm },
+  runMetaItem: { flexGrow: 1, gap: T3Spacing.xs, minWidth: '42%' },
+  runMetaValue: { fontSize: 14, lineHeight: 19 },
+  runSummary: { gap: T3Spacing.md, padding: T3Spacing.lg },
+  runSummaryHeader: { alignItems: 'center', flexDirection: 'row', justifyContent: 'space-between' },
+  runSummaryTitle: { alignItems: 'center', flexDirection: 'row', gap: T3Spacing.sm },
+  markdownCard: { padding: T3Spacing.lg },
+  loadMore: { alignItems: 'center', paddingVertical: T3Spacing.sm },
+  historyStatus: { fontSize: 12, lineHeight: 16, textAlign: 'center' },
 });
