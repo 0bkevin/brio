@@ -18,6 +18,7 @@ import { AppText, AppTextInput, EmptyState, StatusDot } from '@/components/t3-ui
 import { SPLIT_LAYOUT_MIN_WIDTH, T3Radius, T3Spacing, T3Typography } from '@/constants/t3-theme';
 import { HermesThreadScreen } from '@/features/threads/hermes-thread-screen';
 import { useT3Theme } from '@/hooks/use-t3-theme';
+import { cleanArchivedSearchSnippet, isSafeArchivedUserSnippet } from '@/lib/chat-presentation';
 import {
   getHealth,
   listSessions,
@@ -47,6 +48,7 @@ export function HermesHomeScreen({ connection }: { connection: AgentConnection }
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [search, setSearch] = useState('');
   const [activeSessionId, setActiveSessionId] = useState('new');
+  const [threadSearchQuery, setThreadSearchQuery] = useState('');
   const [conversationEpoch, setConversationEpoch] = useState(0);
   const agentId = environmentId(connection);
   const storedProfiles = useProfileStore((state) => state.activeProfiles);
@@ -114,6 +116,20 @@ export function HermesHomeScreen({ connection }: { connection: AgentConnection }
     () => new Set((searchResults.data?.results ?? []).map((result) => result.session_id)),
     [searchResults.data?.results],
   );
+  const searchHits = useMemo(
+    () => new Map(
+      (searchResults.data?.results ?? [])
+        .filter((result) => (
+          (result.role === 'user' || result.role === 'assistant')
+          && isSafeArchivedUserSnippet(result.snippet)
+        ))
+        .map((result) => [
+          result.session_id,
+          cleanArchivedSearchSnippet(result.snippet),
+        ]),
+    ),
+    [searchResults.data?.results],
+  );
   const visibleSessions = useMemo(() => {
     const all = sessions.data?.sessions ?? [];
     if (!search.trim()) return all;
@@ -147,10 +163,12 @@ export function HermesHomeScreen({ connection }: { connection: AgentConnection }
   const openThread = (sessionId: string) => {
     setHistoryOpen(false);
     setActiveSessionId(sessionId);
+    setThreadSearchQuery(search.trim());
     setConversationEpoch((current) => current + 1);
   };
   const startNewChat = () => {
     setActiveSessionId('new');
+    setThreadSearchQuery('');
     setConversationEpoch((current) => current + 1);
   };
   const openTool = (href: Href) => {
@@ -203,6 +221,7 @@ export function HermesHomeScreen({ connection }: { connection: AgentConnection }
         key={`${activeProfile}:${conversationEpoch}`}
         connection={connection}
         embedded
+        initialSearchQuery={threadSearchQuery}
         onSessionCreated={(sessionId) => setActiveSessionId(sessionId)}
         profile={activeProfile}
         routeSessionId={activeSessionId}
@@ -278,7 +297,11 @@ export function HermesHomeScreen({ connection }: { connection: AgentConnection }
               />
             }
             renderItem={({ item }) => (
-              <SessionRow session={item} onPress={() => openThread(item.id)} />
+              <SessionRow
+                searchSnippet={search.trim() ? searchHits.get(item.id) : undefined}
+                session={item}
+                onPress={() => openThread(item.id)}
+              />
             )}
           />
         </SafeAreaView>
@@ -423,7 +446,15 @@ function MenuRow({ detail, label, onPress }: { detail: string; label: string; on
   );
 }
 
-function SessionRow({ session, onPress }: { session: HermesSession; onPress: () => void }) {
+function SessionRow({
+  onPress,
+  searchSnippet,
+  session,
+}: {
+  onPress: () => void;
+  searchSnippet?: string;
+  session: HermesSession;
+}) {
   const colors = useT3Theme();
   const date = formatRelativeTime(session.started_at);
   const title = session.title?.trim() || 'Untitled conversation';
@@ -446,6 +477,11 @@ function SessionRow({ session, onPress }: { session: HermesSession; onPress: () 
           {session.message_count} {session.message_count === 1 ? 'message' : 'messages'}
           {session.model ? ` · ${session.model}` : ''}
         </AppText>
+        {searchSnippet ? (
+          <AppText numberOfLines={2} style={[styles.sessionMatch, { color: colors.secondary }]}>
+            {searchSnippet}
+          </AppText>
+        ) : null}
       </View>
       <AppText style={{ color: colors.tertiary }}>›</AppText>
     </Pressable>
@@ -525,6 +561,7 @@ const styles = StyleSheet.create({
   sessionTitle: { flex: 1, fontFamily: T3Typography.medium, fontSize: 16 },
   sessionDate: { fontSize: 12, lineHeight: 16 },
   sessionMeta: { fontSize: 13, lineHeight: 17 },
+  sessionMatch: { fontSize: 13, lineHeight: 18, marginTop: 3 },
   retry: { padding: T3Spacing.md },
   settingsContent: {
     gap: T3Spacing.lg,

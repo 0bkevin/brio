@@ -145,6 +145,9 @@ export type HermesSessionCreateResponse = {
 export type HermesMessage = {
   role: string;
   content: string;
+  display_content?: string;
+  display_kind?: string;
+  tool_calls?: unknown[];
   tool_name?: string;
   timestamp: number;
 };
@@ -715,8 +718,15 @@ export function interruptComposerSession(connection: AgentConnection, sessionId:
   });
 }
 
-function parseSessionCursor(cursor?: string) {
-  if (!cursor) return { offset: 0, lastId: undefined as string | undefined };
+type SessionCursor = {
+  offset: number;
+  strategy: 'raw' | 'window';
+  firstId?: string;
+  lastId?: string;
+};
+
+function parseSessionCursor(cursor?: string): SessionCursor {
+  if (!cursor) return { offset: 0, strategy: 'raw' };
   try {
     const parsed = JSON.parse(decodeURIComponent(cursor)) as {
       offset?: number;
@@ -724,14 +734,14 @@ function parseSessionCursor(cursor?: string) {
       firstId?: string;
       lastId?: string;
     };
-    if (Number.isSafeInteger(parsed.offset) && parsed.offset >= 0) {
+    if (typeof parsed.offset === 'number' && Number.isSafeInteger(parsed.offset) && parsed.offset >= 0) {
       return { offset: parsed.offset, strategy: parsed.strategy ?? 'raw', firstId: parsed.firstId, lastId: parsed.lastId };
     }
   } catch {
     // Accept the numeric cursor used by early development builds.
   }
   const offset = Number(cursor);
-  return { offset: Number.isSafeInteger(offset) && offset >= 0 ? offset : 0, strategy: 'raw' as const, firstId: undefined, lastId: undefined };
+  return { offset: Number.isSafeInteger(offset) && offset >= 0 ? offset : 0, strategy: 'raw' };
 }
 
 function makeSessionCursor(offset: number, lastId?: string, firstId?: string, strategy: 'raw' | 'window' = 'raw') {
@@ -965,11 +975,23 @@ export function searchSessions(connection: AgentConnection, query: string, profi
 }
 
 export async function getSessionMessages(connection: AgentConnection, sessionId: string, profile?: string) {
-  const response = await brioFetch<HermesMessageListEnvelope>(
-    connection,
-    scopedPath(`/api/sessions/${encodeURIComponent(sessionId)}/messages`, profile),
-  );
-  return normalizeMessageList(response);
+  const encodedSessionId = encodeURIComponent(sessionId);
+  try {
+    const response = await brioFetch<HermesMessageListEnvelope>(
+      connection,
+      `${scopedPath(`/api/sessions/${encodedSessionId}/display-messages`, profile)}?include_compacted=true&limit=500&order=latest`,
+    );
+    return normalizeMessageList(response);
+  } catch {
+    // Older connectors do not expose the display-history route. Keep their
+    // active transcript usable while the UI recovers archived hits through
+    // Hermes search.
+    const response = await brioFetch<HermesMessageListEnvelope>(
+      connection,
+      `${scopedPath(`/api/sessions/${encodedSessionId}/messages`, profile)}?include_compacted=true&limit=500&order=latest`,
+    );
+    return normalizeMessageList(response);
+  }
 }
 
 export function startRun(
