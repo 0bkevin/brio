@@ -193,6 +193,12 @@ func RoutePath(path string) Route {
 			return Route{Kind: RouteControlForward, Path: mapped}
 		}
 	}
+	if isSessionDisplayMessagesPath(path) {
+		return Route{
+			Kind: RouteControlForward,
+			Path: strings.TrimSuffix(path, "/display-messages") + "/messages",
+		}
+	}
 	if isSessionMessagesPath(path) || isSessionDetailPath(path) || isSessionModelPath(path) {
 		return Route{Kind: RouteForward, Path: path}
 	}
@@ -257,6 +263,10 @@ func splitProfilePrefix(path string) (string, string, bool) {
 
 func isSessionMessagesPath(path string) bool {
 	return isSessionTailPath(path, "messages")
+}
+
+func isSessionDisplayMessagesPath(path string) bool {
+	return isSessionTailPath(path, "display-messages")
 }
 
 func isSessionDetailPath(path string) bool {

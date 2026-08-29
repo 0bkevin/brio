@@ -25,6 +25,7 @@ import {
   filterAgentsForControlSession,
   finalizeConnection,
   getHealth,
+  getSessionMessages,
   listSessions,
   listJobRuns,
   listJobs,
@@ -47,6 +48,55 @@ test('normalizes current Hermes list envelopes without breaking legacy responses
   assert.deepEqual(normalizeSessionList({ sessions }).sessions, sessions);
   assert.deepEqual(normalizeMessageList({ data: messages }).messages, messages);
   assert.deepEqual(normalizeMessageList({ messages }).messages, messages);
+});
+
+test('orders merged compacted history by its real conversation timestamps', () => {
+  const messages = [
+    { role: 'assistant', content: 'Form created', timestamp: 20 },
+    { role: 'user', content: 'Create the form', timestamp: 10 },
+    { role: 'assistant', content: 'Later unrelated task', timestamp: 30 },
+  ];
+
+  assert.deepEqual(
+    normalizeMessageList({ messages }).messages.map((message) => message.content),
+    ['Create the form', 'Form created', 'Later unrelated task'],
+  );
+});
+
+test('loads compacted display history and falls back for older connectors', async () => {
+  const originalFetch = globalThis.fetch;
+  const requestURLs = [];
+  globalThis.fetch = async (input) => {
+    const url = String(input);
+    requestURLs.push(url);
+    if (url.includes('/display-messages')) {
+      return new Response(JSON.stringify({ error: 'not found' }), {
+        status: 404,
+        headers: { 'Content-Type': 'application/json' },
+      });
+    }
+    return new Response(JSON.stringify({ data: [{ role: 'user', content: 'Recovered', timestamp: 1 }] }), {
+      status: 200,
+      headers: { 'Content-Type': 'application/json' },
+    });
+  };
+  try {
+    const result = await getSessionMessages({
+      id: 'direct-1',
+      name: 'Hermes',
+      mode: 'self_hosted',
+      transport: 'direct',
+      status: 'online',
+      capabilities: {},
+      url: 'http://127.0.0.1:8787',
+      token: 'secret',
+    }, 'session 1');
+    assert.equal(result.messages[0].content, 'Recovered');
+    assert.match(requestURLs[0], /session%201\/display-messages\?include_compacted=true&limit=500&order=latest$/);
+    assert.match(requestURLs[1], /session%201\/messages\?include_compacted=true&limit=500&order=latest$/);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
 });
 
 test('keeps automation sessions out of chat history even when Hermes ignores source filters', async () => {

@@ -1,7 +1,9 @@
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { useRouter } from 'expo-router';
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
+import Markdown from 'react-native-markdown-display';
 import {
+  ActivityIndicator,
   FlatList,
   Keyboard,
   KeyboardAvoidingView,
@@ -48,6 +50,14 @@ import {
   type HermesGatewayState,
 } from '@/lib/hermes-gateway';
 import { isNamedProfile } from '@/lib/profiles';
+import {
+  hasMatchingUserMessage,
+  runActivityLabel,
+  toVisibleConversationMessage,
+  toolActivityLabel,
+  upsertChatActivity,
+  type ChatActivity,
+} from '@/lib/chat-presentation';
 import {
   buildRuntimeModelOptions,
   modelIncompatibilities,
@@ -112,6 +122,7 @@ export function HermesThreadScreen({
   connection,
   embedded = false,
   initialModelOverride,
+  initialSearchQuery = '',
   onSessionCreated,
   profile,
   routeSessionId,
@@ -119,6 +130,7 @@ export function HermesThreadScreen({
   connection: AgentConnection;
   embedded?: boolean;
   initialModelOverride?: ChatModelOverride;
+  initialSearchQuery?: string;
   onSessionCreated?: (sessionId: string) => void;
   profile: string;
   routeSessionId: string;
@@ -128,6 +140,8 @@ export function HermesThreadScreen({
   const router = useRouter();
   const queryClient = useQueryClient();
   const listRef = useRef<FlatList<FeedItem>>(null);
+  const stickToBottomRef = useRef(!initialSearchQuery.trim());
+  const handledSearchRef = useRef('');
   const composerKey = `${connection.id}:${profile}:${routeSessionId}`;
   const [generatedSessionId] = useState(createDraftSessionId);
   const persistedDraftSessionId = useComposerStore((state) => state.sessionIds[composerKey]);
@@ -145,7 +159,7 @@ export function HermesThreadScreen({
   const gatewaySessionRef = useRef<{ runtime: string; stored: string } | null>(null);
   const [gatewayState, setGatewayState] = useState<HermesGatewayState>('connecting');
   const [gatewayRun, setGatewayRun] = useState<HermesRunStatus | null>(null);
-  const [gatewayActivity, setGatewayActivity] = useState<FeedItem[]>([]);
+  const [gatewayActivity, setGatewayActivity] = useState<ChatActivity[]>([]);
   const [gatewayApproval, setGatewayApproval] = useState<GatewayApproval | null>(null);
   const [gatewayInput, setGatewayInput] = useState<GatewayInputRequest | null>(null);
   const [keyboardInset, setKeyboardInset] = useState(0);
@@ -213,6 +227,12 @@ export function HermesThreadScreen({
     queryFn: () => getSessionMessages(connection, sessionId, profile),
     enabled: routeSessionId !== 'new' || Boolean(runId),
   });
+  const visibleStoredMessages = useMemo(
+    () => (messages.data?.messages ?? [])
+      .map(toVisibleConversationMessage)
+      .filter((message): message is HermesMessage => message !== null),
+    [messages.data?.messages],
+  );
   const modelOptions = useQuery({
     queryKey: ['model-options', connection.id, connection.url, profile],
     queryFn: () => getModelOptions(connection, false, profile),
@@ -434,37 +454,25 @@ export function HermesThreadScreen({
           normalizeLiveUsage(event.payload?.usage ?? event.payload),
         );
       } else if (event.type === 'reasoning.delta' || event.type === 'thinking.delta') {
-        const delta = gatewayPayloadText(event.payload);
-        if (delta) {
-          setGatewayActivity((current) => upsertGatewayActivity(current, {
-            id: 'gateway-reasoning',
-            role: 'tool',
-            content: `${current.find((item) => item.id === 'gateway-reasoning')?.content ?? ''}${delta}`,
-            tool_name: 'Reasoning',
-            timestamp: now,
-          }));
-        }
+        setGatewayActivity((current) => upsertChatActivity(current, {
+          id: 'gateway-reasoning',
+          label: 'Planning the next step',
+          status: 'running',
+        }));
       } else if (event.type === 'reasoning.available') {
-        const text = gatewayPayloadText(event.payload);
-        if (text) {
-          setGatewayActivity((current) => upsertGatewayActivity(current, {
-            id: 'gateway-reasoning',
-            role: 'tool',
-            content: text,
-            tool_name: 'Reasoning',
-            timestamp: now,
-          }));
-        }
+        setGatewayActivity((current) => upsertChatActivity(current, {
+          id: 'gateway-reasoning',
+          label: 'Planning complete',
+          status: 'complete',
+        }));
       } else if (event.type === 'tool.start' || event.type === 'tool.complete') {
         const toolID = String(event.payload?.tool_id ?? event.seq ?? 'current');
         const toolName = String(event.payload?.name ?? 'Tool');
-        const content = gatewayToolText(event.payload, event.type === 'tool.complete');
-        setGatewayActivity((current) => upsertGatewayActivity(current, {
+        const complete = event.type === 'tool.complete';
+        setGatewayActivity((current) => upsertChatActivity(current, {
           id: `gateway-tool-${toolID}`,
-          role: 'tool',
-          content,
-          tool_name: toolName,
-          timestamp: now,
+          label: toolActivityLabel(toolName, complete),
+          status: complete ? 'complete' : 'running',
         }));
       } else if (event.type === 'error') {
         setGatewayActivity([]);
@@ -866,12 +874,12 @@ export function HermesThreadScreen({
     },
   });
 
-  const feed: FeedItem[] = (messages.data?.messages ?? []).map((message, index) => ({
-    ...message,
-    id: `stored-${index}-${message.timestamp}`,
-  }));
-  const latestStored = feed.length > 0 ? feed[feed.length - 1]?.content : undefined;
-  if (optimisticPrompt && latestStored !== optimisticPrompt.content) {
+  const feed: FeedItem[] = visibleStoredMessages
+    .map((message, index) => ({
+      ...message,
+      id: `stored-${index}-${message.timestamp}`,
+    }));
+  if (optimisticPrompt && !hasMatchingUserMessage(feed, optimisticPrompt.content)) {
     feed.push({
       id: 'optimistic-user',
       role: 'user',
@@ -882,7 +890,6 @@ export function HermesThreadScreen({
   immediateMessages.forEach((message) => {
     if (!feed.some((item) => item.content === message.content)) feed.push(message);
   });
-  gatewayActivity.forEach((message) => feed.push(message));
   if (currentRun?.output && !feed.some((message) => message.content === currentRun.output)) {
     feed.push({
       id: 'current-output',
@@ -891,6 +898,21 @@ export function HermesThreadScreen({
       timestamp: currentRun.updated_at ?? 0,
     });
   }
+  const normalizedInitialSearch = initialSearchQuery.trim().toLocaleLowerCase();
+  useEffect(() => {
+    if (!normalizedInitialSearch || handledSearchRef.current === normalizedInitialSearch) return;
+    const index = feed.findIndex((message) => (
+      message.role === 'user'
+      && message.content.toLocaleLowerCase().includes(normalizedInitialSearch)
+    ));
+    if (index < 0) return;
+    handledSearchRef.current = normalizedInitialSearch;
+    stickToBottomRef.current = false;
+    const timer = setTimeout(() => {
+      listRef.current?.scrollToIndex({ animated: false, index, viewPosition: 0.2 });
+    }, 120);
+    return () => clearTimeout(timer);
+  }, [feed, normalizedInitialSearch]);
 
   const controlsThread: ChatThread = {
     id: sessionId,
@@ -1007,8 +1029,40 @@ export function HermesThreadScreen({
                 title="What should Hermes work on?"
               />
             }
-            onContentSizeChange={() => listRef.current?.scrollToEnd({ animated: false })}
-            renderItem={({ item }) => <MessageBubble message={item} />}
+            onContentSizeChange={() => {
+              if (stickToBottomRef.current) listRef.current?.scrollToEnd({ animated: false });
+            }}
+            onScroll={(event) => {
+              const { contentOffset, contentSize, layoutMeasurement } = event.nativeEvent;
+              stickToBottomRef.current = (
+                contentOffset.y + layoutMeasurement.height >= contentSize.height - 96
+              );
+            }}
+            onScrollBeginDrag={() => {
+              stickToBottomRef.current = false;
+            }}
+            onScrollToIndexFailed={({ averageItemLength, index }) => {
+              listRef.current?.scrollToOffset({
+                animated: false,
+                offset: Math.max(0, averageItemLength * index),
+              });
+            }}
+            scrollEventThrottle={32}
+            ListFooterComponent={
+              active && gatewayActivity.length > 0
+                ? <LiveActivityCard items={gatewayActivity} />
+                : null
+            }
+            renderItem={({ item }) => (
+              <MessageBubble
+                highlighted={Boolean(
+                  normalizedInitialSearch
+                  && item.role === 'user'
+                  && item.content.toLocaleLowerCase().includes(normalizedInitialSearch)
+                )}
+                message={item}
+              />
+            )}
           />
         )}
 
@@ -1037,9 +1091,10 @@ export function HermesThreadScreen({
                 ? 'Reconnecting to Hermes'
                 : gatewayState === 'synchronizing'
                   ? 'Synchronizing missed events'
-                  : currentRun?.last_event
-                    ? humanizeEvent(currentRun.last_event)
-                    : 'Hermes is working'}
+                  : runActivityLabel(
+                      typeof currentRun?.last_event === 'string' ? currentRun.last_event : undefined,
+                      gatewayActivity.at(-1),
+                    )}
             </AppText>
             <Pressable disabled={stop.isPending} onPress={() => stop.mutate()}>
               <AppText style={[styles.stopLabel, { color: colors.danger }]}>Stop</AppText>
@@ -1220,10 +1275,9 @@ function QueueAction({
   );
 }
 
-function MessageBubble({ message }: { message: HermesMessage }) {
+function MessageBubble({ highlighted, message }: { highlighted: boolean; message: FeedItem }) {
   const colors = useT3Theme();
   const user = message.role === 'user';
-  const tool = Boolean(message.tool_name) || message.role === 'tool';
   return (
     <View style={[styles.messageRow, user && styles.userMessageRow]}>
       <View
@@ -1231,26 +1285,46 @@ function MessageBubble({ message }: { message: HermesMessage }) {
           styles.bubble,
           user
             ? { backgroundColor: colors.userBubble }
-            : tool
-              ? { backgroundColor: colors.code, borderColor: colors.border, borderWidth: StyleSheet.hairlineWidth }
-              : { backgroundColor: 'transparent' },
+            : { backgroundColor: 'transparent' },
           user && styles.userBubble,
         ]}>
-        {message.tool_name ? (
-          <AppText style={[styles.toolName, { color: user ? colors.userBubbleForeground : colors.muted }]}>
-            {message.tool_name}
-          </AppText>
-        ) : null}
-        <AppText
-          selectable
-          style={[
-            styles.messageText,
-            { color: user ? colors.userBubbleForeground : colors.foreground },
-            tool && { fontFamily: T3Typography.mono, fontSize: 13, lineHeight: 19 },
-          ]}>
-          {message.content || (tool ? 'Tool completed' : '')}
-        </AppText>
+        {user ? (
+          <>
+            {highlighted ? (
+              <AppText style={[styles.searchMatchLabel, { color: colors.userBubbleForeground }]}>
+                Search match
+              </AppText>
+            ) : null}
+            <AppText selectable style={[styles.messageText, { color: colors.userBubbleForeground }]}>
+              {message.content}
+            </AppText>
+          </>
+        ) : (
+          <Markdown style={chatMarkdownStyles(colors)}>{message.content}</Markdown>
+        )}
       </View>
+    </View>
+  );
+}
+
+function LiveActivityCard({ items }: { items: ChatActivity[] }) {
+  const colors = useT3Theme();
+  return (
+    <View
+      accessibilityLabel="Hermes live activity"
+      style={[styles.activityCard, { backgroundColor: colors.code, borderColor: colors.border }]}>
+      <View style={styles.activityHeader}>
+        <ActivityIndicator color={colors.primary} size="small" />
+        <AppText style={styles.activityTitle}>Hermes is working</AppText>
+      </View>
+      {items.map((item) => (
+        <View key={item.id} style={styles.activityRow}>
+          <AppText style={[styles.activityIcon, { color: item.status === 'complete' ? colors.success : colors.warning }]}>
+            {item.status === 'complete' ? '✓' : '•'}
+          </AppText>
+          <AppText style={[styles.activityLabel, { color: colors.secondary }]}>{item.label}</AppText>
+        </View>
+      ))}
     </View>
   );
 }
@@ -1409,13 +1483,6 @@ function normalizeGatewayInput(
   return { kind: 'clarify', requestId, prompt: '', questions, questionIndex };
 }
 
-function humanizeEvent(event: string) {
-  return event
-    .replaceAll('.', ' ')
-    .replaceAll('_', ' ')
-    .replace(/^./, (letter) => letter.toUpperCase());
-}
-
 function gatewayPayloadText(payload?: Record<string, unknown>) {
   for (const key of ['text', 'message', 'summary', 'error']) {
     const value = payload?.[key];
@@ -1424,20 +1491,22 @@ function gatewayPayloadText(payload?: Record<string, unknown>) {
   return '';
 }
 
-function gatewayToolText(payload: Record<string, unknown> | undefined, complete: boolean) {
-  for (const key of ['summary', 'context', 'result_text', 'inline_diff']) {
-    const value = payload?.[key];
-    if (typeof value === 'string' && value.trim()) return value;
-  }
-  return complete ? 'Completed' : 'Running…';
-}
-
-function upsertGatewayActivity(current: FeedItem[], next: FeedItem) {
-  const index = current.findIndex((item) => item.id === next.id);
-  if (index < 0) return [...current, next];
-  const updated = [...current];
-  updated[index] = next;
-  return updated;
+function chatMarkdownStyles(colors: ReturnType<typeof useT3Theme>) {
+  return {
+    body: { color: colors.foreground, fontFamily: T3Typography.regular, fontSize: 15, lineHeight: 23 },
+    blockquote: { backgroundColor: colors.subtle, borderLeftColor: colors.primary, borderLeftWidth: 3, color: colors.secondary, paddingHorizontal: 12 },
+    bullet_list: { marginBottom: 8 },
+    code_block: { backgroundColor: colors.code, borderColor: colors.border, borderRadius: T3Radius.small, borderWidth: StyleSheet.hairlineWidth, color: colors.foreground, fontFamily: T3Typography.mono, padding: 12 },
+    code_inline: { backgroundColor: colors.code, borderRadius: 4, color: colors.foreground, fontFamily: T3Typography.mono, paddingHorizontal: 3 },
+    fence: { backgroundColor: colors.code, borderColor: colors.border, borderRadius: T3Radius.small, borderWidth: StyleSheet.hairlineWidth, color: colors.foreground, fontFamily: T3Typography.mono, padding: 12 },
+    heading1: { color: colors.foreground, fontFamily: T3Typography.bold, fontSize: 22, lineHeight: 28, marginBottom: 8, marginTop: 6 },
+    heading2: { color: colors.foreground, fontFamily: T3Typography.bold, fontSize: 19, lineHeight: 25, marginBottom: 7, marginTop: 6 },
+    heading3: { color: colors.foreground, fontFamily: T3Typography.bold, fontSize: 17, lineHeight: 23, marginBottom: 6, marginTop: 6 },
+    link: { color: colors.primary },
+    list_item: { marginBottom: 3 },
+    ordered_list: { marginBottom: 8 },
+    paragraph: { marginBottom: 8 },
+  };
 }
 
 function displayPrompt(prompt: QueuedPrompt) {
@@ -1478,8 +1547,22 @@ const styles = StyleSheet.create({
   userMessageRow: { alignItems: 'flex-end' },
   bubble: { borderRadius: T3Radius.medium, maxWidth: '88%', paddingHorizontal: 0, paddingVertical: 2 },
   userBubble: { borderBottomRightRadius: 5, paddingHorizontal: 14, paddingVertical: 10 },
+  searchMatchLabel: { fontFamily: T3Typography.bold, fontSize: 11, lineHeight: 15, opacity: 0.75 },
   messageText: { fontSize: 15, lineHeight: 23 },
-  toolName: { fontFamily: T3Typography.bold, fontSize: 11, lineHeight: 15, textTransform: 'uppercase' },
+  activityCard: {
+    alignSelf: 'flex-start',
+    borderRadius: T3Radius.medium,
+    borderWidth: StyleSheet.hairlineWidth,
+    gap: T3Spacing.xs,
+    maxWidth: '88%',
+    paddingHorizontal: T3Spacing.md,
+    paddingVertical: T3Spacing.sm,
+  },
+  activityHeader: { alignItems: 'center', flexDirection: 'row', gap: T3Spacing.sm, marginBottom: 2 },
+  activityTitle: { fontFamily: T3Typography.bold, fontSize: 13, lineHeight: 18 },
+  activityRow: { alignItems: 'center', flexDirection: 'row', gap: T3Spacing.sm },
+  activityIcon: { fontFamily: T3Typography.bold, fontSize: 13, lineHeight: 18, width: 12 },
+  activityLabel: { flex: 1, fontSize: 13, lineHeight: 18 },
   composerShell: { paddingHorizontal: T3Spacing.lg, paddingVertical: 6 },
   composer: {
     alignSelf: 'center',
