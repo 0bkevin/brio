@@ -120,6 +120,7 @@ function createDraftSessionId() {
 
 export function HermesThreadScreen({
   connection,
+  composerVisible = true,
   embedded = false,
   initialModelOverride,
   initialSearchQuery = '',
@@ -128,6 +129,7 @@ export function HermesThreadScreen({
   routeSessionId,
 }: {
   connection: AgentConnection;
+  composerVisible?: boolean;
   embedded?: boolean;
   initialModelOverride?: ChatModelOverride;
   initialSearchQuery?: string;
@@ -1143,6 +1145,7 @@ export function HermesThreadScreen({
               canRedo={Boolean(revisions?.future.length)}
               canUndo={Boolean(revisions?.past.length)}
               connection={connection}
+              visible={composerVisible}
               draft={draft}
               forceExpanded={modelPickerOpen}
               history={history}

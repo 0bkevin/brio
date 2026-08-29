@@ -30,6 +30,12 @@ npm ci
 npm run web
 ```
 
+Voice prompts use the iOS and Android system speech-recognition services, which
+may use network transcription depending on the device and its settings. Because
+that support includes native code, this app cannot run in Expo Go; test it in a
+development build with `npm run ios` or `npm run android`. On web, dictation is
+shown when the browser provides the Web Speech API.
+
 ## Validate
 
 From the repo root:

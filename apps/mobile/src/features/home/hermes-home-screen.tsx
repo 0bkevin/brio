@@ -219,6 +219,7 @@ export function HermesHomeScreen({ connection }: { connection: AgentConnection }
 
       <HermesThreadScreen
         key={`${activeProfile}:${conversationEpoch}`}
+        composerVisible={!historyOpen && !settingsOpen}
         connection={connection}
         embedded
         initialSearchQuery={threadSearchQuery}
