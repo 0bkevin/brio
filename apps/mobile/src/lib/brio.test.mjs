@@ -50,6 +50,19 @@ test('normalizes current Hermes list envelopes without breaking legacy responses
   assert.deepEqual(normalizeMessageList({ messages }).messages, messages);
 });
 
+test('orders merged compacted history by its real conversation timestamps', () => {
+  const messages = [
+    { role: 'assistant', content: 'Form created', timestamp: 20 },
+    { role: 'user', content: 'Create the form', timestamp: 10 },
+    { role: 'assistant', content: 'Later unrelated task', timestamp: 30 },
+  ];
+
+  assert.deepEqual(
+    normalizeMessageList({ messages }).messages.map((message) => message.content),
+    ['Create the form', 'Form created', 'Later unrelated task'],
+  );
+});
+
 test('loads compacted display history and falls back for older connectors', async () => {
   const originalFetch = globalThis.fetch;
   const requestURLs = [];

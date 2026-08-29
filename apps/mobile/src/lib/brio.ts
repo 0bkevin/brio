@@ -184,7 +184,15 @@ export function normalizeSessionList(response: HermesSessionListEnvelope) {
 }
 
 export function normalizeMessageList(response: HermesMessageListEnvelope) {
-  return { ...response, messages: response.messages ?? response.data ?? [] };
+  const messages = response.messages ?? response.data ?? [];
+  // Hermes' display-history endpoint can merge active and compacted rows in
+  // storage order instead of conversation order. Only reorder complete
+  // timestamped transcripts so legacy payloads without timestamps retain the
+  // exact order supplied by their server.
+  const orderedMessages = messages.every((message) => Number.isFinite(Number(message.timestamp)))
+    ? [...messages].sort((left, right) => Number(left.timestamp) - Number(right.timestamp))
+    : messages;
+  return { ...response, messages: orderedMessages };
 }
 
 type HermesControlFileEntry = Omit<Partial<HermesFileEntry>, 'size'> & {

@@ -473,9 +473,8 @@ function SessionRow({
           </AppText>
           <AppText style={[styles.sessionDate, { color: colors.tertiary }]}>{date}</AppText>
         </View>
-        <AppText numberOfLines={1} style={[styles.sessionMeta, { color: colors.muted }]}>
-          {session.message_count} {session.message_count === 1 ? 'message' : 'messages'}
-          {session.model ? ` · ${session.model}` : ''}
+        <AppText numberOfLines={1} style={[styles.sessionMeta, { color: colors.muted }]}> 
+          {session.model || 'Conversation'}
         </AppText>
         {searchSnippet ? (
           <AppText numberOfLines={2} style={[styles.sessionMatch, { color: colors.secondary }]}>
