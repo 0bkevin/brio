@@ -58,7 +58,14 @@
         {
           "photosPermission": "Allow Brio to attach photos as Hermes context.",
           "cameraPermission": "Allow Brio to take a photo and attach it as Hermes context.",
-          "microphonePermission": false
+          "microphonePermission": "Allow Brio to use the microphone for voice prompts."
+        }
+      ],
+      [
+        "expo-speech-recognition",
+        {
+          "microphonePermission": "Allow Brio to use the microphone for voice prompts.",
+          "speechRecognitionPermission": "Allow Brio to turn your speech into editable prompt text."
         }
       ],
       [

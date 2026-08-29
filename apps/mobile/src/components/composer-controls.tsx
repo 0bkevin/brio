@@ -1,8 +1,11 @@
 import { useQuery } from '@tanstack/react-query';
 import * as DocumentPicker from 'expo-document-picker';
 import * as ImagePicker from 'expo-image-picker';
+import { useIsFocused } from 'expo-router';
+import { SymbolView } from 'expo-symbols';
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 import {
+  AppState,
   Modal,
   Platform,
   Pressable,
@@ -36,6 +39,22 @@ import {
 } from '@/lib/brio';
 import { applyCompletion, completionToken, composerContentFromSharedPayloads } from '@/lib/composer-model';
 import { uploadComposerAttachment, type AttachmentSource } from '@/lib/composer';
+import {
+  abortSpeechRecognition,
+  claimSpeechRecognition,
+  isSpeechRecognitionAvailable,
+  ownsSpeechRecognition,
+  releaseSpeechRecognitionBeforeStart,
+  requestSpeechRecognitionPermissions,
+  startSpeechRecognition,
+  stopSpeechRecognition,
+} from '@/lib/speech-recognition-controller';
+import {
+  appendSpeechTranscript,
+  mergeSpeechSegment,
+  normalizeSpeechRecognitionLocale,
+  speechRecognitionErrorMessage,
+} from '@/lib/speech-recognition-model';
 import type { ComposerAttachment, PromptDeliveryMode } from '@/state/composer-store-model';
 
 type UploadState = {
@@ -45,6 +64,8 @@ type UploadState = {
   controller: AbortController;
   error?: string;
 };
+
+type SpeechState = 'idle' | 'starting' | 'listening' | 'stopping';
 
 const COMPOSER_MOTION = {
   duration: 230,
@@ -64,6 +85,7 @@ export function ComposerControls({
   hydrated,
   keyboardVisible,
   forceExpanded = false,
+  visible = true,
   modelControl,
   onAddAttachment,
   onDraftChange,
@@ -85,6 +107,7 @@ export function ComposerControls({
   hydrated: boolean;
   keyboardVisible?: boolean;
   forceExpanded?: boolean;
+  visible?: boolean;
   modelControl?: ReactNode;
   onAddAttachment: (attachment: ComposerAttachment) => Promise<void>;
   onDraftChange: (text: string) => void;
@@ -98,9 +121,14 @@ export function ComposerControls({
 }) {
   const colors = useTheme();
   const incomingShare = useIncomingShareContext();
+  const isFocused = useIsFocused();
   const processedShare = useRef<string | null>(null);
   const inputRef = useRef<TextInput>(null);
   const previousKeyboardVisible = useRef(keyboardVisible);
+  const speechBaseDraft = useRef('');
+  const committedSpeech = useRef('');
+  const speechOwner = useRef(Symbol('composer-speech-owner'));
+  const speechRequest = useRef(0);
   const [pickerOpen, setPickerOpen] = useState(false);
   const [historyOpen, setHistoryOpen] = useState(false);
   const [commandsOpen, setCommandsOpen] = useState(false);
@@ -108,6 +136,7 @@ export function ComposerControls({
   const [inputHeight, setInputHeight] = useState(42);
   const [uploads, setUploads] = useState<UploadState[]>([]);
   const [error, setError] = useState('');
+  const [speechState, setSpeechState] = useState<SpeechState>('idle');
   const token = completionToken(draft);
 
   const capabilities = useQuery({
@@ -130,17 +159,21 @@ export function ComposerControls({
     enabled: commandsOpen,
     staleTime: 60_000,
   });
+  const speechActive = speechState !== 'idle';
+  const hasPrompt = Boolean(draft.trim()) || attachments.length > 0;
   const canSend =
     hydrated &&
     !sendDisabled &&
-    (Boolean(draft.trim()) || attachments.length > 0) &&
-    uploads.length === 0;
+    hasPrompt &&
+    uploads.length === 0 &&
+    !speechActive;
   const expanded =
     forceExpanded ||
     inputFocused ||
     pickerOpen ||
     historyOpen ||
     commandsOpen ||
+    speechActive ||
     attachments.length > 0 ||
     uploads.length > 0 ||
     Boolean(error) ||
@@ -180,6 +213,37 @@ export function ComposerControls({
     }, Platform.OS === 'android' ? 180 : 0);
     return () => clearTimeout(timer);
   }, [inputFocused, keyboardVisible]);
+
+  useEffect(() => {
+    if (isFocused) return;
+    speechRequest.current += 1;
+    abortSpeechRecognition(speechOwner.current);
+    if (!ownsSpeechRecognition(speechOwner.current)) setSpeechState('idle');
+  }, [isFocused]);
+
+  useEffect(() => {
+    if (visible) return;
+    speechRequest.current += 1;
+    abortSpeechRecognition(speechOwner.current);
+    if (!ownsSpeechRecognition(speechOwner.current)) setSpeechState('idle');
+  }, [visible]);
+
+  useEffect(() => {
+    const subscription = AppState.addEventListener('change', (state) => {
+      // iOS permission sheets can transiently report `inactive`; only a real
+      // background transition should cancel the permission/start sequence.
+      if (state !== 'background') return;
+      speechRequest.current += 1;
+      abortSpeechRecognition(speechOwner.current);
+      if (!ownsSpeechRecognition(speechOwner.current)) setSpeechState('idle');
+    });
+    return () => subscription.remove();
+  }, []);
+
+  useEffect(() => () => {
+    speechRequest.current += 1;
+    abortSpeechRecognition(speechOwner.current);
+  }, [connection.id, profile, sessionId]);
 
   const uploadSources = useCallback(async (sources: AttachmentSource[]) => {
     setPickerOpen(false);
@@ -230,7 +294,7 @@ export function ComposerControls({
   }, [attachments, capabilities.data, connection, onAddAttachment, profile, sessionId]);
 
   useEffect(() => {
-    if (incomingShare.isResolving || incomingShare.error || incomingShare.sharedPayloads.length === 0) return;
+    if (speechActive || incomingShare.isResolving || incomingShare.error || incomingShare.sharedPayloads.length === 0) return;
     const payloads = incomingShare.resolvedSharedPayloads.length
       ? incomingShare.resolvedSharedPayloads
       : incomingShare.sharedPayloads;
@@ -244,7 +308,7 @@ export function ComposerControls({
       incomingShare.consumeSharedPayloads();
       if (!succeeded) setError('Some shared files could not be imported. Share them again to retry.');
     })();
-  }, [draft, incomingShare, onDraftChange, uploadSources]);
+  }, [draft, incomingShare, onDraftChange, speechActive, uploadSources]);
 
   useEffect(() => {
     if (Platform.OS !== 'web' || typeof document === 'undefined') return;
@@ -317,10 +381,87 @@ export function ComposerControls({
     if (focused === inputFocused) return;
     setInputFocused(focused);
   };
+  const startSpeech = async () => {
+    const owner = speechOwner.current;
+    const request = ++speechRequest.current;
+    setError('');
+    inputRef.current?.blur();
+    setInputFocused(false);
+    setSpeechState('starting');
+    try {
+      if (!isSpeechRecognitionAvailable()) {
+        setError('Speech recognition is not available on this device or browser.');
+        setSpeechState('idle');
+        return;
+      }
+      const permission = await requestSpeechRecognitionPermissions();
+      if (request !== speechRequest.current) return;
+      if (!permission.granted) {
+        setError('Microphone and speech recognition access are required. Enable them in device settings.');
+        setSpeechState('idle');
+        return;
+      }
+      if (AppState.currentState !== 'active' || !visible || !isFocused) {
+        setSpeechState('idle');
+        return;
+      }
+      const claimed = claimSpeechRecognition(owner, {
+        onStart: () => setSpeechState('listening'),
+        onResult: (event) => {
+          const segment = event.results[0]?.transcript ?? '';
+          if (!segment.trim()) return;
+          if (event.isFinal) committedSpeech.current = mergeSpeechSegment(committedSpeech.current, segment);
+          const transcript = event.isFinal
+            ? committedSpeech.current
+            : mergeSpeechSegment(committedSpeech.current, segment);
+          onDraftChange(appendSpeechTranscript(speechBaseDraft.current, transcript));
+        },
+        onNoMatch: () => setError("I didn't hear any speech. Tap the mic and try again."),
+        onError: (event) => {
+          const message = speechRecognitionErrorMessage(event.error);
+          if (message) setError(message);
+          setSpeechState('stopping');
+        },
+        onEnd: () => setSpeechState('idle'),
+      });
+      if (!claimed) {
+        setError('Dictation is already active in another composer.');
+        setSpeechState('idle');
+        return;
+      }
+      speechBaseDraft.current = draft;
+      committedSpeech.current = '';
+      startSpeechRecognition(owner, {
+        addsPunctuation: true,
+        continuous: false,
+        interimResults: true,
+        lang: normalizeSpeechRecognitionLocale(Intl.DateTimeFormat().resolvedOptions().locale),
+        maxAlternatives: 1,
+      });
+    } catch (reason) {
+      releaseSpeechRecognitionBeforeStart(owner);
+      setSpeechState('idle');
+      setError(reason instanceof Error ? reason.message : 'Could not start speech recognition.');
+    }
+  };
+  const stopSpeech = () => {
+    if (speechState === 'starting') {
+      speechRequest.current += 1;
+      abortSpeechRecognition(speechOwner.current);
+      if (!ownsSpeechRecognition(speechOwner.current)) setSpeechState('idle');
+      return;
+    }
+    if (speechState === 'stopping') {
+      abortSpeechRecognition(speechOwner.current);
+      return;
+    }
+    setSpeechState('stopping');
+    stopSpeechRecognition(speechOwner.current);
+  };
 
   return (
     <>
-      {suggestions.data?.items.length && token ? (
+      {!speechActive && suggestions.data?.items.length && token ? (
         <ScrollView keyboardShouldPersistTaps="handled" style={[styles.completions, { backgroundColor: colors.panelStrong, borderColor: colors.border }]}>
           {suggestions.data.items.slice(0, 12).map((item) => (
             <Pressable key={`${item.text}:${item.meta}`} onPress={() => onDraftChange(applyCompletion(draft, token, item.text))} style={styles.completionRow}>
@@ -389,6 +530,7 @@ export function ComposerControls({
           </Animated.View>
           <TextInput
             accessibilityLabel="Ask Hermes anything"
+            editable={!speechActive}
             maxLength={20000}
             multiline
             onBlur={() => {
@@ -403,7 +545,7 @@ export function ComposerControls({
               setInputHeight(nextHeight);
             }}
             onFocus={() => setFocused(true)}
-            placeholder={active ? 'Ask a follow-up…' : 'Ask Hermes anything…'}
+            placeholder={speechActive ? 'Listening…' : active ? 'Ask a follow-up…' : 'Ask Hermes anything…'}
             placeholderTextColor={colors.textTertiary}
             ref={inputRef}
             scrollEnabled={expanded && inputHeight >= 96}
@@ -420,24 +562,28 @@ export function ComposerControls({
           <Animated.View
             pointerEvents={expanded ? 'none' : 'auto'}
             style={[styles.compactRightSlot, compactRightStyle]}>
-            <Pressable
-              accessibilityElementsHidden={expanded}
-              accessibilityLabel={active ? 'Queue message' : 'Send message'}
-              accessible={!expanded}
-              disabled={!canSend}
-              onPress={() => onSend('queue')}
-              style={({ pressed }) => [
-                styles.sendPressable,
-                {
-                  backgroundColor: canSend ? colors.accent : colors.backgroundSelected,
-                  opacity: pressed ? 0.72 : 1,
-                },
-              ]}>
-              <ThemedText
-                style={{ color: canSend ? colors.accentText : colors.textDisabled, fontSize: 20 }}>
-                ↑
-              </ThemedText>
-            </Pressable>
+            {!hasPrompt && uploads.length === 0 ? (
+              <VoiceAction compact hidden={expanded} onPress={() => void startSpeech()} state={speechState} />
+            ) : (
+              <Pressable
+                accessibilityElementsHidden={expanded}
+                accessibilityLabel={active ? 'Queue message' : 'Send message'}
+                accessible={!expanded}
+                disabled={!canSend}
+                onPress={() => onSend('queue')}
+                style={({ pressed }) => [
+                  styles.sendPressable,
+                  {
+                    backgroundColor: canSend ? colors.accent : colors.backgroundSelected,
+                    opacity: pressed ? 0.72 : 1,
+                  },
+                ]}>
+                <ThemedText
+                  style={{ color: canSend ? colors.accentText : colors.textDisabled, fontSize: 20 }}>
+                  ↑
+                </ThemedText>
+              </Pressable>
+            )}
           </Animated.View>
         </View>
         {expanded ? (
@@ -448,12 +594,16 @@ export function ComposerControls({
               keyboardShouldPersistTaps="handled"
               style={styles.toolbarScroller}
               showsHorizontalScrollIndicator={false}>
-              <ToolbarAction bare label="+" accessibilityLabel="Attach context" onPress={() => setPickerOpen(true)} />
-              {modelControl}
-              <ToolbarAction accessibilityLabel="Commands" label="/" onPress={() => setCommandsOpen(true)} />
-              {history.length > 0 ? <ToolbarAction accessibilityLabel="Prompt history" label="↶" onPress={() => setHistoryOpen(true)} /> : null}
-              {canUndo ? <ToolbarAction label="Undo" onPress={onUndo} /> : null}
-              {canRedo ? <ToolbarAction label="Redo" onPress={onRedo} /> : null}
+              <ToolbarAction bare disabled={speechActive} label="+" accessibilityLabel="Attach context" onPress={() => setPickerOpen(true)} />
+              <VoiceAction
+                onPress={speechActive ? stopSpeech : () => void startSpeech()}
+                state={speechState}
+              />
+              {speechActive ? null : modelControl}
+              <ToolbarAction disabled={speechActive} accessibilityLabel="Commands" label="/" onPress={() => setCommandsOpen(true)} />
+              {history.length > 0 ? <ToolbarAction disabled={speechActive} accessibilityLabel="Prompt history" label="↶" onPress={() => setHistoryOpen(true)} /> : null}
+              {canUndo ? <ToolbarAction disabled={speechActive} label="Undo" onPress={onUndo} /> : null}
+              {canRedo ? <ToolbarAction disabled={speechActive} label="Redo" onPress={onRedo} /> : null}
               {active ? <ToolbarAction disabled={!canSend} label="Redirect" onPress={() => onSend('redirect')} tone="warning" /> : null}
             </ScrollView>
             <Pressable
@@ -484,6 +634,58 @@ function AttachmentChip({ detail, name, onRemove, tone = 'normal' }: { detail: s
       </View>
       <Pressable accessibilityLabel={`Remove ${name}`} onPress={onRemove}><ThemedText themeColor="textTertiary">×</ThemedText></Pressable>
     </View>
+  );
+}
+
+function VoiceAction({
+  compact = false,
+  hidden = false,
+  onPress,
+  state,
+}: {
+  compact?: boolean;
+  hidden?: boolean;
+  onPress: () => void;
+  state: SpeechState;
+}) {
+  const colors = useTheme();
+  const active = state !== 'idle';
+  const label = state === 'starting'
+    ? 'Starting dictation'
+    : state === 'stopping'
+      ? 'Force stop dictation'
+      : state === 'listening'
+        ? 'Stop dictation'
+        : 'Dictate prompt';
+  const symbol = active
+    ? ({ ios: 'stop.fill', android: 'stop', web: 'stop' } as const)
+    : ({ ios: 'mic.fill', android: 'mic_none', web: 'mic_none' } as const);
+
+  return (
+    <Pressable
+      accessibilityElementsHidden={hidden}
+      accessibilityLabel={label}
+      accessible={!hidden}
+      onPress={onPress}
+      style={({ pressed }) => [
+        compact ? styles.sendPressable : styles.voiceAction,
+        {
+          backgroundColor: active ? colors.danger : colors.backgroundSelected,
+          opacity: state === 'stopping' ? 0.72 : pressed ? 0.62 : 1,
+        },
+      ]}>
+      <SymbolView
+        fallback={<ThemedText style={{ color: active ? '#fff' : colors.textSecondary }} type="smallBold">Mic</ThemedText>}
+        name={symbol}
+        size={compact ? 20 : 18}
+        tintColor={active ? '#fff' : colors.textSecondary}
+      />
+      {!compact && active ? (
+        <ThemedText style={{ color: '#fff' }} type="smallBold">
+          {state === 'stopping' ? 'Finishing…' : state === 'starting' ? 'Starting…' : 'Listening…'}
+        </ThemedText>
+      ) : null}
+    </Pressable>
   );
 }
 
@@ -622,6 +824,16 @@ const styles = StyleSheet.create({
   },
   send: { alignItems: 'center', borderRadius: 20, height: 40, justifyContent: 'center', width: 40 },
   sendPressable: { alignItems: 'center', borderRadius: 20, height: 40, justifyContent: 'center', width: 40 },
+  voiceAction: {
+    alignItems: 'center',
+    borderRadius: 999,
+    flexDirection: 'row',
+    gap: 6,
+    justifyContent: 'center',
+    minHeight: 34,
+    minWidth: 38,
+    paddingHorizontal: 10,
+  },
   compactLeftSlot: { height: 40, justifyContent: 'center', overflow: 'hidden' },
   compactRightSlot: { alignItems: 'flex-end', height: 40, justifyContent: 'center', overflow: 'hidden' },
   compactControlPressable: { alignItems: 'center', height: 40, justifyContent: 'center', width: 36 },
