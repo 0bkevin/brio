@@ -473,7 +473,7 @@ function SessionRow({
           </AppText>
           <AppText style={[styles.sessionDate, { color: colors.tertiary }]}>{date}</AppText>
         </View>
-        <AppText numberOfLines={1} style={[styles.sessionMeta, { color: colors.muted }]}> 
+        <AppText numberOfLines={1} style={[styles.sessionMeta, { color: colors.muted }]}>
           {session.model || 'Conversation'}
         </AppText>
         {searchSnippet ? (
